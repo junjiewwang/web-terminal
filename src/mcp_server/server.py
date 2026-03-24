@@ -163,7 +163,8 @@ async def connect_host(host_name: str) -> str:
     """连接到指定的 SSH 主机
 
     自动启动 WeTTY 终端实例并建立 PTY 交互式会话。
-    连接后你的所有操作会在用户的浏览器终端中实时显示。
+    如果浏览器已连接（WeTTY 实例已运行），则直接 attach 到同一个 tmux 会话，
+    浏览器和 Agent 共享终端，互相可见。
 
     Args:
         host_name: 主机名称（在 list_hosts 中查看）
@@ -182,14 +183,24 @@ async def connect_host(host_name: str) -> str:
     wetty_mgr = _get_wetty_manager()
     pty_mgr = _get_pty_manager()
 
-    # Step 1: 启动 WeTTY 实例（复用已有）
+    # 检测是否已有运行中的 WeTTY 实例（浏览器可能已连接）
+    is_attach_mode = wetty_mgr.has_running_instance(host_name)
+
+    # Step 1: 启动 WeTTY 实例（已有则复用）
     try:
         instance = await wetty_mgr.start_instance(host)
     except Exception as e:
         return f"错误：WeTTY 启动失败 - {e}"
 
     # Step 2: 等待 WeTTY 进程就绪
-    await asyncio.sleep(2.0)
+    if is_attach_mode:
+        # attach 模式：WeTTY 实例已运行，tmux 会话已存在，短暂等待即可
+        await asyncio.sleep(0.5)
+        logger.info("connect_host: attach 模式 — WeTTY 实例已存在，tmux 会话 attach")
+    else:
+        # new 模式：新启动的 WeTTY 实例，需要等待进程启动 + SSH 建立
+        await asyncio.sleep(2.0)
+        logger.info("connect_host: new 模式 — 新 WeTTY 实例，等待 SSH 建立")
 
     # Step 3: 建立 PTY socket.io 连接
     base_path = f"/wetty/t/{host_name}"
@@ -203,16 +214,18 @@ async def connect_host(host_name: str) -> str:
     except ConnectionError as e:
         return f"错误：PTY 连接失败 - {e}"
 
+    mode_label = "attach（共享浏览器终端）" if is_attach_mode else "new（新建终端）"
     await _publish_event("session_created", pty_session.session_id, host_name, {
         "hostname": host.hostname,
         "username": host.username,
         "mode": "pty",
+        "tmux_mode": "attach" if is_attach_mode else "new",
     })
 
     return (
-        f"已连接到 {host.username}@{host.hostname}:{host.port}（PTY 交互式模式）\n"
+        f"已连接到 {host.username}@{host.hostname}:{host.port}（PTY 交互式模式 — {mode_label}）\n"
         f"Session ID: {pty_session.session_id}\n"
-        f"终端已在浏览器中实时显示。\n\n"
+        f"终端已在浏览器中实时显示。你的所有操作浏览器可实时看到。\n\n"
         f"提示：\n"
         f"- 如果是堡垒机，请用 send_input 输入目标主机 IP\n"
         f"- 用 wait_for_output 等待特定文本出现\n"

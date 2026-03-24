@@ -238,7 +238,7 @@ let _globalSSE: {
   resume: () => void;
 } | null = null;
 
-/** SSE 已知事件类型（用于过滤） */
+/** SSE 已知业务事件类型（用于过滤） */
 const SSE_EVENT_TYPES = new Set([
   "command_start",
   "command_output",
@@ -247,6 +247,25 @@ const SSE_EVENT_TYPES = new Set([
   "session_created",
   "session_closed",
 ]);
+
+/**
+ * 获取历史事件（最近 100 条）
+ *
+ * 用于前端初始化时补充加载：SSE 只能推送连接之后的事件，
+ * 页面刷新或首次加载时需要从后端拉取已有的历史事件。
+ */
+export async function fetchEventHistory(): Promise<AgentEvent[]> {
+  try {
+    const res = await fetchWithRetry(`${API_BASE}/events/history`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    // 后端返回的 event_type 是枚举值字符串，直接兼容前端
+    return Array.isArray(data) ? data : [];
+  } catch {
+    console.warn("加载历史事件失败，将依赖 SSE 实时推送");
+    return [];
+  }
+}
 
 /**
  * 订阅 SSE 事件流
@@ -263,22 +282,26 @@ export function subscribeEvents(
   let abortController: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let destroyed = false;
+  let paused = false; // 标记是否被 pause() 暂停（区分主动暂停与连接断开）
   let reconnectDelay = 1000; // 初始重连延迟 1s
 
   function connect() {
-    if (destroyed || abortController) return;
+    if (destroyed || paused || abortController) return;
 
     abortController = new AbortController();
     const { signal } = abortController;
 
-    _readSSEStream(signal, onEvent)
+    _readSSEStream(signal, onEvent, () => {
+      // onFirstData 回调：收到第一条数据时重置退避延迟
+      reconnectDelay = 1000;
+    })
       .catch(() => {
         // 连接断开或错误，忽略（下面统一处理重连）
       })
       .finally(() => {
         abortController = null;
-        // 非主动销毁时自动重连
-        if (!destroyed) {
+        // 非主动销毁、非暂停时自动重连
+        if (!destroyed && !paused) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connect();
@@ -287,11 +310,6 @@ export function subscribeEvents(
           reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
         }
       });
-
-    // 连接成功后重置退避
-    // （在 _readSSEStream 内部收到第一条数据时重置更精确，
-    //   但这里简化处理：每次发起连接就重置）
-    reconnectDelay = 1000;
   }
 
   function disconnect() {
@@ -305,8 +323,20 @@ export function subscribeEvents(
     }
   }
 
+  function pause() {
+    paused = true;
+    disconnect();
+  }
+
+  function resume() {
+    paused = false;
+    // 恢复时立即重连，重置退避延迟
+    reconnectDelay = 1000;
+    connect();
+  }
+
   // 注册为全局控制器
-  _globalSSE = { pause: disconnect, resume: connect };
+  _globalSSE = { pause, resume };
 
   // 立即连接
   connect();
@@ -315,7 +345,7 @@ export function subscribeEvents(
   return () => {
     destroyed = true;
     disconnect();
-    if (_globalSSE?.pause === disconnect) {
+    if (_globalSSE?.pause === pause) {
       _globalSSE = null;
     }
   };
@@ -331,10 +361,12 @@ export function subscribeEvents(
  *
  * @param signal - AbortSignal，用于外部中断连接
  * @param onEvent - 事件回调
+ * @param onFirstData - 收到第一条有效数据时的回调（用于重置退避）
  */
 async function _readSSEStream(
   signal: AbortSignal,
   onEvent: (event: AgentEvent) => void,
+  onFirstData?: () => void,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/events/stream`, {
     signal,
@@ -350,11 +382,18 @@ async function _readSSEStream(
   let buffer = "";
   let currentEvent = "";
   let currentData = "";
+  let firstDataFired = false;
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+
+      // 收到任何数据即视为连接成功，触发一次 onFirstData
+      if (!firstDataFired) {
+        firstDataFired = true;
+        onFirstData?.();
+      }
 
       buffer += decoder.decode(value, { stream: true });
 
@@ -368,15 +407,24 @@ async function _readSSEStream(
           currentEvent = line.slice(6).trim();
         } else if (line.startsWith("data:")) {
           currentData = line.slice(5).trim();
+        } else if (line.startsWith(":")) {
+          // SSE 注释行（包括 sse_starlette 的 ping 心跳 ": ping"）
+          // 忽略，但这些行说明连接是活跃的
+          continue;
         } else if (line === "" && currentData) {
-          // 空行 = 事件结束，分发事件
-          if (SSE_EVENT_TYPES.has(currentEvent) && currentData) {
+          // 空行 = 事件结束，分发业务事件
+          if (SSE_EVENT_TYPES.has(currentEvent)) {
             try {
               onEvent(JSON.parse(currentData));
             } catch {
               console.error("SSE 事件解析失败:", currentData);
             }
           }
+          // ping 等非业务事件默默消化，不分发
+          currentEvent = "";
+          currentData = "";
+        } else if (line === "") {
+          // 空行但没有 data（如 ping 后的空行），重置解析状态
           currentEvent = "";
           currentData = "";
         }
