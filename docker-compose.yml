@@ -1,0 +1,17 @@
+services:
+  wetty-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - wetty-data:/app/data
+      - ./config:/app/config:ro
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      - PYTHONPATH=/app
+      # - WETTY_API_TOKEN=your-secret-token      # 生产环境启用 API 认证
+      # - WETTY_ENCRYPTION_KEY=your-fernet-key    # 生产环境设置固定加密密钥
+    restart: unless-stopped
+
+volumes:
+  wetty-data:
