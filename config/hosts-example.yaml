@@ -1,0 +1,67 @@
+# WeTTY + MCP 智能终端服务 - 主机资产配置
+#
+# 使用方法：
+#   1. 复制本文件为 hosts.yaml:  cp hosts-example.yaml hosts.yaml
+#   2. 按实际环境修改主机信息
+#   3. hosts.yaml 已被 .gitignore 忽略，不会提交到仓库（含敏感凭据）
+#
+# 本文件是主机配置的 Single Source of Truth（唯一真相）
+# 数据库是运行时缓存，所有变更以本文件为准
+#
+# 同步机制：
+#   1. 启动时自动同步到数据库
+#   2. 运行中修改 hosts.yaml 会自动热加载（watchfiles 监听 + 2s 防抖）
+#   3. 也可通过 POST /api/hosts/sync 手动触发同步
+#
+# 同步规则：
+#   - 本文件中有、DB 中无 → 新增
+#   - 本文件中有、DB 中有且字段变化 → 更新
+#   - 本文件中无、DB 中有 → 删除
+#   - 校验先行：任何一条格式错误则整批拒绝
+#
+# 字段说明：
+#   name          - 主机别名（唯一标识，用于 MCP 工具和 URL 路径）
+#   hostname      - 主机地址（IP 或域名）
+#   port          - SSH 端口（默认 22）
+#   username      - SSH 用户名
+#   auth_type     - 认证方式：key（密钥）| password（密码）
+#   private_key_path - SSH 私钥路径（auth_type: key 时必填）
+#   password      - SSH 密码（auth_type: password 时必填，存储时自动加密）
+#   description   - 主机描述（可选）
+#   tags          - 标签列表（可选，用于分类筛选）
+
+hosts:
+  # ── 密钥认证示例（推荐） ──────────────────────
+  - name: dev-server
+    hostname: 192.168.1.100
+    port: 22
+    username: deploy
+    auth_type: key
+    private_key_path: ~/.ssh/id_rsa
+    description: 开发环境服务器
+    tags:
+      - dev
+      - linux
+
+  # ── 密码认证示例 ──────────────────────────────
+  - name: prod-server
+    hostname: 10.0.0.50
+    port: 22
+    username: admin
+    auth_type: password
+    password: "your-password-here"    # 启动时自动加密存储
+    description: 生产环境服务器
+    tags:
+      - prod
+      - linux
+
+  # ── 非标准端口 + 堡垒机示例 ──────────────────
+  # - name: bastion
+  #   hostname: bastion.example.com
+  #   port: 36000
+  #   username: operator
+  #   auth_type: password
+  #   password: "your-password-here"
+  #   description: 堡垒机 / JumpServer
+  #   tags:
+  #     - bastion
