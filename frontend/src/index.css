@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/* ══════════════════════════════════════════════════════════════
+ * xterm.js 终端样式覆盖
+ *
+ * 1. 消除右侧白色竖条：FitAddon 按字符网格计算终端宽度，
+ *    实际渲染宽度 < 容器宽度时右侧留有缝隙。
+ *    统一所有 xterm 内部元素背景色为 #0a0a0a 消除视觉差异。
+ *
+ * 2. 滚动条美化：终端内容超出时 xterm 使用浏览器原生滚动条，
+ *    原生滚动条在暗色背景上非常突兀。
+ *    用深色极细滚动条替代，hover 时略亮提示可滚动。
+ * ══════════════════════════════════════════════════════════════ */
+
+/* ── 背景色统一（消除右侧缝隙） ── */
+.xterm,
+.xterm-viewport,
+.xterm-screen {
+  background-color: #0a0a0a !important;
+}
+
+/* ── 滚动条样式（Chromium: Chrome / Edge / Safari） ── */
+.xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* ── 滚动条样式（Firefox） ── */
+.xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+
+/* ── 全局：隐藏页面级滚动条（SPA 单屏布局不需要） ── */
+body {
+  overflow: hidden;
+}
