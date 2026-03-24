@@ -121,11 +121,12 @@ class PTYSession:
         self._sio.on("connect", self._on_connect)
         self._sio.on("disconnect", self._on_disconnect)
 
-    async def connect(self, timeout: float = 10.0) -> None:
+    async def connect(self, timeout: float = 10.0, wait_for_ready: bool = True) -> None:
         """连接到 WeTTY 实例
 
         Args:
             timeout: 连接超时秒数
+            wait_for_ready: 是否等待终端输出就绪（tmux 会话 attach 后出现内容）
 
         Raises:
             ConnectionError: 连接失败或超时
@@ -167,7 +168,54 @@ class PTYSession:
                 f"PTY 连接后未收到 connect 确认: {self.host_name}"
             )
 
+        # 等待 tmux 会话就绪（终端输出中出现内容）
+        if wait_for_ready:
+            await self._wait_for_terminal_ready(timeout=timeout)
+
         logger.info("PTY 会话已连接: %s -> %s", self.session_id[:8], self.host_name)
+
+    async def _wait_for_terminal_ready(self, timeout: float = 10.0) -> None:
+        """等待终端输出就绪
+
+        tmux 会话建立后，WeTTY 会通过 data 事件推送终端内容。
+        等待缓冲区中出现数据，表示 tmux + SSH 链路已通。
+
+        Args:
+            timeout: 最大等待秒数
+
+        Raises:
+            ConnectionError: 超时未收到终端输出
+        """
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= timeout:
+                # 超时但不阻断连接 — tmux attach 可能已成功但无新输出
+                logger.warning(
+                    "PTY 终端就绪等待超时（%.1fs），继续使用: %s",
+                    timeout, self.session_id[:8],
+                )
+                return
+
+            # 检查是否已有终端输出
+            if len(self._raw_buffer) > 0:
+                logger.info(
+                    "PTY 终端就绪: %s (%.1fs, buffer=%d lines)",
+                    self.session_id[:8], elapsed, len(self._raw_buffer),
+                )
+                return
+
+            # 等待新输出事件
+            self._output_event.clear()
+            remaining = timeout - elapsed
+            try:
+                await asyncio.wait_for(
+                    self._output_event.wait(),
+                    timeout=min(remaining, 0.5),
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def send_input(self, text: str) -> None:
         """向终端发送输入

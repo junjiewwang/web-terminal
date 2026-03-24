@@ -3,7 +3,7 @@ import HostList from "./components/HostList";
 import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
 import type { Host, AgentEvent } from "./services/api";
-import { fetchHosts, subscribeEvents } from "./services/api";
+import { fetchHosts, fetchEventHistory, subscribeEvents } from "./services/api";
 
 /**
  * 应用主布局：左侧主机列表 + 中间终端 + 右侧 Agent 面板
@@ -35,10 +35,27 @@ export default function App() {
     loadHosts();
   }, []);
 
-  // SSE 事件订阅
-  // subscribeEvents 内部注册为全局单例，startWeTTY 会自动暂停/恢复 SSE，
-  // 组件层无需额外管理 SSE 生命周期。
+  // SSE 事件订阅 + 历史事件加载
+  // 1. 首先拉取历史事件，确保页面刷新后面板不为空
+  // 2. 然后建立 SSE 长连接，实时推送后续事件
   useEffect(() => {
+    // 加载历史事件（不阻塞 SSE 连接建立）
+    fetchEventHistory().then((history) => {
+      if (history.length > 0) {
+        setEvents((prev) => {
+          // 去重：以 timestamp + event_type 作为唯一标识
+          const existingKeys = new Set(
+            prev.map((e) => `${e.timestamp}-${e.event_type}`),
+          );
+          const newEvents = history.filter(
+            (e) => !existingKeys.has(`${e.timestamp}-${e.event_type}`),
+          );
+          return [...newEvents, ...prev].slice(-100);
+        });
+      }
+    });
+
+    // SSE 实时订阅
     const cleanup = subscribeEvents((event) => {
       setEvents((prev) => [...prev.slice(-99), event]);
     });

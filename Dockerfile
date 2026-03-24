@@ -63,13 +63,15 @@ WORKDIR /app
 
 # 1) 系统包（几乎不变）
 #    - openssh-client: SSH 客户端
-#    - sshpass: WeTTY --ssh-pass 参数依赖此工具自动输入密码
+#    - sshpass: tmux-session.sh 内通过 sshpass 自动输入 SSH 密码
+#    - tmux: 会话复用，浏览器和 MCP Agent 共享同一个 SSH PTY
 #    - nginx: 前端反向代理，解决浏览器 SSE 连接阻塞问题
 #    - OpenSSH 10.x 默认禁用 ssh-rsa，旧服务器兼容配置
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
         sshpass \
+        tmux \
         nginx \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/ssh/ssh_config.d \
@@ -92,9 +94,10 @@ RUN ln -sf /usr/local/lib/node_modules/wetty/build/main.js /usr/local/bin/wetty 
 # 4) nginx 配置（偶尔变）
 COPY nginx.conf /etc/nginx/sites-available/default
 
-# 5) 启动脚本 + 数据目录（几乎不变）
+# 5) 启动脚本 + tmux 会话脚本 + 数据目录（几乎不变）
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh \
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/entrypoint.sh /app/scripts/*.sh \
     && mkdir -p /app/data
 
 # 6) 前端产物（经常变：从独立 Stage 拷贝）

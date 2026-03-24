@@ -1,7 +1,8 @@
 # 方案 A：tmux 会话共享 — 详细实施计划
 
-> **状态**: 📋 待实施
+> **状态**: ✅ Sprint 1 + Sprint 2 已实施并验证通过（部署验证 + Agent Attach 测试通过）
 > **创建日期**: 2026-03-24
+> **最后更新**: 2026-03-24
 > **关联需求**: MCP Agent 操作浏览器已连接终端 Session，用户可在浏览器实时观看 Agent 操作
 
 ---
@@ -220,3 +221,102 @@ fi
 |------|----------|------|
 | **B: WeTTY 多客户端单 PTY** | ❌ 放弃 | 需要 fork WeTTY 源码，维护成本高 |
 | **C: SSE 日志回显** | ❌ 放弃 | 不满足"浏览器终端看到 Agent 操作"的需求 |
+
+---
+
+## 八、实施记录
+
+### Sprint 1：tmux 基础集成 ✅
+
+**实施日期**: 2026-03-24
+
+| # | 任务 | 实际变更 | 状态 |
+|---|------|----------|------|
+| 1.1 | `scripts/tmux-session.sh` | 新建脚本：参数解析 → 构建 SSH 命令（支持密码/密钥/交互式） → tmux has-session 判断 → new-session 或 attach-session | ✅ |
+| 1.2 | `wetty_manager.py` | `_WeTTYProcess.start()` 从 `--ssh-host/--ssh-user/--ssh-pass` 改为 `--command "tmux-session.sh ..."` ；新增 `_build_tmux_script_args()`、`tmux_session_name` 属性、`TMUX_SCRIPT_PATH` 常量 | ✅ |
+| 1.3 | `Dockerfile` | `apt-get install` 新增 `tmux`；`COPY scripts/` + `chmod +x` | ✅ |
+| 1.4 | `entrypoint.sh` | 新增 tmux 可用性检查 + `TERM` 环境变量设置 | ✅ |
+
+### Sprint 2：MCP 会话共享 ✅
+
+**实施日期**: 2026-03-24
+
+| # | 任务 | 实际变更 | 状态 |
+|---|------|----------|------|
+| 2.1 | `connect_host` attach 模式 | `WeTTYManager.has_running_instance()` 新增；`connect_host` 区分 new/attach 模式，attach 时缩短等待时间 | ✅ |
+| 2.2 | PTYSession 就绪检测 | `PTYSession.connect()` 新增 `wait_for_ready` 参数 + `_wait_for_terminal_ready()` 方法，替代固定 sleep | ✅ |
+
+### 部署验证 ✅
+
+**验证日期**: 2026-03-24
+
+| # | 验证项 | 结果 | 备注 |
+|---|--------|------|------|
+| V1 | Docker 镜像构建 | ✅ 通过 | tmux 3.5a + sshpass + scripts 全部包含 |
+| V2 | 容器启动 | ✅ 通过 | nginx + uvicorn + WeTTY 正常启动 |
+| V3 | 浏览器终端连接 | ✅ 通过 | 点击 tce-server → JumpServer 堡垒机欢迎界面正常显示 |
+| V4 | WeTTY tmux 模式 | ✅ 通过 | 日志确认 `WeTTY 进程启动 (tmux 模式)`, tmux 状态栏可见 |
+| V5 | Agent Attach 模式 | ✅ 通过 | 详见下方测试记录 |
+| V6 | 断开 Agent 后浏览器不受影响 | ✅ 通过 | Agent close 后 tmux 会话保持, 浏览器继续使用 |
+
+### Agent Attach 模式测试 ✅
+
+**测试日期**: 2026-03-24
+
+**前置条件**：浏览器已通过 WeTTY 连接到 tce-server，tmux 会话 `wetty-tce-server` 处于 attached 状态。
+
+**测试结果**：
+
+| # | 测试步骤 | 预期 | 实际 | 状态 |
+|---|----------|------|------|------|
+| T1 | Agent PTY 连接 WeTTY (port 3000) | 连接成功 | `connected=True`, socket.io websocket 升级成功 | ✅ |
+| T2 | tmux clients 检查 | 多个 client 同时 attach | attach 前 1 client (`/dev/pts/0`), attach 后 2 clients (`/dev/pts/0` + `/dev/pts/3`) | ✅ |
+| T3 | Agent read_terminal | 读到与浏览器相同的堡垒机界面 | 读到 JumpServer 欢迎菜单 + `[Host]>` 提示符 | ✅ |
+| T4 | Agent send_input (回车) | 堡垒机响应, 浏览器同步显示 | 堡垒机显示主机列表, 浏览器实时显示 | ✅ |
+| T5 | Agent 发送标识命令 `echo AGENT_ATTACH_OK` | 浏览器可见 Agent 发送的命令 | 浏览器截图确认显示 `[Host]> echo AGENT_ATTACH_OK` | ✅ |
+| T6 | Agent close PTY | tmux 会话保持, 浏览器不受影响 | `tmux list-sessions` 显示会话仍在, 浏览器继续正常使用 | ✅ |
+
+**关键日志证据**：
+
+```
+# tmux clients BEFORE attach (仅浏览器)
+/dev/pts/0: wetty-tce-server [76x72 xterm-256color] (attached,focused,UTF-8)
+
+# tmux clients AFTER attach (浏览器 + Agent)
+/dev/pts/0: wetty-tce-server [76x72 xterm-256color] (attached,focused,UTF-8)
+/dev/pts/3: wetty-tce-server [80x30 xterm-256color] (attached,focused,UTF-8)
+
+# tmux sessions AFTER Agent close (会话保持)
+wetty-tce-server: 1 windows (created Tue Mar 24 11:27:50 2026) (attached)
+```
+
+### Sprint 3：健壮性（待实施）
+
+- [ ] tmux 会话超时/异常断开恢复
+- [ ] 多主机并发验证
+- [ ] Agent 先连 → 浏览器后连验证
+- [ ] tmux 状态栏定制（可选）
+
+### MCP 实际操作验证 ✅
+
+**验证日期**: 2026-03-24
+
+通过 CodeBuddy MCP 客户端 → wetty-terminal MCP Server → 堡垒机 → 目标主机，执行 kubectl 命令查询业务 Pod。
+
+| # | 操作 | MCP 工具 | 结果 |
+|---|------|----------|------|
+| M1 | 连接堡垒机 | `connect_host("<host_name>")` | ✅ attach 模式，共享浏览器终端 |
+| M2 | 读取堡垒机菜单 | `read_terminal(lines=20)` | ✅ JumpServer 欢迎界面 |
+| M3 | 输入目标 IP | `send_input("<target_ip>\r")` | ✅ SSH 跳转成功 |
+| M4 | 查询业务 pod | `run_command("kubectl get pods -A -o wide \| grep -i <app>")` | ✅ 返回多个 Pod 全部 Running |
+
+**查询结果**: 多个业务 Pod，全部 Running / 0 重启，验证了 MCP → 堡垒机 → 目标主机 → kubectl 的完整操作链路。
+
+### UI/UX 修复 ✅
+
+**修复日期**: 2026-03-24
+
+| # | 问题 | 修复 | 涉及文件 |
+|---|------|------|----------|
+| U1 | 终端下方多行点号（tmux 多客户端窗口尺寸冲突） | `tmux set-option -g window-size largest` | `scripts/tmux-session.sh` |
+| U2 | Agent 操作日志面板无数据（SSE 重连 + 无历史加载） | SSE pause/resume 状态分离 + 精确退避重置 + 历史事件加载 + SSE ping 处理 | `frontend/src/services/api.ts`, `frontend/src/App.tsx` |
