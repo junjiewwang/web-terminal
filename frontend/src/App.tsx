@@ -1,22 +1,50 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import HostList from "./components/HostList";
 import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
+import TerminalTabs, {
+  tabIdForHost,
+  createTabForHost,
+  type TerminalTab,
+} from "./components/TerminalTabs";
 import type { Host, AgentEvent } from "./services/api";
-import { fetchHosts, fetchEventHistory, subscribeEvents } from "./services/api";
+import { fetchHosts, fetchEventHistory, subscribeEvents, stopWeTTY, switchTmuxWindow } from "./services/api";
 
 /**
- * 应用主布局：左侧主机列表 + 中间终端 + 右侧 Agent 面板
+ * 应用主布局：左侧主机列表 + 中间（Tab 栏 + 终端）+ 右侧 Agent 面板
+ *
+ * 状态管理：
+ * - hosts: 主机列表（树形，bastion 含 children）
+ * - tabs: 已打开的终端 Tab 列表
+ * - activeTabId: 当前活跃的 Tab ID
+ * - events: Agent 事件列表
+ *
+ * 多 Tab 独立终端模式：
+ * - 每个 Tab 持有独立的 TerminalView 实例（独立的 socket.io 连接 + xterm.js）
+ * - 切换 Tab 时非活跃的 TerminalView 保持连接不销毁
+ * - Tab 切换时通过 tmux switch-client -c 只切换该 Tab 的 tmux client 视图，
+ *   不影响其他 Tab 的终端内容
  */
 export default function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
-  const [selectedHost, setSelectedHost] = useState<Host | null>(null);
-  const [events, setEvents] = useState<AgentEvent[]>([]);
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [hostsLoading, setHostsLoading] = useState(true);
+  const [events, setEvents] = useState<AgentEvent[]>([]);
 
-  // 加载主机列表（含错误恢复）
-  const loadHosts = () => {
+  // ── Tab 状态 ──
+  const [tabs, setTabs] = useState<TerminalTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+
+  // 已连接的主机 ID 集合（从已打开的 Tab 推断）
+  const connectedHostIds = useMemo(
+    () => new Set(tabs.map((t) => t.host.id)),
+    [tabs],
+  );
+
+  // ── 加载主机列表 ──
+  const loadHosts = useCallback(() => {
     setHostsLoading(true);
     setHostsError(null);
     fetchHosts()
@@ -29,21 +57,17 @@ export default function App() {
         setHostsError(err instanceof Error ? err.message : "未知错误");
         setHostsLoading(false);
       });
-  };
+  }, []);
 
   useEffect(() => {
     loadHosts();
-  }, []);
+  }, [loadHosts]);
 
-  // SSE 事件订阅 + 历史事件加载
-  // 1. 首先拉取历史事件，确保页面刷新后面板不为空
-  // 2. 然后建立 SSE 长连接，实时推送后续事件
+  // ── SSE 事件订阅 + 历史事件加载 ──
   useEffect(() => {
-    // 加载历史事件（不阻塞 SSE 连接建立）
     fetchEventHistory().then((history) => {
       if (history.length > 0) {
         setEvents((prev) => {
-          // 去重：以 timestamp + event_type 作为唯一标识
           const existingKeys = new Set(
             prev.map((e) => `${e.timestamp}-${e.event_type}`),
           );
@@ -55,12 +79,117 @@ export default function App() {
       }
     });
 
-    // SSE 实时订阅
     const cleanup = subscribeEvents((event) => {
       setEvents((prev) => [...prev.slice(-99), event]);
     });
     return cleanup;
   }, []);
+
+  // ── 更新 Tab 数据中的 clientTty + 立即触发 switch（如果 tab 是 active 的）──
+  // 注意：独立 WeTTY 模式下（bastionName 包含 "--"）不需要 tmux switch
+  const handleClientTtyReady = useCallback((tabId: string, tty: string) => {
+    setTabs((prev) => {
+      const updated = prev.map((t) => (t.id === tabId ? { ...t, clientTty: tty } : t));
+      // 如果该 tab 当前是 active 的，立即执行 per-client tmux switch
+      // 独立 WeTTY 模式下跳过
+      if (tabId === activeTabId) {
+        const tab = updated.find((t) => t.id === tabId);
+        if (
+          tab?.tmuxWindow &&
+          tab?.bastionName &&
+          !tab.bastionName.includes("--") // 独立 WeTTY 实例名包含 "--"
+        ) {
+          switchTmuxWindow(tab.bastionName, tab.tmuxWindow, tty)
+            .catch((err) => console.warn("tmux 窗口切换失败:", err));
+        }
+      }
+      return updated;
+    });
+  }, [activeTabId]);
+
+  // ── 主机选择 → 打开/切换 Tab ──
+  const handleHostSelect = useCallback(
+    (host: Host) => {
+      const tabId = tabIdForHost(host);
+
+      // 已有 Tab → 切换到它
+      const existingTab = tabs.find((t) => t.id === tabId);
+      if (existingTab) {
+        setActiveTabId(tabId);
+        return;
+      }
+
+      // 新建 Tab
+      let bastionName: string | undefined;
+      if (host.host_type === "jump_host" && host.parent_id) {
+        const parentBastion = hosts.find(
+          (h) => h.id === host.parent_id || h.children?.some((c) => c.id === host.id),
+        );
+        bastionName = parentBastion?.name;
+      }
+
+      const newTab = createTabForHost(host, bastionName);
+      setTabs((prev) => [...prev, newTab]);
+      setActiveTabId(tabId);
+    },
+    [tabs, hosts],
+  );
+
+  // ── Tab 切换（per-client tmux switch-client）──
+  const handleTabSelect = useCallback(
+    (tabId: string) => {
+      setActiveTabId(tabId);
+
+      // jump_host Tab 切换时，使用 per-client switch 只切换该 Tab 的 tmux 视图
+      // 注意：独立 WeTTY 模式下（bastionName 包含 "--"）不需要 tmux switch
+      const targetTab = tabs.find((t) => t.id === tabId);
+      if (
+        targetTab?.tmuxWindow &&
+        targetTab.bastionName &&
+        !targetTab.bastionName.includes("--") // 独立 WeTTY 实例名包含 "--"
+      ) {
+        switchTmuxWindow(
+          targetTab.bastionName,
+          targetTab.tmuxWindow,
+          targetTab.clientTty, // 有 clientTty 时用 per-client 模式，否则全局
+        ).catch((err) => console.warn("tmux 窗口切换失败:", err));
+      }
+    },
+    [tabs],
+  );
+
+  // ── 关闭 Tab ──
+  const handleTabClose = useCallback(
+    (tabId: string) => {
+      const closingTab = tabs.find((t) => t.id === tabId);
+      if (closingTab) {
+        if (closingTab.host.host_type !== "jump_host") {
+          stopWeTTY(closingTab.host.name).catch(() => {});
+        }
+      }
+
+      setTabs((prev) => {
+        const remaining = prev.filter((t) => t.id !== tabId);
+
+        if (tabId === activeTabId) {
+          const closedIdx = prev.findIndex((t) => t.id === tabId);
+          const nextTab =
+            remaining[Math.min(closedIdx, remaining.length - 1)] ?? null;
+          setActiveTabId(nextTab?.id ?? null);
+        }
+
+        return remaining;
+      });
+    },
+    [tabs, activeTabId],
+  );
+
+  // ── 终端区域 header 信息 ──
+  const headerText = activeTab
+    ? activeTab.host.host_type === "jump_host" && activeTab.host.target_ip
+      ? `${activeTab.bastionName ?? "bastion"} → ${activeTab.host.name} (${activeTab.host.target_ip})`
+      : `${activeTab.host.username}@${activeTab.host.hostname}:${activeTab.host.port}`
+    : "请选择一个主机";
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
@@ -68,33 +197,66 @@ export default function App() {
       <aside className="w-64 border-r border-gray-800 flex flex-col">
         <div className="p-4 border-b border-gray-800">
           <h1 className="text-lg font-bold text-emerald-400">
-            🖥 MCP Terminal
+            MCP Terminal
           </h1>
           <p className="text-xs text-gray-500 mt-1">
-            AI Agent SSH 终端管理
+            AI Agent SSH Terminal
           </p>
         </div>
         <HostList
           hosts={hosts}
-          selectedHost={selectedHost}
-          onSelect={setSelectedHost}
+          selectedHost={activeTab?.host ?? null}
+          onSelect={handleHostSelect}
           loading={hostsLoading}
           error={hostsError}
           onRetry={loadHosts}
+          connectedHostIds={connectedHostIds}
         />
       </aside>
 
-      {/* 中间：终端区域 */}
-      <main className="flex-1 flex flex-col">
-        <header className="h-10 bg-gray-900 border-b border-gray-800 flex items-center px-4">
-          <span className="text-sm text-gray-400">
-            {selectedHost
-              ? `${selectedHost.username}@${selectedHost.hostname}:${selectedHost.port}`
-              : "请选择一个主机"}
-          </span>
+      {/* 中间：Tab 栏 + 终端区域 */}
+      <main className="flex-1 flex flex-col min-w-0">
+        {/* header */}
+        <header className="h-10 bg-gray-900 border-b border-gray-800 flex items-center px-4 shrink-0">
+          <span className="text-sm text-gray-400 truncate">{headerText}</span>
         </header>
-        <div className="flex-1">
-          <TerminalView host={selectedHost} />
+
+        {/* Tab 栏（无 Tab 时不渲染） */}
+        <TerminalTabs
+          tabs={tabs}
+          activeTabId={activeTabId}
+          onSelectTab={handleTabSelect}
+          onCloseTab={handleTabClose}
+        />
+
+        {/* 多终端视图层叠（每个 Tab 一个 TerminalView，仅 active 的可见） */}
+        <div className="flex-1 min-h-0 relative">
+          {tabs.length === 0 ? (
+            /* 无 Tab 空状态 */
+            <div className="absolute inset-0 flex items-center justify-center text-gray-600">
+              <div className="text-center">
+                <div className="text-4xl mb-4">🖥</div>
+                <p className="text-lg">选择左侧主机开始使用</p>
+                <p className="text-sm mt-2 text-gray-700">
+                  或通过 MCP Client 连接 Agent 工具
+                </p>
+              </div>
+            </div>
+          ) : (
+            tabs.map((tab) => (
+              <div
+                key={tab.id}
+                className="absolute inset-0"
+                style={{ display: tab.id === activeTabId ? undefined : "none" }}
+              >
+                <TerminalView
+                  host={tab.host}
+                  isActive={tab.id === activeTabId}
+                  onClientTtyReady={(tty) => handleClientTtyReady(tab.id, tty)}
+                />
+              </div>
+            ))
+          )}
         </div>
       </main>
 

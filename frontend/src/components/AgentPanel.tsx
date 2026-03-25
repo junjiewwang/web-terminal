@@ -12,6 +12,8 @@ const EVENT_CONFIG: Record<string, { icon: string; color: string; label: string 
   command_error: { icon: "❌", color: "text-red-400", label: "执行错误" },
   session_created: { icon: "🔗", color: "text-cyan-400", label: "建立连接" },
   session_closed: { icon: "🔌", color: "text-yellow-400", label: "断开连接" },
+  session_error: { icon: "⚠️", color: "text-red-400", label: "连接失败" },
+  window_switched: { icon: "🔀", color: "text-purple-400", label: "切换窗口" },
 };
 
 /**
