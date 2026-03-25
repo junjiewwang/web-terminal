@@ -285,52 +285,69 @@ async def _connect_direct_host(host: Host) -> str:
 
 
 async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
-    """二级主机的连接流程（复用堡垒机 WeTTY + tmux 新窗口 + 跳板编排）"""
+    """二级主机的连接流程（独立 WeTTY 实例架构）
+
+    与 REST API /api/wetty/start 保持一致：
+    - 每个 jump_host 创建独立的 WeTTY 实例（如 tce-server--m12）
+    - 输入完全隔离，不与其他 Tab 共享
+    - 不需要 tmux 窗口管理
+    """
     wetty_mgr = _get_wetty_manager()
     pty_mgr = _get_pty_manager()
-    tmux_mgr = _get_tmux_manager()
 
-    # Step 1: 确保堡垒机 WeTTY 实例运行中（已有则复用）
-    is_new_bastion = not wetty_mgr.has_running_instance(bastion.name)
-    try:
-        instance = await wetty_mgr.start_instance(bastion)
-    except Exception as e:
-        return f"错误：堡垒机 WeTTY 启动失败 - {e}"
+    # Step 1: 为 jump_host 创建独立的 WeTTY 实例
+    # 使用复合名称（bastion_name--jump_host_name）确保唯一性
+    instance_name = f"{bastion.name}--{jump_host.name}"
 
-    if is_new_bastion:
-        await asyncio.sleep(2.0)
-        logger.info("connect_jump_host: 堡垒机 WeTTY 新启动 (%s)", bastion.name)
+    # 如果已有该实例，复用
+    if wetty_mgr.has_running_instance(instance_name):
+        instance = wetty_mgr.get_instance(instance_name)
+        if instance:
+            logger.info("connect_jump_host: 复用已有独立 WeTTY (%s)", instance_name)
+        else:
+            # 实例已停止，创建新实例
+            instance = None
     else:
-        await asyncio.sleep(0.5)
-        logger.info("connect_jump_host: 堡垒机 WeTTY 已存在，复用 (%s)", bastion.name)
+        instance = None
 
-    # Step 2: 在堡垒机 tmux session 中创建新窗口
-    tmux_session = TmuxWindowManager.session_name_for(bastion.name)
-    window_name = jump_host.name
+    if not instance:
+        try:
+            instance = await wetty_mgr.start_instance_for_jump_host(
+                instance_name=instance_name,
+                bastion=bastion,
+            )
+        except FileNotFoundError:
+            return "错误：wetty 命令未找到，请先安装: npm install -g wetty"
+        except OSError as e:
+            return f"错误：WeTTY 启动失败 - {e}"
 
-    if not await tmux_mgr.create_window(tmux_session, window_name):
-        return f"错误：tmux 窗口创建失败 ({tmux_session}:{window_name})"
+    # 等待 WeTTY 进程就绪
+    await asyncio.sleep(2.0)
+    logger.info("connect_jump_host: 独立 WeTTY 已启动 (%s)", instance_name)
 
-    # Step 3: 建立 PTY 连接（连接到堡垒机 WeTTY，绑定 tmux 窗口）
-    base_path = f"/wetty/t/{bastion.name}"
+    # Step 2: 建立 PTY 连接（连接到独立 WeTTY 实例）
+    # base_path 使用实例的实际名称（如 tce-server--m12）
+    base_path = f"/wetty/t/{instance.host_name}"
     try:
         pty_session = await pty_mgr.create_session(
             host_name=jump_host.name,
             wetty_port=instance.port,
             wetty_base_path=base_path,
             connect_timeout=15.0,
-            tmux_window=window_name,
+            tmux_window="0",  # 默认窗口
         )
     except ConnectionError as e:
         return f"错误：PTY 连接失败 - {e}"
 
-    # Step 4: 执行跳板编排
+    # Step 3: 执行跳板编排（前台执行，等待完成）
+    tmux_session = TmuxWindowManager.session_name_for(instance_name)
     orchestrator = JumpOrchestrator(pty_session)
     result = await orchestrator.execute_jump(
         jump_host=jump_host,
         bastion=bastion,
         tmux_session_name=tmux_session,
-        window_name=window_name,
+        window_name="0",
+        skip_window_creation=True,  # 独立 WeTTY 模式，不需要创建窗口
     )
 
     if not result.success:
@@ -343,21 +360,19 @@ async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
         "hostname": jump_host.target_ip,
         "bastion": bastion.name,
         "mode": "pty",
-        "tmux_mode": "jump",
-        "tmux_window": window_name,
+        "tmux_mode": "independent",  # 独立 WeTTY 模式
+        "instance_name": instance_name,
         "steps_executed": result.steps_executed,
     })
 
     msg = (
-        f"已通过堡垒机 {bastion.name} 连接到 {jump_host.name}"
-        f"（{jump_host.target_ip}）\n"
+        f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
+        f"通过堡垒机: {bastion.name}\n"
         f"Session ID: {pty_session.session_id}\n"
-        f"{result.message}\n"
-        f"终端已在浏览器中实时显示（tmux 窗口: {window_name}）。\n\n"
+        f"{result.message}\n\n"
         f"提示：\n"
         f"- 用 run_command 执行命令并获取输出\n"
-        f"- 用 list_windows 查看当前堡垒机的所有窗口\n"
-        f"- 用 switch_window 在不同二级主机之间切换"
+        f"- 用 read_terminal 查看当前终端屏幕"
     )
 
     if result.skipped_reason:
