@@ -828,7 +828,7 @@ _run_jump_orchestration():
 12. ~~**jump_host 新窗口缺少 SSH 连接**~~ → 已通过方案 C 修复：`create_window(command=ssh_cmd)` 新窗口创建时自动 SSH 到堡垒机，`JumpOrchestrator` 的 `ready_pattern` 能正确匹配
 13. ~~**decrypt_password 类型错误**~~ → 已修复：`wetty_manager.py` 中添加 `password_encrypted` 的 None 检查后再调用 `decrypt_password()`
 14. ~~**WeTTY 冷启动 502 瞬态问题**~~ → 已通过方案 E 修复：前端 socket.io 静默重试，冷启动期间前 3 次连接失败不显示错误，保持 "connecting" 状态让 socket.io 自动重连
-15. **MCP jump_host 连接**：MCP 的 `_connect_jump_host` 还在使用旧架构（复用堡垒机 WeTTY + tmux 新窗口），需要更新为独立 WeTTY 实例架构
+15. ~~**MCP jump_host 连接**~~ → 已修复：更新 `_connect_jump_host` 为独立 WeTTY 实例架构，与 REST API 保持一致
 
 ## 十、开发里程碑
 
