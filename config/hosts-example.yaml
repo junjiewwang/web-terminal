@@ -29,6 +29,21 @@
 #   password      - SSH 密码（auth_type: password 时必填，存储时自动加密）
 #   description   - 主机描述（可选）
 #   tags          - 标签列表（可选，用于分类筛选）
+#
+# 堡垒机扩展字段（type: bastion 时使用）：
+#   type          - 主机类型：direct（直连，默认）| bastion（堡垒机）
+#   ready_pattern - 堡垒机就绪检测正则（登录后出现的标志性文本）
+#   login_success_pattern - 二级主机登录成功正则（用于检测跳转成功）
+#   jump_hosts    - 二级主机列表（通过堡垒机跳转的目标主机）
+#
+# 二级主机字段（jump_hosts 列表中的每一项）：
+#   name          - 二级主机别名（全局唯一，可直接用于 connect_host）
+#   target_ip     - 目标主机 IP（在堡垒机中输入的地址）
+#   description   - 描述（可选）
+#   password      - 目标主机密码（可选，用于 login_steps 中的 {{password}} 替换）
+#   login_steps   - 登录交互步骤链（可选，为空则输入 IP 后直接等待登录成功）
+#     - wait      - 等待出现的正则模式
+#       send      - 匹配后发送的内容（支持 {{password}} 变量替换）
 
 hosts:
   # ── 密钥认证示例（推荐） ──────────────────────
@@ -55,13 +70,37 @@ hosts:
       - prod
       - linux
 
-  # ── 非标准端口 + 堡垒机示例 ──────────────────
-  # - name: bastion
+  # ── 堡垒机 + 二级主机示例 ──────────────────────
+  # - name: my-bastion
   #   hostname: bastion.example.com
   #   port: 36000
   #   username: operator
   #   auth_type: password
-  #   password: "your-password-here"
+  #   password: "bastion-password"
   #   description: 堡垒机 / JumpServer
+  #   type: bastion
   #   tags:
   #     - bastion
+  #     - prod
+  #   ready_pattern: "\\[Host\\]>|Opt>"
+  #   login_success_pattern: "Last login|\\]#|\\]\\$"
+  #   jump_hosts:
+  #     # 直连型：输入 IP 后直接等待登录成功（无额外交互步骤）
+  #     - name: app-server-1
+  #       target_ip: "10.0.0.3"
+  #       description: "应用服务器 A"
+  #     # 选择账号型：需要在登录过程中选择账号
+  #     - name: db-server
+  #       target_ip: "10.0.0.5"
+  #       description: "数据库服务器"
+  #       login_steps:
+  #         - wait: "请选择账号|Select account"
+  #           send: "1"
+  #     # 密码型：需要在登录过程中输入目标主机密码
+  #     - name: prod-app
+  #       target_ip: "10.0.0.20"
+  #       description: "生产应用服务器"
+  #       login_steps:
+  #         - wait: "password:"
+  #           send: "{{password}}"
+  #       password: "target-password"
