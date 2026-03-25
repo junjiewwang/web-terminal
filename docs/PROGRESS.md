@@ -828,6 +828,7 @@ _run_jump_orchestration():
 12. ~~**jump_host 新窗口缺少 SSH 连接**~~ → 已通过方案 C 修复：`create_window(command=ssh_cmd)` 新窗口创建时自动 SSH 到堡垒机，`JumpOrchestrator` 的 `ready_pattern` 能正确匹配
 13. ~~**decrypt_password 类型错误**~~ → 已修复：`wetty_manager.py` 中添加 `password_encrypted` 的 None 检查后再调用 `decrypt_password()`
 14. ~~**WeTTY 冷启动 502 瞬态问题**~~ → 已通过方案 E 修复：前端 socket.io 静默重试，冷启动期间前 3 次连接失败不显示错误，保持 "connecting" 状态让 socket.io 自动重连
+15. **MCP jump_host 连接**：MCP 的 `_connect_jump_host` 还在使用旧架构（复用堡垒机 WeTTY + tmux 新窗口），需要更新为独立 WeTTY 实例架构
 
 ## 十、开发里程碑
 
@@ -842,4 +843,22 @@ _run_jump_orchestration():
 | Phase 7 | Jump Host 浏览器直连（REST API jump_host 感知） | ✅ 已完成 |
 | Phase 7.1 | 多 Tab 独立终端视图（per-client tmux switch-client） | ✅ 已完成 |
 | Phase 7.2 | 独立 WeTTY 实例架构（每个 jump_host Tab 独立实例） | ✅ 已完成 |
+| Phase 7.3 | Sprint 3 健壮性（并发测试 + 会话超时） | 🔲 进行中 |
 | Phase 8 | CI/CD + 生产环境配置 | 🔲 待实施 |
+
+## 十一、Sprint 3 健壮性进展（Phase 7.3）
+
+### ✅ 已完成
+
+- [x] **P0: 并发测试用例**（`tests/test_concurrency.py`）
+  - 端口分配并发安全测试
+  - 多主机并发启动测试
+  - Agent 先连 → 浏览器后连验证
+  - 多 PTY 会话并发测试
+
+### 🔲 进行中
+
+- [ ] **P1: tmux 会话超时/清理机制**
+- [ ] **P2: WeTTY 进程健康监控**
+- [ ] **P3: tmux 状态栏定制**
+- [ ] **MCP jump_host 架构更新**：同步独立 WeTTY 实例架构
