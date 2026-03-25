@@ -142,15 +142,33 @@ export function useTerminal(
       onResizeRef.current?.({ cols: size.cols, rows: size.rows });
     });
 
-    // 窗口 resize → 重新 fit
-    const handleWindowResize = () => {
-      try {
-        fitAddon.fit();
-      } catch {
-        // 忽略
-      }
+    // ── 容器尺寸变化 → debounce fit ──────────────
+    // 使用 ResizeObserver 替代 window.resize 事件：
+    //  - window.resize 仅感知浏览器窗口尺寸变化
+    //  - ResizeObserver 能感知容器 DOM 本身的尺寸变化（侧边栏折叠/展开、面板拖拽等）
+    // 使用 requestAnimationFrame + 标志位实现 debounce：
+    //  - 避免拖拽期间高频 fit() 导致 DOM 重排和终端闪烁
+    //  - 比 setTimeout debounce 更流畅，与浏览器渲染帧同步
+    let rafId: number | null = null;
+    const debouncedFit = () => {
+      if (rafId !== null) return; // 当前帧已有排队，跳过
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        try {
+          fitAddon.fit();
+        } catch {
+          // 忽略（容器尺寸为 0 等边界场景）
+        }
+      });
     };
-    window.addEventListener("resize", handleWindowResize);
+
+    const resizeObserver = new ResizeObserver(() => {
+      debouncedFit();
+    });
+    resizeObserver.observe(container);
+
+    // 保留 window.resize 作为兜底（某些浏览器 ResizeObserver 可能遗漏全屏切换等场景）
+    window.addEventListener("resize", debouncedFit);
 
     // 存储引用
     termRef.current = term;
@@ -158,7 +176,9 @@ export function useTerminal(
 
     // ── 清理 ──
     return () => {
-      window.removeEventListener("resize", handleWindowResize);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", debouncedFit);
       dataDisposable.dispose();
       resizeDisposable.dispose();
       term.dispose();

@@ -5,6 +5,7 @@
  *  - 管理与 WeTTY server 的 socket.io 连接生命周期
  *  - 桥接 socket.io 事件与 xterm.js 终端（通过 TerminalHandle）
  *  - 自动重连 + 连接状态追踪
+ *  - 冷启动期间静默重试（不显示错误）
  *
  * WeTTY socket.io 事件协议：
  *  Client → Server:
@@ -20,6 +21,7 @@
  *  - 只负责「网络连接」，不涉及终端 UI（由 useTerminal 管理）
  *  - 连接路径从 WeTTY basePath 动态构造：`${basePath}/socket.io`
  *  - 通过 onData 回调将 server 数据传递给终端
+ *  - 冷启动静默重试：WeTTY 进程启动需要时间，期间连接失败不报错
  */
 
 import { useRef, useEffect, useCallback, useState } from "react";
@@ -53,6 +55,18 @@ export interface WettySocketHandle {
   disconnect: () => void;
 }
 
+/** 冷启动静默重试配置 */
+const COLD_START_CONFIG = {
+  /** 首次重连延迟（毫秒）- WeTTY 通常在 500ms 内就绪 */
+  reconnectionDelay: 300,
+  /** 最大重连延迟 */
+  reconnectionDelayMax: 2000,
+  /** 静默重试次数 - 超过此次数才显示错误 */
+  silentRetryCount: 3,
+  /** 最大重连次数 */
+  reconnectionAttempts: 10,
+};
+
 /**
  * WeTTY socket.io 连接 Hook
  *
@@ -63,6 +77,7 @@ export function useWettySocket(options: UseWettySocketOptions): WettySocketHandl
   const { basePath, onData, onConnect, onDisconnect } = options;
   const [status, setStatus] = useState<SocketStatus>("disconnected");
   const socketRef = useRef<Socket | null>(null);
+  const connectionAttemptsRef = useRef(0);
 
   // 用 ref 存储回调避免 effect 依赖变化导致重连
   const onDataRef = useRef(onData);
@@ -80,6 +95,7 @@ export function useWettySocket(options: UseWettySocketOptions): WettySocketHandl
     }
 
     setStatus("connecting");
+    connectionAttemptsRef.current = 0;
 
     // socket.io 连接路径：basePath + /socket.io
     // 例如 basePath = /wetty/t/tce-server → path = /wetty/t/tce-server/socket.io
@@ -92,11 +108,11 @@ export function useWettySocket(options: UseWettySocketOptions): WettySocketHandl
       transports: ["polling", "websocket"],
       // 超时配置（对齐 WeTTY server 端）
       timeout: 10000,
-      // 自动重连
+      // 冷启动优化：快速重连
       reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
+      reconnectionAttempts: COLD_START_CONFIG.reconnectionAttempts,
+      reconnectionDelay: COLD_START_CONFIG.reconnectionDelay,
+      reconnectionDelayMax: COLD_START_CONFIG.reconnectionDelayMax,
     });
 
     socketRef.current = socket;
@@ -104,6 +120,7 @@ export function useWettySocket(options: UseWettySocketOptions): WettySocketHandl
     // ── socket.io 事件监听 ──
 
     socket.on("connect", () => {
+      connectionAttemptsRef.current = 0; // 重置计数
       setStatus("connected");
       onConnectRef.current?.();
     });
@@ -123,12 +140,32 @@ export function useWettySocket(options: UseWettySocketOptions): WettySocketHandl
     });
 
     socket.on("disconnect", (reason: string) => {
-      setStatus("disconnected");
-      onDisconnectRef.current?.(reason);
+      // 非主动断开时才设置 disconnected
+      if (reason !== "io client disconnect") {
+        setStatus("disconnected");
+        onDisconnectRef.current?.(reason);
+      }
     });
 
     socket.on("connect_error", (err: Error) => {
+      connectionAttemptsRef.current += 1;
+
+      // 冷启动静默重试：前 N 次失败不显示错误
+      if (connectionAttemptsRef.current <= COLD_START_CONFIG.silentRetryCount) {
+        console.log(
+          `[WeTTY] 终端启动中，自动重连... (${connectionAttemptsRef.current}/${COLD_START_CONFIG.silentRetryCount})`
+        );
+        // 保持 "connecting" 状态，让 socket.io 自动重试
+        return;
+      }
+
+      // 超过静默重试次数，显示错误
       console.error("[WeTTY socket] 连接错误:", err.message);
+      setStatus("error");
+    });
+
+    socket.on("reconnect_failed", () => {
+      console.error("[WeTTY socket] 重连失败，已达最大重试次数");
       setStatus("error");
     });
 

@@ -43,6 +43,22 @@ async function fetchWithRetry(
 
 // ── 类型定义 ──────────────────────────────────
 
+/** 主机类型 */
+export type HostType = "direct" | "bastion" | "jump_host";
+
+/** 登录交互步骤（堡垒机跳转时的 wait→send 原子操作） */
+export interface LoginStep {
+  wait: string;
+  send: string;
+  timeout: number;
+}
+
+/** 堡垒机跳板配置 */
+export interface JumpHostConfig {
+  ready_pattern: string;
+  login_success_pattern: string;
+}
+
 export interface Host {
   id: number;
   name: string;
@@ -53,6 +69,16 @@ export interface Host {
   private_key_path?: string;
   description?: string;
   tags: string[];
+
+  // ── 跳板主机字段 ──
+  host_type: HostType;
+  parent_id?: number | null;
+  target_ip?: string | null;
+  jump_config?: JumpHostConfig | null;
+  login_steps?: LoginStep[] | null;
+  /** 二级主机列表（仅 bastion 类型） */
+  children: Host[];
+
   created_at: string;
   updated_at: string;
 }
@@ -91,6 +117,8 @@ export interface WeTTYInstance {
   port: number;
   url: string;
   running: boolean;
+  /** 堡垒机名称（仅 jump_host 时由后端返回） */
+  bastion_name?: string | null;
 }
 
 export interface CreateHostRequest {
@@ -103,6 +131,13 @@ export interface CreateHostRequest {
   password?: string;
   description?: string;
   tags?: string[];
+
+  // ── 跳板主机字段 ──
+  host_type?: HostType;
+  parent_id?: number;
+  target_ip?: string;
+  jump_config?: JumpHostConfig;
+  login_steps?: LoginStep[];
 }
 
 // ── 主机管理 ──────────────────────────────────
@@ -219,6 +254,65 @@ export async function listWeTTYInstances(): Promise<WeTTYInstance[]> {
   return res.json();
 }
 
+// ── tmux 窗口管理 ──────────────────────────
+
+/** tmux 客户端信息 */
+export interface TmuxClient {
+  tty: string;      // 客户端 TTY（如 /dev/pts/3）
+  window: string;   // 当前窗口名
+  session: string;  // 会话名
+}
+
+/**
+ * 获取堡垒机 tmux 会话的所有客户端信息
+ *
+ * 前端 socket.io 连接建立后调用，获取当前所有 client。
+ * 返回每个客户端的 TTY、当前窗口和会话信息，前端可以据此识别自己的 client。
+ *
+ * @param bastionName - 堡垒机名称
+ */
+export async function fetchClientTtys(bastionName: string): Promise<TmuxClient[]> {
+  const res = await fetch(`${API_BASE}/tmux/client-ttys/${encodeURIComponent(bastionName)}`);
+  if (!res.ok) throw new Error(`获取 tmux client 列表失败: ${res.statusText}`);
+  const data = await res.json();
+  return data.clients ?? [];
+}
+
+/**
+ * 切换 tmux 窗口（per-client 模式）
+ *
+ * 支持两种模式：
+ * - 提供 clientTty: 只切换该 client 的视图（多 Tab 独立视图）
+ * - 不提供 clientTty: 全局切换所有 client（向后兼容）
+ *
+ * @param bastionName - 堡垒机名称
+ * @param windowName - 目标窗口名（如二级主机名 m12、m15）
+ * @param clientTty - 可选，指定 tmux client TTY
+ */
+export async function switchTmuxWindow(
+  bastionName: string,
+  windowName: string,
+  clientTty?: string,
+): Promise<void> {
+  const body: Record<string, string> = {
+    bastion_name: bastionName,
+    window_name: windowName,
+  };
+  if (clientTty) {
+    body.client_tty = clientTty;
+  }
+
+  const res = await fetch(`${API_BASE}/tmux/switch-window`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`切换 tmux 窗口失败: ${detail}`);
+  }
+}
+
 // ── SSE 事件订阅（模块级单例 · fetch + ReadableStream 实现）──
 
 /**
@@ -246,6 +340,8 @@ const SSE_EVENT_TYPES = new Set([
   "command_error",
   "session_created",
   "session_closed",
+  "session_error",
+  "window_switched",
 ]);
 
 /**
