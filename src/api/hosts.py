@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.database import get_db
-from src.models.host import HostCreate, HostResponse, HostUpdate
+from src.models.host import HostCreate, HostResponse, HostType, HostUpdate
 from src.services.host_manager import HostManager
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
@@ -27,9 +27,15 @@ async def list_hosts(
     tag: str | None = None,
     manager: HostManager = Depends(_get_manager),
 ) -> list[HostResponse]:
-    """获取主机列表，支持按标签过滤"""
+    """获取主机列表（树形结构），支持按标签过滤
+
+    返回顶层主机列表（direct / bastion），不包含 jump_host 类型。
+    jump_host 作为其所属 bastion 的 children 子列表返回。
+    """
     hosts = await manager.list_hosts(tag=tag)
-    return [HostResponse.from_orm_model(h) for h in hosts]
+    # jump_host 通过 bastion.children 递归返回，不出现在顶层列表
+    top_level = [h for h in hosts if h.host_type != HostType.JUMP_HOST]
+    return [HostResponse.from_orm_model(h) for h in top_level]
 
 
 @router.get("/{host_id}", response_model=HostResponse)
