@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.models.host import AuthType, Host
+from src.utils.ssh_command import build_ssh_command
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,76 @@ class WeTTYManager:
         """列出所有 WeTTY 实例"""
         return [p.info for p in self._instances.values()]
 
+    def get_ssh_command(self, host_name: str) -> Optional[str]:
+        """获取指定主机实例的 SSH 连接命令
+
+        用于 jump_host 后台编排：在新 tmux 窗口中需要先 SSH 到堡垒机，
+        此方法返回堡垒机的完整 SSH 命令字符串（含认证参数），
+        可直接传给 tmux new-window 的 command 参数。
+
+        Args:
+            host_name: 主机名（堡垒机名称）
+
+        Returns:
+            SSH 命令字符串，实例不存在或未运行时返回 None
+        """
+        process = self._instances.get(host_name)
+        if process and process.is_running:
+            return process.ssh_command
+        return None
+
+    def get_instance(self, host_name: str) -> Optional[WeTTYInstance]:
+        """获取指定主机的 WeTTY 实例信息
+
+        Args:
+            host_name: 主机名
+
+        Returns:
+            WeTTYInstance 实例信息，不存在时返回 None
+        """
+        process = self._instances.get(host_name)
+        if process and process.is_running:
+            return process.info
+        return None
+
+    async def start_instance_for_jump_host(
+        self,
+        instance_name: str,
+        bastion: Host,
+    ) -> WeTTYInstance:
+        """为 jump_host 创建独立的 WeTTY 实例
+
+        使用堡垒机的连接信息，但实例名使用复合名称（如 tce-server--m12）。
+        这样每个 jump_host Tab 有独立的 WeTTY 实例，输入完全隔离。
+
+        Args:
+            instance_name: 实例名（复合名称，如 tce-server--m12）
+            bastion: 父堡垒机 ORM 对象
+
+        Returns:
+            WeTTYInstance 实例信息
+        """
+        async with self._lock:
+            # 复用已有实例
+            if instance_name in self._instances:
+                existing = self._instances[instance_name]
+                if existing.is_running:
+                    return existing.info
+                # 已停止，清理后重建
+                del self._instances[instance_name]
+
+            port = self._allocate_port()
+            process = _WeTTYProcess(
+                host=bastion,  # 使用堡垒机连接信息
+                port=port,
+                instance_name=instance_name,  # 使用复合名称
+            )
+            await process.start()
+            self._instances[instance_name] = process
+
+        logger.info("WeTTY 实例已启动 (jump_host): %s -> port %d", instance_name, port)
+        return process.info
+
     def _allocate_port(self) -> int:
         """分配下一个可用端口"""
         port = self._port_counter
@@ -164,17 +235,38 @@ class _WeTTYProcess:
     # tmux 会话名前缀
     TMUX_SESSION_PREFIX = "wetty"
 
-    def __init__(self, host: Host, port: int) -> None:
+    def __init__(self, host: Host, port: int, instance_name: Optional[str] = None) -> None:
         self.host = host
         self.port = port
         self._process: Optional[asyncio.subprocess.Process] = None
-        self._base_path = self.BASE_PATH_TEMPLATE.format(host_name=host.name)
-        self._tmux_session_name = f"{self.TMUX_SESSION_PREFIX}-{host.name}"
+        # 使用传入的 instance_name（如复合名称）或默认使用 host.name
+        self._effective_name = instance_name or host.name
+        self._base_path = self.BASE_PATH_TEMPLATE.format(host_name=self._effective_name)
+        self._tmux_session_name = f"{self.TMUX_SESSION_PREFIX}-{self._effective_name}"
 
     @property
     def tmux_session_name(self) -> str:
         """tmux 会话名称，供外部查询"""
         return self._tmux_session_name
+
+    @property
+    def ssh_command(self) -> str:
+        """该实例对应主机的 SSH 连接命令
+
+        复用公共 build_ssh_command()，保持与 tmux-session.sh 的 SSH 命令格式一致。
+        用于 jump_host 场景：在新 tmux 窗口中需要先 SSH 到堡垒机。
+
+        Returns:
+            完整的 SSH 命令字符串（可直接在 shell 中执行）
+        """
+        decrypted_password = self._decrypt_host_password()
+        return build_ssh_command(
+            hostname=self.host.hostname,
+            port=self.host.port,
+            username=self.host.username,
+            password=decrypted_password,
+            key_path=self.host.private_key_path,
+        )
 
     async def start(self) -> None:
         """启动 WeTTY 进程
@@ -277,7 +369,7 @@ class _WeTTYProcess:
     @property
     def info(self) -> WeTTYInstance:
         return WeTTYInstance(
-            host_name=self.host.name,
+            host_name=self._effective_name,  # 使用 effective_name（支持复合名称）
             port=self.port,
             pid=self._process.pid if self._process else None,
             url=f"{self._base_path}/",
@@ -286,6 +378,8 @@ class _WeTTYProcess:
 
     def _decrypt_host_password(self) -> Optional[str]:
         """解密主机密码，失败时记录日志并返回 None"""
+        if not self.host.password_encrypted:
+            return None
         try:
             from src.utils.security import decrypt_password
             return decrypt_password(self.host.password_encrypted)

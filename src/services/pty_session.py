@@ -71,6 +71,7 @@ class PTYSessionInfo:
     created_at: str
     last_activity: str
     screen_lines: int
+    tmux_window: str | None = None
 
 
 # ── PTY 会话实现 ──────────────────────────────
@@ -92,11 +93,13 @@ class PTYSession:
         host_name: str,
         wetty_port: int,
         wetty_base_path: str,
+        tmux_window: str | None = None,
     ) -> None:
         self.session_id = session_id
         self.host_name = host_name
         self.wetty_port = wetty_port
         self.wetty_base_path = wetty_base_path
+        self.tmux_window = tmux_window
 
         # socket.io 客户端
         self._sio = socketio.AsyncClient(
@@ -374,6 +377,7 @@ class PTYSession:
             created_at=self._created_at.isoformat(),
             last_activity=self._last_activity.isoformat(),
             screen_lines=len(self._raw_buffer),
+            tmux_window=self.tmux_window,
         )
 
     # ── socket.io 事件处理 ──────────────────────
@@ -422,6 +426,7 @@ class PTYSessionManager:
         wetty_port: int,
         wetty_base_path: str,
         connect_timeout: float = 15.0,
+        tmux_window: str | None = None,
     ) -> PTYSession:
         """创建并连接 PTY 会话
 
@@ -430,6 +435,7 @@ class PTYSessionManager:
             wetty_port: WeTTY 实例端口
             wetty_base_path: WeTTY base path（如 /wetty/t/tce-server）
             connect_timeout: 连接超时
+            tmux_window: 绑定的 tmux 窗口名（二级主机场景）
 
         Returns:
             已连接的 PTYSession
@@ -443,6 +449,7 @@ class PTYSessionManager:
             host_name=host_name,
             wetty_port=wetty_port,
             wetty_base_path=wetty_base_path,
+            tmux_window=tmux_window,
         )
 
         await session.connect(timeout=connect_timeout)
