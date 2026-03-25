@@ -41,12 +41,25 @@ build_ssh_command() {
 
 SSH_CMD=$(build_ssh_command)
 
-# ── tmux 全局配置 ─────────────────────────────
-# window-size largest：tmux 始终使用最大客户端的窗口尺寸
+# ── tmux 配置文件 ─────────────────────────────
+# 注意：tmux set-option -g 需要 tmux 服务器已运行，而首次创建会话时
+# 服务器尚未启动，命令会静默失败。因此必须通过配置文件设置全局选项，
+# tmux 在启动服务器（new-session）时会自动加载 ~/.tmux.conf。
+TMUX_CONF="$HOME/.tmux.conf"
+cat > "$TMUX_CONF" << 'EOF'
+# ── wetty-mcp-terminal tmux 配置 ──
+
+# window-size largest：始终使用最大客户端的窗口尺寸
 # 解决多客户端（浏览器 + Agent PTY）attach 时尺寸不同导致的点号填充问题
-# Agent PTY 尺寸通常较小（80x30），浏览器终端较大（~76x72），
-# 使用 largest 确保浏览器（主界面）的显示不受 Agent 影响
-tmux set-option -g window-size largest 2>/dev/null || true
+set-option -g window-size largest
+
+# default-terminal xterm-256color：覆盖 tmux 默认的 tmux-256color
+# tmux 默认将 $TERM 设为 tmux-256color，通过 SSH 传播到目标主机后，
+# 旧版 CentOS/RHEL 的 terminfo 库可能没有该条目，导致 top/vim 等报错：
+#   'tmux-256color': unknown terminal type.
+# xterm-256color 是几乎所有 Linux 发行版都预装的 terminfo，兼容性最好
+set-option -g default-terminal "xterm-256color"
+EOF
 
 # ── tmux 会话管理 ─────────────────────────────
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
