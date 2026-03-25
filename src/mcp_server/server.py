@@ -27,9 +27,12 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from src.models.database import async_session_factory
+from src.models.host import Host, HostType
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
+from src.services.jump_orchestrator import JumpOrchestrator
 from src.services.pty_session import PTYSessionManager
+from src.services.tmux_manager import TmuxWindowManager
 from src.services.wetty_manager import WeTTYManager
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ logger = logging.getLogger(__name__)
 # ── 全局引用（通过 init_mcp_server 注入，避免循环依赖）──
 _wetty_manager: WeTTYManager | None = None
 _pty_manager: PTYSessionManager | None = None
+_tmux_manager: TmuxWindowManager | None = None
 
 # 创建 MCP Server 实例
 mcp = FastMCP(
@@ -56,12 +60,18 @@ mcp = FastMCP(
 )
 
 
-def init_mcp_server(wetty_manager: WeTTYManager) -> None:
-    """初始化 MCP Server 的依赖（由 main.py 在启动时调用）"""
-    global _wetty_manager, _pty_manager
+def init_mcp_server(wetty_manager: WeTTYManager, tmux_manager: TmuxWindowManager | None = None) -> None:
+    """初始化 MCP Server 的依赖（由 main.py 在启动时调用）
+
+    Args:
+        wetty_manager: WeTTY 实例管理器
+        tmux_manager: tmux 窗口管理器（可选，不传则内部创建）
+    """
+    global _wetty_manager, _pty_manager, _tmux_manager
     _wetty_manager = wetty_manager
     _pty_manager = PTYSessionManager()
-    logger.info("MCP Server 依赖注入完成（PTY 交互式模式）")
+    _tmux_manager = tmux_manager or TmuxWindowManager()
+    logger.info("MCP Server 依赖注入完成（PTY 交互式模式 + tmux 多窗口）")
 
 
 def get_pty_manager() -> PTYSessionManager | None:
@@ -110,6 +120,13 @@ def _get_pty_manager() -> PTYSessionManager:
     return _pty_manager
 
 
+def _get_tmux_manager() -> TmuxWindowManager:
+    """获取 tmux 窗口管理器实例"""
+    if _tmux_manager is None:
+        raise RuntimeError("MCP Server 尚未初始化，请先调用 init_mcp_server()")
+    return _tmux_manager
+
+
 async def _publish_event(event_type: str, session_id: str, host_name: str, data: dict | None = None) -> None:
     """发布 SSE 事件"""
     await event_bus.publish(
@@ -129,6 +146,9 @@ async def _publish_event(event_type: str, session_id: str, host_name: str, data:
 async def list_hosts(tag: Optional[str] = None) -> str:
     """列出所有可用的 SSH 主机
 
+    返回树形结构：bastion 类型主机会列出其下的二级主机（jump_host）。
+    可直接使用主机名连接，包括二级主机名。
+
     Args:
         tag: 可选，按标签过滤主机列表
 
@@ -141,8 +161,12 @@ async def list_hosts(tag: Optional[str] = None) -> str:
 
     result = []
     for h in hosts:
+        # 跳过 jump_host（它们在 bastion 的 children 中展示）
+        if h.host_type == HostType.JUMP_HOST:
+            continue
+
         tags = [t.strip() for t in h.tags.split(",") if t.strip()] if h.tags else []
-        result.append({
+        host_info: dict = {
             "id": h.id,
             "name": h.name,
             "hostname": h.hostname,
@@ -150,7 +174,21 @@ async def list_hosts(tag: Optional[str] = None) -> str:
             "username": h.username,
             "description": h.description,
             "tags": tags,
-        })
+            "type": h.host_type.value,
+        }
+
+        # bastion 类型展示二级主机列表
+        if h.is_bastion and h.children:
+            host_info["jump_hosts"] = [
+                {
+                    "name": c.name,
+                    "target_ip": c.target_ip,
+                    "description": c.description,
+                }
+                for c in h.children
+            ]
+
+        result.append(host_info)
 
     if not result:
         return "没有找到可用的主机。请先通过管理界面添加主机。"
@@ -162,51 +200,62 @@ async def list_hosts(tag: Optional[str] = None) -> str:
 async def connect_host(host_name: str) -> str:
     """连接到指定的 SSH 主机
 
-    自动启动 WeTTY 终端实例并建立 PTY 交互式会话。
-    如果浏览器已连接（WeTTY 实例已运行），则直接 attach 到同一个 tmux 会话，
-    浏览器和 Agent 共享终端，互相可见。
+    自动识别主机类型并执行对应连接流程：
+    - direct / bastion: 启动 WeTTY 实例 + PTY 会话
+    - jump_host: 复用父堡垒机的 WeTTY 实例，自动编排跳板连接
 
     Args:
-        host_name: 主机名称（在 list_hosts 中查看）
+        host_name: 主机名称（在 list_hosts 中查看，包括二级主机名）
 
     Returns:
         连接结果，包含 session_id 供后续命令使用
     """
-    # 查找主机
+    # 查找主机（jump_host 需同时获取父堡垒机）
     async with async_session_factory() as session:
         mgr = HostManager(session)
         host = await mgr.get_host_by_name(host_name)
+        bastion = None
+        if host and host.is_jump_host and host.parent_id:
+            bastion = await mgr.get_host_by_id(host.parent_id)
 
     if not host:
         return f"错误：未找到名为 '{host_name}' 的主机。请先用 list_hosts 查看可用主机。"
 
+    # 按主机类型分发
+    if host.is_jump_host:
+        if not bastion:
+            return f"错误：二级主机 '{host_name}' 的父堡垒机不存在。请检查配置。"
+        return await _connect_jump_host(host, bastion)
+
+    return await _connect_direct_host(host)
+
+
+async def _connect_direct_host(host: Host) -> str:
+    """直连主机 / 堡垒机的连接流程（启动 WeTTY + PTY）"""
     wetty_mgr = _get_wetty_manager()
     pty_mgr = _get_pty_manager()
 
-    # 检测是否已有运行中的 WeTTY 实例（浏览器可能已连接）
-    is_attach_mode = wetty_mgr.has_running_instance(host_name)
+    is_attach_mode = wetty_mgr.has_running_instance(host.name)
 
-    # Step 1: 启动 WeTTY 实例（已有则复用）
+    # 启动 WeTTY 实例（已有则复用）
     try:
         instance = await wetty_mgr.start_instance(host)
     except Exception as e:
         return f"错误：WeTTY 启动失败 - {e}"
 
-    # Step 2: 等待 WeTTY 进程就绪
+    # 等待 WeTTY 进程就绪
     if is_attach_mode:
-        # attach 模式：WeTTY 实例已运行，tmux 会话已存在，短暂等待即可
         await asyncio.sleep(0.5)
-        logger.info("connect_host: attach 模式 — WeTTY 实例已存在，tmux 会话 attach")
+        logger.info("connect_host: attach 模式 — WeTTY 实例已存在 (%s)", host.name)
     else:
-        # new 模式：新启动的 WeTTY 实例，需要等待进程启动 + SSH 建立
         await asyncio.sleep(2.0)
-        logger.info("connect_host: new 模式 — 新 WeTTY 实例，等待 SSH 建立")
+        logger.info("connect_host: new 模式 — 新 WeTTY 实例 (%s)", host.name)
 
-    # Step 3: 建立 PTY socket.io 连接
-    base_path = f"/wetty/t/{host_name}"
+    # 建立 PTY socket.io 连接
+    base_path = f"/wetty/t/{host.name}"
     try:
         pty_session = await pty_mgr.create_session(
-            host_name=host_name,
+            host_name=host.name,
             wetty_port=instance.port,
             wetty_base_path=base_path,
             connect_timeout=15.0,
@@ -215,7 +264,7 @@ async def connect_host(host_name: str) -> str:
         return f"错误：PTY 连接失败 - {e}"
 
     mode_label = "attach（共享浏览器终端）" if is_attach_mode else "new（新建终端）"
-    await _publish_event("session_created", pty_session.session_id, host_name, {
+    await _publish_event("session_created", pty_session.session_id, host.name, {
         "hostname": host.hostname,
         "username": host.username,
         "mode": "pty",
@@ -223,7 +272,8 @@ async def connect_host(host_name: str) -> str:
     })
 
     return (
-        f"已连接到 {host.username}@{host.hostname}:{host.port}（PTY 交互式模式 — {mode_label}）\n"
+        f"已连接到 {host.username}@{host.hostname}:{host.port}"
+        f"（PTY 交互式模式 — {mode_label}）\n"
         f"Session ID: {pty_session.session_id}\n"
         f"终端已在浏览器中实时显示。你的所有操作浏览器可实时看到。\n\n"
         f"提示：\n"
@@ -232,6 +282,88 @@ async def connect_host(host_name: str) -> str:
         f"- 用 run_command 执行命令并获取输出\n"
         f"- 用 read_terminal 查看当前终端屏幕"
     )
+
+
+async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
+    """二级主机的连接流程（复用堡垒机 WeTTY + tmux 新窗口 + 跳板编排）"""
+    wetty_mgr = _get_wetty_manager()
+    pty_mgr = _get_pty_manager()
+    tmux_mgr = _get_tmux_manager()
+
+    # Step 1: 确保堡垒机 WeTTY 实例运行中（已有则复用）
+    is_new_bastion = not wetty_mgr.has_running_instance(bastion.name)
+    try:
+        instance = await wetty_mgr.start_instance(bastion)
+    except Exception as e:
+        return f"错误：堡垒机 WeTTY 启动失败 - {e}"
+
+    if is_new_bastion:
+        await asyncio.sleep(2.0)
+        logger.info("connect_jump_host: 堡垒机 WeTTY 新启动 (%s)", bastion.name)
+    else:
+        await asyncio.sleep(0.5)
+        logger.info("connect_jump_host: 堡垒机 WeTTY 已存在，复用 (%s)", bastion.name)
+
+    # Step 2: 在堡垒机 tmux session 中创建新窗口
+    tmux_session = TmuxWindowManager.session_name_for(bastion.name)
+    window_name = jump_host.name
+
+    if not await tmux_mgr.create_window(tmux_session, window_name):
+        return f"错误：tmux 窗口创建失败 ({tmux_session}:{window_name})"
+
+    # Step 3: 建立 PTY 连接（连接到堡垒机 WeTTY，绑定 tmux 窗口）
+    base_path = f"/wetty/t/{bastion.name}"
+    try:
+        pty_session = await pty_mgr.create_session(
+            host_name=jump_host.name,
+            wetty_port=instance.port,
+            wetty_base_path=base_path,
+            connect_timeout=15.0,
+            tmux_window=window_name,
+        )
+    except ConnectionError as e:
+        return f"错误：PTY 连接失败 - {e}"
+
+    # Step 4: 执行跳板编排
+    orchestrator = JumpOrchestrator(pty_session)
+    result = await orchestrator.execute_jump(
+        jump_host=jump_host,
+        bastion=bastion,
+        tmux_session_name=tmux_session,
+        window_name=window_name,
+    )
+
+    if not result.success:
+        await _publish_event("session_error", pty_session.session_id, jump_host.name, {
+            "error": result.message,
+        })
+        return f"错误：跳板连接失败 - {result.message}"
+
+    await _publish_event("session_created", pty_session.session_id, jump_host.name, {
+        "hostname": jump_host.target_ip,
+        "bastion": bastion.name,
+        "mode": "pty",
+        "tmux_mode": "jump",
+        "tmux_window": window_name,
+        "steps_executed": result.steps_executed,
+    })
+
+    msg = (
+        f"已通过堡垒机 {bastion.name} 连接到 {jump_host.name}"
+        f"（{jump_host.target_ip}）\n"
+        f"Session ID: {pty_session.session_id}\n"
+        f"{result.message}\n"
+        f"终端已在浏览器中实时显示（tmux 窗口: {window_name}）。\n\n"
+        f"提示：\n"
+        f"- 用 run_command 执行命令并获取输出\n"
+        f"- 用 list_windows 查看当前堡垒机的所有窗口\n"
+        f"- 用 switch_window 在不同二级主机之间切换"
+    )
+
+    if result.skipped_reason:
+        msg += f"\n\n注意：{result.skipped_reason}"
+
+    return msg
 
 
 @mcp.tool()
@@ -460,3 +592,76 @@ async def disconnect(session_id: str) -> str:
         return f"已断开与 {host_name} 的 PTY 连接。Session: {session_id[:8]}..."
     else:
         return f"断开失败：会话 {session_id} 不存在。"
+
+
+@mcp.tool()
+async def list_windows(bastion_name: str) -> str:
+    """列出堡垒机的所有 tmux 窗口
+
+    查看堡垒机 tmux 会话中的所有窗口（包括主窗口和二级主机窗口），
+    当前活跃的窗口会标注 [active]。
+
+    Args:
+        bastion_name: 堡垒机名称
+
+    Returns:
+        窗口列表信息（JSON 格式）
+    """
+    tmux_mgr = _get_tmux_manager()
+    tmux_session = TmuxWindowManager.session_name_for(bastion_name)
+
+    if not await tmux_mgr.session_exists(tmux_session):
+        return f"错误：堡垒机 '{bastion_name}' 的 tmux 会话不存在。请先连接堡垒机。"
+
+    windows = await tmux_mgr.list_windows(tmux_session)
+    if not windows:
+        return f"堡垒机 '{bastion_name}' 当前没有打开的窗口。"
+
+    result = [
+        {
+            "index": w.window_index,
+            "name": w.window_name,
+            "active": w.active,
+        }
+        for w in windows
+    ]
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def switch_window(bastion_name: str, window_name: str) -> str:
+    """切换堡垒机的活跃 tmux 窗口
+
+    在堡垒机的不同二级主机之间切换。切换后浏览器终端会实时显示
+    目标窗口的内容，Agent 后续命令也作用于新的活跃窗口。
+
+    Args:
+        bastion_name: 堡垒机名称
+        window_name: 目标窗口名（如二级主机名 m12、m15）
+
+    Returns:
+        切换结果
+    """
+    tmux_mgr = _get_tmux_manager()
+    tmux_session = TmuxWindowManager.session_name_for(bastion_name)
+
+    if not await tmux_mgr.session_exists(tmux_session):
+        return f"错误：堡垒机 '{bastion_name}' 的 tmux 会话不存在。请先连接堡垒机。"
+
+    success = await tmux_mgr.select_window(tmux_session, window_name)
+    if not success:
+        # 提供可用窗口列表辅助诊断
+        windows = await tmux_mgr.list_windows(tmux_session)
+        available = ", ".join(w.window_name for w in windows)
+        return (
+            f"错误：切换窗口失败。窗口 '{window_name}' 可能不存在。\n"
+            f"可用窗口: {available or '无'}"
+        )
+
+    await _publish_event("window_switched", "", bastion_name, {
+        "window_name": window_name,
+        "tmux_session": tmux_session,
+    })
+
+    return f"已切换到窗口 '{window_name}'（{tmux_session}:{window_name}）"
