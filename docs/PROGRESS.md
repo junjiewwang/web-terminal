@@ -856,9 +856,36 @@ _run_jump_orchestration():
   - Agent 先连 → 浏览器后连验证
   - 多 PTY 会话并发测试
 
+- [x] **P0: MCP jump_host 架构更新**（独立 WeTTY 实例架构）
+  - 修复 MCP `_connect_jump_host` 使用旧架构（复用堡垒机 WeTTY + tmux 新窗口）问题
+  - 改用 `start_instance_for_jump_host` 创建独立 WeTTY 实例
+  - 设置 `skip_window_creation=True` 跳过 tmux 窗口创建
+  - MCP 连接 m12 成功，资源使用情况正常获取
+
+- [x] **P0: 浏览器 tce-server 与 m12 同步问题修复**
+  - **问题现象**：切换到 m12 Tab 时，后端日志显示 `wetty-tce-server:m12 - can't find window: m12`
+  - **根因**：前端 `createTabForHost` 手动设置 `bastionName = "tce-server"`（不包含 "--"），但 API 返回的 `bastion_name` 是 `tce-server--m12`（包含 "--"）
+  - **修复（第一轮）**：在 `TerminalView` 检测到独立 WeTTY 实例时，通过 `onBastionNameUpdate` 回调更新 Tab 的 `bastionName`
+  - **修复（第二轮）**：`createTabForHost` 和 `handleHostSelect` 不再为 jump_host 设置 `bastionName` 和 `tmuxWindow`，等待 API 返回后由 `onBastionNameUpdate` 更新，避免 Tab 切换时使用旧值
+  - **涉及文件**：`frontend/src/components/TerminalView.tsx`、`frontend/src/App.tsx`、`frontend/src/components/TerminalTabs.tsx`
+  - **验证状态**：✅ 浏览器端到端测试通过（Tab 创建 + 多次切换无错误）
+
+- [x] **P1: 移除断开按钮，优化 Tab 关闭逻辑**
+  - **问题现象**：状态栏的"断开终端"按钮点击后会自动重连，功能与 Tab 关闭按钮重复
+  - **根因**：TerminalView 组件始终挂载（Tab 未关闭），断开后 `useEffect` 立即触发重连
+  - **修复方案**：
+    1. 移除状态栏的"✕ 断开终端"按钮
+    2. 修复 `handleTabClose`：正确关闭 jump_host 的独立 WeTTY 实例（使用 `bastionName`）
+    3. 修复后端 API：返回正确的 `bastion_name`（独立实例名如 `"tce-server--m12"`）
+    4. 修复后端 API 复用实例时也返回 `bastion_name`
+    5. 修复前端 Tab 显示：从 `bastionName` 提取堡垒机名作为前缀（`split("--")[0]`）
+    6. 修复前端 header 显示：同样从 `bastionName` 提取堡垒机名
+    7. **修复核心问题**：WeTTY 关闭时清理 tmux session，避免下次启动时复用旧 session
+  - **涉及文件**：`frontend/src/components/TerminalView.tsx`、`frontend/src/App.tsx`、`frontend/src/components/TerminalTabs.tsx`、`src/api/wetty.py`、`src/services/wetty_manager.py`
+  - **验证状态**：✅ 前端构建成功，待容器重启后验证
+
 ### 🔲 进行中
 
 - [ ] **P1: tmux 会话超时/清理机制**
 - [ ] **P2: WeTTY 进程健康监控**
 - [ ] **P3: tmux 状态栏定制**
-- [ ] **MCP jump_host 架构更新**：同步独立 WeTTY 实例架构

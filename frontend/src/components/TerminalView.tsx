@@ -16,7 +16,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Host, WeTTYInstance } from "../services/api";
-import { startWeTTY, stopWeTTY, fetchClientTtys } from "../services/api";
+import { startWeTTY, fetchClientTtys } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
 import { useWettySocket, type SocketStatus } from "../hooks/useWettySocket";
 
@@ -32,12 +32,15 @@ interface TerminalViewProps {
   isActive: boolean;
   /** tmux client TTY 获取成功后的回调（用于 per-client 窗口切换） */
   onClientTtyReady?: (tty: string) => void;
+  /** bastionName 更新回调（独立 WeTTY 实例检测后更新 Tab 状态） */
+  onBastionNameUpdate?: (bastionName: string) => void;
 }
 
 export default function TerminalView({
   host,
   isActive,
   onClientTtyReady,
+  onBastionNameUpdate,
 }: TerminalViewProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -167,6 +170,11 @@ export default function TerminalView({
       let path: string;
       if (instance.bastion_name) {
         path = `/wetty/t/${instance.bastion_name}`;
+        // 独立 WeTTY 实例（名称包含 "--"），更新 Tab 的 bastionName
+        // 这样 handleTabSelect 能正确跳过 tmux 切换
+        if (instance.bastion_name.includes("--") && onBastionNameUpdate) {
+          onBastionNameUpdate(instance.bastion_name);
+        }
       } else {
         path = instance.url.replace(/\/$/, "");
       }
@@ -178,20 +186,7 @@ export default function TerminalView({
       setError(msg);
       setStatus("error");
     }
-  }, []);
-
-  // ── 断开连接 ────────────────────────────────
-  const disconnectFromHost = useCallback(() => {
-    if (host && host.host_type !== "jump_host") {
-      stopWeTTY(host.name).catch(console.error);
-    }
-    wettySocket.disconnect();
-    setBasePath(null);
-    setStatus("idle");
-    setError(null);
-    prevHostIdRef.current = null;
-    clientTtyReportedRef.current = false;
-  }, [host, wettySocket]);
+  }, [onBastionNameUpdate]);
 
   // ── 当 host 变化时自动启动 WeTTY ──
   useEffect(() => {
@@ -238,7 +233,6 @@ export default function TerminalView({
         host={host}
         status={status}
         socketStatus={wettySocket.status}
-        onDisconnect={disconnectFromHost}
         onReconnect={() => connectToHost(host)}
       />
 
@@ -301,13 +295,11 @@ function _StatusBar({
   host,
   status,
   socketStatus,
-  onDisconnect,
   onReconnect,
 }: {
   host: Host;
   status: ConnectionStatus;
   socketStatus: SocketStatus;
-  onDisconnect?: () => void;
   onReconnect?: () => void;
 }) {
   const cfg = STATUS_MAP[status];
@@ -329,15 +321,6 @@ function _StatusBar({
             title="重新连接"
           >
             ↻
-          </button>
-        )}
-        {(status === "connected" || status === "connecting") && onDisconnect && (
-          <button
-            onClick={onDisconnect}
-            className="ml-2 px-1.5 py-0.5 text-[10px] text-gray-500 hover:text-red-400 hover:bg-gray-800 rounded transition-colors"
-            title="断开终端"
-          >
-            ✕
           </button>
         )}
       </div>

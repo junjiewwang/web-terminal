@@ -168,7 +168,7 @@ async def _start_jump_host(
     # 使用复合名称（bastion_name--jump_host_name）确保唯一性
     instance_name = f"{bastion.name}--{jump_host.name}"
 
-    # 如果已有该实例，直接返回
+    # 如果已有该实例，直接返回（不再执行跳板编排，实例已连接到目标主机）
     if manager.has_running_instance(instance_name):
         instance = manager.get_instance(instance_name)
         if instance:
@@ -177,7 +177,7 @@ async def _start_jump_host(
                 port=instance.port,
                 url=instance.url,
                 running=instance.running,
-                bastion_name=None,
+                bastion_name=instance_name,  # 返回实例名，前端需要它来关闭实例
             )
         # 实例已停止，继续创建新实例
 
@@ -213,14 +213,16 @@ async def _start_jump_host(
         )
     )
 
-    # Step 4: 返回独立 WeTTY 的 URL（不设置 bastion_name）
-    # 前端会直接连接这个独立的 WeTTY 实例
+    # Step 4: 返回独立 WeTTY 的 URL 和 bastion_name
+    # 前端需要 bastion_name 来：
+    # 1. 判断是否是独立 WeTTY 实例（包含 "--"）
+    # 2. 正确关闭 WeTTY 实例
     return WeTTYInstanceResponse(
         host_name=instance.host_name,
         port=instance.port,
         url=instance.url,
         running=instance.running,
-        bastion_name=None,  # 关键：不设置 bastion_name，表示独立实例
+        bastion_name=instance_name,  # 独立实例名，如 "tce-server--m12"
     )
 
 
