@@ -85,6 +85,13 @@ export default function App() {
     return cleanup;
   }, []);
 
+  // ── 更新 Tab 数据中的 bastionName（独立 WeTTY 实例检测）──
+  const handleBastionNameUpdate = useCallback((tabId: string, bastionName: string) => {
+    setTabs((prev) =>
+      prev.map((t) => (t.id === tabId ? { ...t, bastionName } : t)),
+    );
+  }, []);
+
   // ── 更新 Tab 数据中的 clientTty + 立即触发 switch（如果 tab 是 active 的）──
   // 注意：独立 WeTTY 模式下（bastionName 包含 "--"）不需要 tmux switch
   const handleClientTtyReady = useCallback((tabId: string, tty: string) => {
@@ -119,20 +126,12 @@ export default function App() {
         return;
       }
 
-      // 新建 Tab
-      let bastionName: string | undefined;
-      if (host.host_type === "jump_host" && host.parent_id) {
-        const parentBastion = hosts.find(
-          (h) => h.id === host.parent_id || h.children?.some((c) => c.id === host.id),
-        );
-        bastionName = parentBastion?.name;
-      }
-
-      const newTab = createTabForHost(host, bastionName);
+      // 新建 Tab（不再传递 bastionName，等待 API 返回后由 onBastionNameUpdate 更新）
+      const newTab = createTabForHost(host);
       setTabs((prev) => [...prev, newTab]);
       setActiveTabId(tabId);
     },
-    [tabs, hosts],
+    [tabs],
   );
 
   // ── Tab 切换（per-client tmux switch-client）──
@@ -163,9 +162,13 @@ export default function App() {
     (tabId: string) => {
       const closingTab = tabs.find((t) => t.id === tabId);
       if (closingTab) {
-        if (closingTab.host.host_type !== "jump_host") {
-          stopWeTTY(closingTab.host.name).catch(() => {});
-        }
+        // 关闭对应的 WeTTY 实例
+        // - jump_host（独立 WeTTY 实例）：使用 bastionName（如 "tce-server--m12"）
+        // - bastion/direct：使用 host.name
+        const instanceName = closingTab.bastionName?.includes("--")
+          ? closingTab.bastionName
+          : closingTab.host.name;
+        stopWeTTY(instanceName).catch(() => {});
       }
 
       setTabs((prev) => {
@@ -187,7 +190,7 @@ export default function App() {
   // ── 终端区域 header 信息 ──
   const headerText = activeTab
     ? activeTab.host.host_type === "jump_host" && activeTab.host.target_ip
-      ? `${activeTab.bastionName ?? "bastion"} → ${activeTab.host.name} (${activeTab.host.target_ip})`
+      ? `${activeTab.bastionName?.includes("--") ? activeTab.bastionName.split("--")[0] : activeTab.bastionName ?? "bastion"} → ${activeTab.host.name} (${activeTab.host.target_ip})`
       : `${activeTab.host.username}@${activeTab.host.hostname}:${activeTab.host.port}`
     : "请选择一个主机";
 
@@ -253,6 +256,9 @@ export default function App() {
                   host={tab.host}
                   isActive={tab.id === activeTabId}
                   onClientTtyReady={(tty) => handleClientTtyReady(tab.id, tty)}
+                  onBastionNameUpdate={(bastionName) =>
+                    handleBastionNameUpdate(tab.id, bastionName)
+                  }
                 />
               </div>
             ))

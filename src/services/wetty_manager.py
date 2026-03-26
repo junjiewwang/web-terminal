@@ -353,7 +353,7 @@ class _WeTTYProcess:
         return " ".join(args)
 
     async def stop(self) -> None:
-        """停止 WeTTY 进程"""
+        """停止 WeTTY 进程并清理 tmux session"""
         if self._process and self._process.returncode is None:
             self._process.terminate()
             try:
@@ -361,6 +361,30 @@ class _WeTTYProcess:
             except asyncio.TimeoutError:
                 self._process.kill()
             self._process = None
+
+        # 清理对应的 tmux session
+        await self._cleanup_tmux_session()
+
+    async def _cleanup_tmux_session(self) -> None:
+        """清理 WeTTY 对应的 tmux session"""
+        import subprocess
+
+        session_name = self._tmux_session_name
+        try:
+            # 检查 session 是否存在
+            result = subprocess.run(
+                ["tmux", "has-session", "-t", session_name],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                # Session 存在，终止它
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", session_name],
+                    capture_output=True,
+                )
+                logger.info("tmux session 已清理: %s", session_name)
+        except Exception as e:
+            logger.warning("清理 tmux session 失败: %s", e)
 
     @property
     def is_running(self) -> bool:

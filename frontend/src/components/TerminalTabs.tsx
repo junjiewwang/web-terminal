@@ -27,19 +27,17 @@ export function tabIdForHost(host: Host): string {
 }
 
 /** 根据 Host 对象创建 TerminalTab */
-export function createTabForHost(host: Host, bastionName?: string): TerminalTab {
+export function createTabForHost(host: Host): TerminalTab {
   return {
     id: tabIdForHost(host),
     label: host.name,
     host,
-    // bastionName: jump_host 填父堡垒机名；bastion 自身也填（用于 tmux switch API）
-    // 但 bastion 自身不需要显示前缀，TerminalTabs 组件通过 host_type 判断
-    bastionName: host.host_type === "jump_host" ? bastionName : host.host_type === "bastion" ? host.name : undefined,
-    tmuxWindow: host.host_type === "jump_host"
-      ? host.name
-      : host.host_type === "bastion"
-        ? "0" // 堡垒机默认窗口（window index 0）
-        : undefined,
+    // bastionName: jump_host 不在这里设置，等待 API 返回后由 onBastionNameUpdate 更新
+    // bastion: 自身填 name（用于 tmux switch API）
+    bastionName: host.host_type === "bastion" ? host.name : undefined,
+    // tmuxWindow: jump_host 不在这里设置，等待 API 返回后判断是否独立 WeTTY 实例
+    // bastion: 默认窗口（window index 0）
+    tmuxWindow: host.host_type === "bastion" ? "0" : undefined,
   };
 }
 
@@ -104,7 +102,13 @@ export default function TerminalTabs({
             {/* Tab 名称（仅 jump_host 显示 bastion 前缀） */}
             <span className="truncate">
               {tab.host.host_type === "jump_host" && tab.bastionName && (
-                <span className="text-gray-600 mr-0.5">{tab.bastionName}/</span>
+                <span className="text-gray-600 mr-0.5">
+                  {/* 独立实例名格式为 "bastion--jump_host"，提取堡垒机名作为前缀 */}
+                  {tab.bastionName.includes("--")
+                    ? tab.bastionName.split("--")[0]
+                    : tab.bastionName}
+                  /
+                </span>
               )}
               {tab.label}
             </span>
