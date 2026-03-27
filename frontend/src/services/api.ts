@@ -121,6 +121,15 @@ export interface WeTTYInstance {
   bastion_name?: string | null;
 }
 
+/** 新架构：终端会话信息（替代 WeTTYInstance） */
+export interface TerminalInstance {
+  session_id: string;
+  instance_name: string;
+  running: boolean;
+  ws_url: string;
+  bastion_name?: string | null;
+}
+
 export interface CreateHostRequest {
   name: string;
   hostname: string;
@@ -252,6 +261,43 @@ export async function listWeTTYInstances(): Promise<WeTTYInstance[]> {
   const res = await fetch(`${API_BASE}/wetty`);
   if (!res.ok) throw new Error(`获取 WeTTY 列表失败: ${res.statusText}`);
   return res.json();
+}
+
+// ── 新架构：终端会话管理（Python PTY 直连）──
+
+export async function startTerminal(hostId: number): Promise<TerminalInstance> {
+  _globalSSE?.pause();
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(`${API_BASE}/terminal/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host_id: hostId }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error(`启动终端失败: ${res.statusText}`);
+    return res.json();
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("启动终端超时（15s），请检查网络连接");
+    }
+    throw err;
+  } finally {
+    _globalSSE?.resume();
+  }
+}
+
+export async function stopTerminal(instanceName: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/terminal/stop/${encodeURIComponent(instanceName)}`, {
+    method: "POST",
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`停止终端失败: ${res.statusText}`);
+  }
 }
 
 // ── tmux 窗口管理 ──────────────────────────

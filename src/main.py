@@ -17,20 +17,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.api import events, hosts, sessions, tmux, wetty, wetty_proxy
+from src.api import events, hosts, sessions, tmux
+from src.api import terminal as terminal_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
 from src.models.database import async_session_factory, init_db
 from src.services.host_manager import HostManager
 from src.services.ssh_session import SSHSessionManager
+from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
-from src.services.wetty_manager import WeTTYManager
 from src.utils.security import generate_api_token, verify_api_token
 
 logger = logging.getLogger(__name__)
 
 # 全局服务实例
 ssh_manager = SSHSessionManager()
-wetty_manager = WeTTYManager()
+terminal_manager = TerminalManager()
 tmux_manager_instance = TmuxWindowManager()
 
 # hosts.yaml 路径
@@ -59,14 +60,12 @@ async def lifespan(app: FastAPI):
 
     # 注入全局服务实例到 API 模块
     sessions.ssh_manager = ssh_manager
-    wetty.wetty_manager = wetty_manager
-    wetty.tmux_manager = tmux_manager_instance
-    wetty_proxy.wetty_manager = wetty_manager
     tmux.tmux_manager = tmux_manager_instance
+    terminal_api.terminal_manager = terminal_manager
+    terminal_api.tmux_manager = tmux_manager_instance
 
-    # 初始化 MCP Server 依赖（PTY 交互式模式，通过 WeTTY socket.io 共享终端）
-    # tmux_manager_instance 由 REST API 和 MCP 工具共享
-    init_mcp_server(wetty_manager, tmux_manager=tmux_manager_instance)
+    # 初始化 MCP Server 依赖
+    init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance)
 
     # 生成 API Token（设置了 WETTY_API_TOKEN 环境变量时启用认证）
     env_token = os.environ.get("WETTY_API_TOKEN")
@@ -106,8 +105,7 @@ async def lifespan(app: FastAPI):
         if pty_mgr:
             await pty_mgr.close_all()
         await ssh_manager.close_all()
-        await wetty_manager.stop_all()
-        await wetty_proxy.shutdown_proxy()
+        await terminal_manager.stop_all()
     logger.info("服务已关闭 ✓")
 
 
@@ -181,7 +179,7 @@ async def _cleanup_zombie_sessions_loop() -> None:
     try:
         while True:
             try:
-                cleaned = await wetty_manager.cleanup_zombie_sessions()
+                cleaned = await terminal_manager.cleanup_zombie_sessions()
                 if cleaned:
                     logger.info("定期清理: 清理了 %d 个 zombie tmux session", cleaned)
             except Exception:
@@ -265,8 +263,7 @@ async def auth_middleware(request: Request, call_next):
 app.include_router(hosts.router)
 app.include_router(sessions.router)
 app.include_router(events.router)
-app.include_router(wetty.router)
-app.include_router(wetty_proxy.router)
+app.include_router(terminal_api.router)
 app.include_router(tmux.router)
 
 # ── 挂载 MCP Server（SSE 模式）──────────────

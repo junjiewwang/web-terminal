@@ -8,7 +8,7 @@ import TerminalTabs, {
   type TerminalTab,
 } from "./components/TerminalTabs";
 import type { Host, AgentEvent } from "./services/api";
-import { fetchHosts, fetchEventHistory, subscribeEvents, stopWeTTY, switchTmuxWindow } from "./services/api";
+import { fetchHosts, fetchEventHistory, subscribeEvents, stopTerminal } from "./services/api";
 
 /**
  * 应用主布局：左侧主机列表 + 中间（Tab 栏 + 终端）+ 右侧 Agent 面板
@@ -85,36 +85,20 @@ export default function App() {
     return cleanup;
   }, []);
 
-  // ── 更新 Tab 数据中的 bastionName（独立 WeTTY 实例检测）──
-  const handleBastionNameUpdate = useCallback((tabId: string, bastionName: string) => {
+  // ── 更新 Tab 数据中的 instanceName（终端启动后由 TerminalView 回调更新）──
+  const handleInstanceNameUpdate = useCallback((tabId: string, instanceName: string) => {
     setTabs((prev) =>
-      prev.map((t) => (t.id === tabId ? { ...t, bastionName } : t)),
+      prev.map((t) => (t.id === tabId ? { ...t, bastionName: instanceName } : t)),
     );
   }, []);
 
-  // ── 更新 Tab 数据中的 clientTty + 立即触发 switch（如果 tab 是 active 的）──
-  // 注意：独立 WeTTY 模式下（bastionName 包含 "--"）不需要 tmux switch
-  const handleClientTtyReady = useCallback((tabId: string, tty: string) => {
-    setTabs((prev) => {
-      const updated = prev.map((t) => (t.id === tabId ? { ...t, clientTty: tty } : t));
-      // 如果该 tab 当前是 active 的，立即执行 per-client tmux switch
-      // 独立 WeTTY 模式下跳过
-      if (tabId === activeTabId) {
-        const tab = updated.find((t) => t.id === tabId);
-        if (
-          tab?.tmuxWindow &&
-          tab?.bastionName &&
-          !tab.bastionName.includes("--") // 独立 WeTTY 实例名包含 "--"
-        ) {
-          switchTmuxWindow(tab.bastionName, tab.tmuxWindow, tty)
-            .catch((err) => console.warn("tmux 窗口切换失败:", err));
-        }
-      }
-      return updated;
-    });
-  }, [activeTabId]);
-
-  // ── 主机选择 → 打开/切换 Tab ──
+  // ── Tab 切换（新架构下每个 Tab 有独立 PTY，不需要 tmux switch）──
+  const handleTabSelect = useCallback(
+    (tabId: string) => {
+      setActiveTabId(tabId);
+    },
+    [],
+  );
   const handleHostSelect = useCallback(
     (host: Host) => {
       const tabId = tabIdForHost(host);
@@ -134,41 +118,14 @@ export default function App() {
     [tabs],
   );
 
-  // ── Tab 切换（per-client tmux switch-client）──
-  const handleTabSelect = useCallback(
-    (tabId: string) => {
-      setActiveTabId(tabId);
-
-      // jump_host Tab 切换时，使用 per-client switch 只切换该 Tab 的 tmux 视图
-      // 注意：独立 WeTTY 模式下（bastionName 包含 "--"）不需要 tmux switch
-      const targetTab = tabs.find((t) => t.id === tabId);
-      if (
-        targetTab?.tmuxWindow &&
-        targetTab.bastionName &&
-        !targetTab.bastionName.includes("--") // 独立 WeTTY 实例名包含 "--"
-      ) {
-        switchTmuxWindow(
-          targetTab.bastionName,
-          targetTab.tmuxWindow,
-          targetTab.clientTty, // 有 clientTty 时用 per-client 模式，否则全局
-        ).catch((err) => console.warn("tmux 窗口切换失败:", err));
-      }
-    },
-    [tabs],
-  );
-
   // ── 关闭 Tab ──
   const handleTabClose = useCallback(
     (tabId: string) => {
       const closingTab = tabs.find((t) => t.id === tabId);
       if (closingTab) {
-        // 关闭对应的 WeTTY 实例
-        // - jump_host（独立 WeTTY 实例）：使用 bastionName（如 "tce-server--m12"）
-        // - bastion/direct：使用 host.name
-        const instanceName = closingTab.bastionName?.includes("--")
-          ? closingTab.bastionName
-          : closingTab.host.name;
-        stopWeTTY(instanceName).catch(() => {});
+        // 关闭终端会话：使用 instanceName（bastionName 字段存储）
+        const instanceName = closingTab.bastionName || closingTab.host.name;
+        stopTerminal(instanceName).catch(() => {});
       }
 
       setTabs((prev) => {
@@ -190,7 +147,7 @@ export default function App() {
   // ── 终端区域 header 信息 ──
   const headerText = activeTab
     ? activeTab.host.host_type === "jump_host" && activeTab.host.target_ip
-      ? `${activeTab.bastionName?.includes("--") ? activeTab.bastionName.split("--")[0] : activeTab.bastionName ?? "bastion"} → ${activeTab.host.name} (${activeTab.host.target_ip})`
+      ? `${activeTab.bastionName?.split("--")[0] ?? "bastion"} → ${activeTab.host.name} (${activeTab.host.target_ip})`
       : `${activeTab.host.username}@${activeTab.host.hostname}:${activeTab.host.port}`
     : "请选择一个主机";
 
@@ -255,9 +212,8 @@ export default function App() {
                 <TerminalView
                   host={tab.host}
                   isActive={tab.id === activeTabId}
-                  onClientTtyReady={(tty) => handleClientTtyReady(tab.id, tty)}
-                  onBastionNameUpdate={(bastionName) =>
-                    handleBastionNameUpdate(tab.id, bastionName)
+                  onInstanceNameUpdate={(instanceName) =>
+                    handleInstanceNameUpdate(tab.id, instanceName)
                   }
                 />
               </div>
