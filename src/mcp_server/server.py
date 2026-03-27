@@ -544,8 +544,6 @@ async def get_session_status(session_id: Optional[str] = None) -> str:
             "session_id": s.session_id,
             "instance_name": s.instance_name,
             "running": s.running,
-            "instance_name": s.instance_name,
-            "running": s.running,
             "mode": "pty",
         })
     return json.dumps(result, ensure_ascii=False, indent=2)

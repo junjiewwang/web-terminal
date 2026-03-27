@@ -331,7 +331,7 @@ class TerminalSession:
     ) -> str:
         """等待 PTY 输出中出现指定模式（Agent 使用，expect 风格）"""
         import re
-        from src.services.pty_session import strip_ansi
+        from src.services.pty_session import is_tmux_status_line, strip_ansi
 
         if not self._running:
             raise ConnectionError("终端会话未运行")
@@ -361,6 +361,9 @@ class TerminalSession:
 
                 for line in new_lines:
                     clean_line = strip_ansi(line)
+                    # 过滤 tmux 状态栏行，避免干扰提示符匹配
+                    if is_tmux_status_line(clean_line):
+                        continue
                     collected_lines.append(clean_line)
 
                 full_text = "\n".join(collected_lines)
@@ -396,11 +399,12 @@ class TerminalSession:
 
     def read_screen(self, lines: int = 50) -> str:
         """读取终端屏幕缓冲区（Agent 使用）"""
-        from src.services.pty_session import strip_ansi
+        from src.services.pty_session import strip_ansi, strip_tmux_status
 
         buf = list(self._raw_buffer)
         recent = buf[-lines:] if len(buf) > lines else buf
-        return strip_ansi("\n".join(recent))
+        raw_text = strip_ansi("\n".join(recent))
+        return strip_tmux_status(raw_text)
 
     # ── 内部方法 ──────────────────────────────────
 

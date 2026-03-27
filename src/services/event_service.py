@@ -26,6 +26,8 @@ class EventType(str, Enum):
     COMMAND_ERROR = "command_error"
     SESSION_CREATED = "session_created"
     SESSION_CLOSED = "session_closed"
+    SESSION_ERROR = "session_error"
+    WINDOW_SWITCHED = "window_switched"
 
 
 @dataclass
