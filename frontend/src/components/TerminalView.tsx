@@ -32,12 +32,19 @@ interface TerminalViewProps {
   isActive: boolean;
   /** instanceName 更新回调（用于 Tab 关闭时 stop 正确的实例） */
   onInstanceNameUpdate?: (instanceName: string) => void;
+  /**
+   * 外部传入的 WebSocket URL（如 /ws/terminal/{session_id}）。
+   * 当 Agent 通过 MCP 已创建会话时，前端通过 SSE 感知后直接传入 ws_url，
+   * 跳过 startTerminal API 调用，直接建立 WebSocket 连接。
+   */
+  initialWsUrl?: string | null;
 }
 
 export default function TerminalView({
   host,
   isActive,
   onInstanceNameUpdate,
+  initialWsUrl,
 }: TerminalViewProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -141,8 +148,15 @@ export default function TerminalView({
     }
 
     prevHostIdRef.current = host.id;
-    connectToHost(host);
-  }, [host, connectToHost, wsUrl, ws]);
+
+    // 如果外部传入了 wsUrl（Agent 已创建会话），直接连接 WebSocket
+    if (initialWsUrl) {
+      setWsUrl(initialWsUrl);
+      setStatus("connecting");
+    } else {
+      connectToHost(host);
+    }
+  }, [host, connectToHost, wsUrl, ws, initialWsUrl]);
 
   // ── 空状态 ──
   if (!host) {

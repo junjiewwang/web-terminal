@@ -17,6 +17,8 @@ export interface TerminalTab {
   tmuxWindow?: string;
   /** 该 Tab 对应的 tmux client TTY（socket.io 连接建立后获取） */
   clientTty?: string;
+  /** Agent 已创建会话时的 WebSocket URL（跳过 startTerminal） */
+  wsUrl?: string;
 }
 
 // ── 辅助函数 ──────────────────────────────────────
@@ -32,12 +34,10 @@ export function createTabForHost(host: Host): TerminalTab {
     id: tabIdForHost(host),
     label: host.name,
     host,
-    // bastionName: jump_host 不在这里设置，等待 API 返回后由 onBastionNameUpdate 更新
-    // bastion: 自身填 name（用于 tmux switch API）
-    bastionName: host.host_type === "bastion" ? host.name : undefined,
-    // tmuxWindow: jump_host 不在这里设置，等待 API 返回后判断是否独立 WeTTY 实例
-    // bastion: 默认窗口（window index 0）
-    tmuxWindow: host.host_type === "bastion" ? "0" : undefined,
+    // bastionName 存储 instanceName（用于关闭时 stop 正确的终端会话）
+    // - direct/bastion: host.name
+    // - jump_host: 由 onInstanceNameUpdate 回调更新为 "bastion--jump_host"
+    bastionName: host.host_type !== "jump_host" ? host.name : undefined,
   };
 }
 

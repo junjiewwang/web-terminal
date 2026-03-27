@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import HostList from "./components/HostList";
 import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
@@ -8,7 +8,7 @@ import TerminalTabs, {
   type TerminalTab,
 } from "./components/TerminalTabs";
 import type { Host, AgentEvent } from "./services/api";
-import { fetchHosts, fetchEventHistory, subscribeEvents, stopTerminal } from "./services/api";
+import { fetchHosts, fetchEventHistory, subscribeEvents, stopTerminal, fetchTerminals } from "./services/api";
 
 /**
  * 应用主布局：左侧主机列表 + 中间（Tab 栏 + 终端）+ 右侧 Agent 面板
@@ -19,11 +19,10 @@ import { fetchHosts, fetchEventHistory, subscribeEvents, stopTerminal } from "./
  * - activeTabId: 当前活跃的 Tab ID
  * - events: Agent 事件列表
  *
- * 多 Tab 独立终端模式：
- * - 每个 Tab 持有独立的 TerminalView 实例（独立的 socket.io 连接 + xterm.js）
- * - 切换 Tab 时非活跃的 TerminalView 保持连接不销毁
- * - Tab 切换时通过 tmux switch-client -c 只切换该 Tab 的 tmux client 视图，
- *   不影响其他 Tab 的终端内容
+ * Agent ↔ 浏览器状态同步（SSE 事件驱动）：
+ * - session_created: Agent 通过 MCP 连接主机后，前端自动创建 Tab + WebSocket
+ * - session_closed: Agent 断开连接后，前端自动移除对应 Tab
+ * - 页面加载时一次性轮询 /api/terminal 同步已有会话（覆盖 Agent 先于浏览器连接的场景）
  */
 export default function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
@@ -36,6 +35,12 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+
+  // 用 ref 追踪最新的 hosts/tabs（SSE 回调中需要访问最新值，避免闭包陈旧问题）
+  const hostsRef = useRef<Host[]>([]);
+  hostsRef.current = hosts;
+  const tabsRef = useRef<TerminalTab[]>([]);
+  tabsRef.current = tabs;
 
   // 已连接的主机 ID 集合（从已打开的 Tab 推断）
   const connectedHostIds = useMemo(
@@ -63,7 +68,7 @@ export default function App() {
     loadHosts();
   }, [loadHosts]);
 
-  // ── SSE 事件订阅 + 历史事件加载 ──
+  // ── SSE 事件订阅 + 历史事件加载 + Agent 操作联动 ──
   useEffect(() => {
     fetchEventHistory().then((history) => {
       if (history.length > 0) {
@@ -81,9 +86,160 @@ export default function App() {
 
     const cleanup = subscribeEvents((event) => {
       setEvents((prev) => [...prev.slice(-99), event]);
+
+      // ── SSE 事件驱动 UI 联动 ──
+      if (event.event_type === "session_created") {
+        _handleSessionCreated(event);
+      } else if (event.event_type === "session_closed") {
+        _handleSessionClosed(event);
+      }
     });
     return cleanup;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * Agent session_created → 自动匹配主机并创建 Tab
+   *
+   * 查找策略：
+   * 1. 从 event.host_name 匹配顶层主机（direct/bastion）
+   * 2. 从 event.host_name 匹配二级主机（jump_host，在 bastion.children 中）
+   * 3. 从 event.data.instance_name 匹配（兜底，覆盖 bastion--jump_host 格式）
+   */
+  function _handleSessionCreated(event: AgentEvent) {
+    const allHosts = hostsRef.current;
+    const currentTabs = tabsRef.current;
+    const hostName = event.host_name;
+    const sessionId = event.session_id;
+    const instanceName = (event.data.instance_name as string) || "";
+
+    // 查找匹配的 Host 对象
+    let matchedHost: Host | undefined;
+
+    // 策略1：顶层主机名匹配
+    matchedHost = allHosts.find((h) => h.name === hostName);
+
+    // 策略2：二级主机（在 bastion.children 中查找）
+    if (!matchedHost) {
+      for (const h of allHosts) {
+        if (h.children?.length) {
+          const child = h.children.find((c) => c.name === hostName);
+          if (child) {
+            matchedHost = child;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!matchedHost) return;
+
+    // 检查是否已有对应 Tab（避免重复创建）
+    const tabId = tabIdForHost(matchedHost);
+    if (currentTabs.some((t) => t.id === tabId)) return;
+
+    // 构造 wsUrl
+    const wsUrl = sessionId ? `/ws/terminal/${sessionId}` : undefined;
+
+    // 创建新 Tab（携带 wsUrl，TerminalView 将直接连接 WebSocket 而非调 startTerminal）
+    const newTab: TerminalTab = {
+      ...createTabForHost(matchedHost),
+      bastionName: instanceName || matchedHost.name,
+      wsUrl,
+    };
+
+    setTabs((prev) => [...prev, newTab]);
+    // 如果当前无活跃 Tab，自动切换到新 Tab
+    setActiveTabId((prev) => prev ?? tabId);
+  }
+
+  /**
+   * Agent session_closed → 自动移除对应 Tab
+   *
+   * 查找策略：通过 host_name 或 instance_name 匹配已有 Tab
+   */
+  function _handleSessionClosed(event: AgentEvent) {
+    const hostName = event.host_name;
+
+    setTabs((prev) => {
+      // 通过 host_name 匹配 Tab（Tab 的 host.name 或 bastionName）
+      const closingTab = prev.find(
+        (t) => t.host.name === hostName || t.bastionName === hostName,
+      );
+      if (!closingTab) return prev;
+
+      const remaining = prev.filter((t) => t.id !== closingTab.id);
+
+      // 如果关闭的是当前活跃 Tab，切换到相邻 Tab
+      setActiveTabId((currentId) => {
+        if (currentId !== closingTab.id) return currentId;
+        const closedIdx = prev.findIndex((t) => t.id === closingTab.id);
+        const nextTab =
+          remaining[Math.min(closedIdx, remaining.length - 1)] ?? null;
+        return nextTab?.id ?? null;
+      });
+
+      return remaining;
+    });
+  }
+
+  // ── 页面加载时同步已有终端会话（覆盖 Agent 先于浏览器打开的场景）──
+  useEffect(() => {
+    // 等待主机列表加载完成后再同步
+    if (hostsLoading || hosts.length === 0) return;
+
+    fetchTerminals().then((sessions) => {
+      if (sessions.length === 0) return;
+
+      setTabs((prev) => {
+        const existingIds = new Set(prev.map((t) => t.id));
+        const newTabs: TerminalTab[] = [];
+
+        for (const session of sessions) {
+          if (!session.running) continue;
+
+          // 从 instance_name 解析出主机名
+          // 格式: "host_name" 或 "bastion--jump_host"
+          const parts = session.instance_name.split("--");
+          const targetName = parts.length > 1 ? parts[1] : parts[0];
+
+          // 在 hosts 中查找匹配的主机
+          let matchedHost: Host | undefined;
+          for (const h of hosts) {
+            if (h.name === targetName) {
+              matchedHost = h;
+              break;
+            }
+            if (h.children?.length) {
+              const child = h.children.find((c) => c.name === targetName);
+              if (child) {
+                matchedHost = child;
+                break;
+              }
+            }
+          }
+
+          if (!matchedHost) continue;
+
+          const tabId = tabIdForHost(matchedHost);
+          if (existingIds.has(tabId)) continue;
+          existingIds.add(tabId);
+
+          newTabs.push({
+            ...createTabForHost(matchedHost),
+            bastionName: session.instance_name,
+            wsUrl: session.ws_url,
+          });
+        }
+
+        if (newTabs.length === 0) return prev;
+
+        // 自动选中第一个新 Tab（如果当前没有活跃 Tab）
+        setActiveTabId((currentId) => currentId ?? newTabs[0].id);
+        return [...prev, ...newTabs];
+      });
+    });
+  }, [hostsLoading, hosts]);
 
   // ── 更新 Tab 数据中的 instanceName（终端启动后由 TerminalView 回调更新）──
   const handleInstanceNameUpdate = useCallback((tabId: string, instanceName: string) => {
@@ -124,7 +280,14 @@ export default function App() {
       const closingTab = tabs.find((t) => t.id === tabId);
       if (closingTab) {
         // 关闭终端会话：使用 instanceName（bastionName 字段存储）
-        const instanceName = closingTab.bastionName || closingTab.host.name;
+        let instanceName = closingTab.bastionName || closingTab.host.name;
+        // jump_host fallback：如果 onInstanceNameUpdate 还没执行，从 hosts 推断 bastion--name
+        if (!closingTab.bastionName && closingTab.host.host_type === "jump_host") {
+          const bastion = hosts.find(h => h.children?.some(c => c.id === closingTab.host.id));
+          if (bastion) {
+            instanceName = `${bastion.name}--${closingTab.host.name}`;
+          }
+        }
         stopTerminal(instanceName).catch(() => {});
       }
 
@@ -212,6 +375,7 @@ export default function App() {
                 <TerminalView
                   host={tab.host}
                   isActive={tab.id === activeTabId}
+                  initialWsUrl={tab.wsUrl}
                   onInstanceNameUpdate={(instanceName) =>
                     handleInstanceNameUpdate(tab.id, instanceName)
                   }
