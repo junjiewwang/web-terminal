@@ -1,10 +1,8 @@
 """MCP Server - AI Agent 工具接口
 
-基于 FastMCP 实现 Agent 工具，支持两种模式：
-1. PTY 交互式模式（默认）：通过 WeTTY socket.io 共享终端，支持堡垒机交互，浏览器实时回显
-2. exec 直连模式（备用）：通过 asyncssh 直接执行命令，适合可直连的目标主机
+通过 Python PTY 直连终端，支持堡垒机交互，浏览器通过 WebSocket 实时回显。
 
-PTY 模式工具（堡垒机 + 浏览器回显）：
+PTY 模式工具：
   - connect_host: 连接到指定主机（自动启动 WeTTY + PTY 会话）
   - run_command: 在会话中执行命令（通过 PTY 发送 + 等待提示符）
   - send_input: 向终端发送任意输入（菜单选择、交互式命令等）
@@ -31,15 +29,13 @@ from src.models.host import Host, HostType
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import JumpOrchestrator
-from src.services.pty_session import PTYSessionManager
+from src.services.terminal_manager import TerminalManager, TerminalSession
 from src.services.tmux_manager import TmuxWindowManager
-from src.services.wetty_manager import WeTTYManager, wait_for_port
 
 logger = logging.getLogger(__name__)
 
-# ── 全局引用（通过 init_mcp_server 注入，避免循环依赖）──
-_wetty_manager: WeTTYManager | None = None
-_pty_manager: PTYSessionManager | None = None
+# ── 全局引用（通过 init_mcp_server 注入）──
+_terminal_manager: TerminalManager | None = None
 _tmux_manager: TmuxWindowManager | None = None
 
 # 创建 MCP Server 实例
@@ -60,23 +56,17 @@ mcp = FastMCP(
 )
 
 
-def init_mcp_server(wetty_manager: WeTTYManager, tmux_manager: TmuxWindowManager | None = None) -> None:
-    """初始化 MCP Server 的依赖（由 main.py 在启动时调用）
-
-    Args:
-        wetty_manager: WeTTY 实例管理器
-        tmux_manager: tmux 窗口管理器（可选，不传则内部创建）
-    """
-    global _wetty_manager, _pty_manager, _tmux_manager
-    _wetty_manager = wetty_manager
-    _pty_manager = PTYSessionManager()
+def init_mcp_server(terminal_manager: TerminalManager, tmux_manager: TmuxWindowManager | None = None) -> None:
+    """初始化 MCP Server 的依赖（由 main.py 在启动时调用）"""
+    global _terminal_manager, _tmux_manager
+    _terminal_manager = terminal_manager
     _tmux_manager = tmux_manager or TmuxWindowManager()
-    logger.info("MCP Server 依赖注入完成（PTY 交互式模式 + tmux 多窗口）")
+    logger.info("MCP Server 依赖注入完成（Python PTY 直连模式）")
 
 
-def get_pty_manager() -> PTYSessionManager | None:
-    """获取 PTY 会话管理器实例（供外部模块使用，如 lifespan 清理）"""
-    return _pty_manager
+def get_pty_manager() -> None:
+    """兼容旧接口（不再需要独立的 PTY Manager）"""
+    return None
 
 
 # ── 命令安全过滤 ──────────────────────────────
@@ -106,18 +96,11 @@ def _validate_command(command: str) -> str | None:
 # ── 内部工具函数 ──────────────────────────────
 
 
-def _get_wetty_manager() -> WeTTYManager:
-    """获取 WeTTY 管理器实例"""
-    if _wetty_manager is None:
+def _get_terminal_manager() -> TerminalManager:
+    """获取终端管理器实例"""
+    if _terminal_manager is None:
         raise RuntimeError("MCP Server 尚未初始化，请先调用 init_mcp_server()")
-    return _wetty_manager
-
-
-def _get_pty_manager() -> PTYSessionManager:
-    """获取 PTY 会话管理器实例"""
-    if _pty_manager is None:
-        raise RuntimeError("MCP Server 尚未初始化，请先调用 init_mcp_server()")
-    return _pty_manager
+    return _terminal_manager
 
 
 def _get_tmux_manager() -> TmuxWindowManager:
@@ -137,6 +120,18 @@ async def _publish_event(event_type: str, session_id: str, host_name: str, data:
             data=data or {},
         )
     )
+
+
+def _decrypt_host_password(host: Host) -> str | None:
+    """解密主机密码"""
+    if not host.password_encrypted:
+        return None
+    try:
+        from src.utils.security import decrypt_password
+        return decrypt_password(host.password_encrypted)
+    except Exception as e:
+        logger.warning("密码解密失败 (%s): %s", host.name, e)
+        return None
 
 
 # ── MCP 工具定义 ──────────────────────────────
@@ -231,171 +226,113 @@ async def connect_host(host_name: str) -> str:
 
 
 async def _connect_direct_host(host: Host) -> str:
-    """直连主机 / 堡垒机的连接流程（启动 WeTTY + PTY）"""
-    wetty_mgr = _get_wetty_manager()
-    pty_mgr = _get_pty_manager()
+    """直连主机 / 堡垒机的连接流程（Python PTY 直连）"""
+    mgr = _get_terminal_manager()
 
-    is_attach_mode = wetty_mgr.has_running_instance(host.name)
+    is_reusing = mgr.has_running_session(host.name)
 
-    # 启动 WeTTY 实例（已有则复用）
+    # 解密密码
+    password = _decrypt_host_password(host)
+
+    # 创建终端会话（已有则复用）
     try:
-        instance = await wetty_mgr.start_instance(host)
-    except Exception as e:
-        return f"错误：WeTTY 启动失败 - {e}"
-
-    # 等待 WeTTY 进程就绪
-    if is_attach_mode:
-        await asyncio.sleep(0.5)
-        logger.info("connect_host: attach 模式 — WeTTY 实例已存在 (%s)", host.name)
-    else:
-        try:
-            await wait_for_port(instance.port)
-        except TimeoutError:
-            return f"错误：WeTTY 端口 {instance.port} 启动超时"
-        logger.info("connect_host: new 模式 — 新 WeTTY 实例 (%s)", host.name)
-
-    # 建立 PTY socket.io 连接
-    base_path = f"/wetty/t/{host.name}"
-    try:
-        pty_session = await pty_mgr.create_session(
-            host_name=host.name,
-            wetty_port=instance.port,
-            wetty_base_path=base_path,
-            connect_timeout=15.0,
+        session = await mgr.create_session(
+            instance_name=host.name,
+            host=host,
+            decrypted_password=password,
         )
-    except ConnectionError as e:
-        return f"错误：PTY 连接失败 - {e}"
+    except Exception as e:
+        return f"错误：终端启动失败 - {e}"
 
-    mode_label = "attach（共享浏览器终端）" if is_attach_mode else "new（新建终端）"
-    await _publish_event("session_created", pty_session.session_id, host.name, {
+    # 等待终端就绪
+    if not is_reusing:
+        try:
+            await session.wait_for(
+                pattern=r"[\$#>%]\s*$|Opt>|password:|Password:",
+                timeout=15.0,
+            )
+        except TimeoutError:
+            pass  # 超时不阻断，继续使用
+
+    mode_label = "复用已有终端" if is_reusing else "新建终端"
+    await _publish_event("session_created", session.session_id, host.name, {
         "hostname": host.hostname,
         "username": host.username,
         "mode": "pty",
-        "tmux_mode": "attach" if is_attach_mode else "new",
     })
 
     return (
         f"已连接到 {host.username}@{host.hostname}:{host.port}"
-        f"（PTY 交互式模式 — {mode_label}）\n"
-        f"Session ID: {pty_session.session_id}\n"
-        f"终端已在浏览器中实时显示。你的所有操作浏览器可实时看到。\n\n"
+        f"（{mode_label}）\n"
+        f"Session ID: {session.session_id}\n"
+        f"终端已在浏览器中实时显示。\n\n"
         f"提示：\n"
-        f"- 如果是堡垒机，请用 send_input 输入目标主机 IP\n"
-        f"- 用 wait_for_output 等待特定文本出现\n"
         f"- 用 run_command 执行命令并获取输出\n"
         f"- 用 read_terminal 查看当前终端屏幕"
     )
 
 
 async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
-    """二级主机的连接流程（独立 WeTTY 实例架构）
+    """二级主机的连接流程（Python PTY 直连）"""
+    mgr = _get_terminal_manager()
+    tmux_mgr = _get_tmux_manager()
 
-    与 REST API /api/wetty/start 保持一致：
-    - 每个 jump_host 创建独立的 WeTTY 实例（如 tce-server--m12）
-    - 输入完全隔离，不与其他 Tab 共享
-    - 不需要 tmux 窗口管理
-    """
-    wetty_mgr = _get_wetty_manager()
-    pty_mgr = _get_pty_manager()
-
-    # Step 1: 为 jump_host 创建独立的 WeTTY 实例
-    # 使用复合名称（bastion_name--jump_host_name）确保唯一性
     instance_name = f"{bastion.name}--{jump_host.name}"
-    is_reusing = False
+    is_reusing = mgr.has_running_session(instance_name)
 
-    # 如果已有该实例，复用
-    if wetty_mgr.has_running_instance(instance_name):
-        instance = wetty_mgr.get_instance(instance_name)
-        if instance:
-            logger.info("connect_jump_host: 复用已有独立 WeTTY (%s)", instance_name)
-            is_reusing = True
-        else:
-            # 实例已停止，创建新实例
-            instance = None
-    else:
-        instance = None
+    # 解密堡垒机密码
+    password = _decrypt_host_password(bastion)
 
-    if not instance:
-        try:
-            instance = await wetty_mgr.start_instance_for_jump_host(
-                instance_name=instance_name,
-                bastion=bastion,
-            )
-        except FileNotFoundError:
-            return "错误：wetty 命令未找到，请先安装: npm install -g wetty"
-        except OSError as e:
-            return f"错误：WeTTY 启动失败 - {e}"
-
-    # 等待 WeTTY 进程就绪
+    # 创建终端会话（使用堡垒机连接信息）
     try:
-        await wait_for_port(instance.port)
-    except TimeoutError:
-        return f"错误：WeTTY 端口 {instance.port} 启动超时"
-    logger.info("connect_jump_host: 独立 WeTTY 已启动 (%s)", instance_name)
-
-    # Step 2: 建立 PTY 连接（连接到独立 WeTTY 实例）
-    # base_path 使用实例的实际名称（如 tce-server--m12）
-    base_path = f"/wetty/t/{instance.host_name}"
-    try:
-        pty_session = await pty_mgr.create_session(
-            host_name=jump_host.name,
-            wetty_port=instance.port,
-            wetty_base_path=base_path,
-            connect_timeout=15.0,
-            tmux_window="0",  # 默认窗口
+        session = await mgr.create_session(
+            instance_name=instance_name,
+            host=bastion,
+            decrypted_password=password,
         )
-    except ConnectionError as e:
-        return f"错误：PTY 连接失败 - {e}"
+    except Exception as e:
+        return f"错误：终端启动失败 - {e}"
 
-    # Step 3: 执行跳板编排（仅新建实例时执行，复用时检测跳过）
-    tmux_session = TmuxWindowManager.session_name_for(instance_name)
-
+    # 复用模式：检测是否已登录，跳过编排
     if is_reusing:
-        # 复用模式：检测 tmux session 是否已有活跃 SSH 连接
-        tmux_mgr = _get_tmux_manager()
+        tmux_session = TmuxWindowManager.session_name_for(instance_name)
         if await tmux_mgr.is_session_logged_in(tmux_session):
-            logger.info(
-                "connect_jump_host: tmux session 已有活跃连接，跳过跳板编排 (%s)",
-                instance_name,
-            )
-            await _publish_event("session_created", pty_session.session_id, jump_host.name, {
+            logger.info("connect_jump_host: 复用已有连接 (%s)", instance_name)
+            await _publish_event("session_created", session.session_id, jump_host.name, {
                 "hostname": jump_host.target_ip,
                 "bastion": bastion.name,
                 "mode": "pty",
-                "tmux_mode": "reuse",
-                "instance_name": instance_name,
-                "steps_executed": 0,
             })
             return (
                 f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
                 f"通过堡垒机: {bastion.name}\n"
-                f"Session ID: {pty_session.session_id}\n"
-                f"复用已有连接（跳过跳板编排）\n\n"
+                f"Session ID: {session.session_id}\n"
+                f"复用已有连接\n\n"
                 f"提示：\n"
                 f"- 用 run_command 执行命令并获取输出\n"
                 f"- 用 read_terminal 查看当前终端屏幕"
             )
 
-    orchestrator = JumpOrchestrator(pty_session)
+    # 新建模式：执行跳板编排
+    orchestrator = JumpOrchestrator(session)  # type: ignore[arg-type]
     result = await orchestrator.execute_jump(
         jump_host=jump_host,
         bastion=bastion,
-        tmux_session_name=tmux_session,
+        tmux_session_name=session.tmux_session_name,
         window_name="0",
-        skip_window_creation=True,  # 独立 WeTTY 模式，不需要创建窗口
+        skip_window_creation=True,
     )
 
     if not result.success:
-        await _publish_event("session_error", pty_session.session_id, jump_host.name, {
+        await _publish_event("session_error", session.session_id, jump_host.name, {
             "error": result.message,
         })
         return f"错误：跳板连接失败 - {result.message}"
 
-    await _publish_event("session_created", pty_session.session_id, jump_host.name, {
+    await _publish_event("session_created", session.session_id, jump_host.name, {
         "hostname": jump_host.target_ip,
         "bastion": bastion.name,
         "mode": "pty",
-        "tmux_mode": "independent",  # 独立 WeTTY 模式
         "instance_name": instance_name,
         "steps_executed": result.steps_executed,
     })
@@ -403,7 +340,7 @@ async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
     msg = (
         f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
         f"通过堡垒机: {bastion.name}\n"
-        f"Session ID: {pty_session.session_id}\n"
+        f"Session ID: {session.session_id}\n"
         f"{result.message}\n\n"
         f"提示：\n"
         f"- 用 run_command 执行命令并获取输出\n"
@@ -436,15 +373,15 @@ async def run_command(session_id: str, command: str, timeout: int = 30) -> str:
     if reject_reason:
         return f"错误：{reject_reason}"
 
-    pty_mgr = _get_pty_manager()
-    session = pty_mgr.get_session(session_id)
+    mgr = _get_terminal_manager()
+    session = mgr.get_session_by_id(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
 
-    if not session.connected:
+    if not session.running:
         return f"错误：会话 {session_id} 已断开。请重新用 connect_host 连接。"
 
-    await _publish_event("command_start", session_id, session.host_name, {"command": command})
+    await _publish_event("command_start", session_id, session.instance_name, {"command": command})
 
     try:
         output = await session.send_command(
@@ -454,17 +391,17 @@ async def run_command(session_id: str, command: str, timeout: int = 30) -> str:
             timeout=float(timeout),
         )
     except TimeoutError as e:
-        await _publish_event("command_error", session_id, session.host_name, {
+        await _publish_event("command_error", session_id, session.instance_name, {
             "error": f"命令超时（{timeout}s）",
         })
         return f"错误：{e}"
     except ConnectionError as e:
-        await _publish_event("command_error", session_id, session.host_name, {
+        await _publish_event("command_error", session_id, session.instance_name, {
             "error": str(e),
         })
         return f"错误：连接异常 - {e}"
 
-    await _publish_event("command_complete", session_id, session.host_name, {
+    await _publish_event("command_complete", session_id, session.instance_name, {
         "command": command,
     })
 
@@ -485,15 +422,15 @@ async def send_input(session_id: str, text: str) -> str:
     Returns:
         发送确认
     """
-    pty_mgr = _get_pty_manager()
-    session = pty_mgr.get_session(session_id)
+    mgr = _get_terminal_manager()
+    session = mgr.get_session_by_id(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
-    if not session.connected:
+    if not session.running:
         return f"错误：会话 {session_id} 已断开。"
 
-    await _publish_event("command_start", session_id, session.host_name, {
+    await _publish_event("command_start", session_id, session.instance_name, {
         "command": f"[input] {text.rstrip()}"
     })
 
@@ -524,12 +461,12 @@ async def wait_for_output(
     Returns:
         从等待开始到匹配成功之间的所有终端输出（已清除 ANSI）
     """
-    pty_mgr = _get_pty_manager()
-    session = pty_mgr.get_session(session_id)
+    mgr = _get_terminal_manager()
+    session = mgr.get_session_by_id(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
-    if not session.connected:
+    if not session.running:
         return f"错误：会话 {session_id} 已断开。"
 
     try:
@@ -559,8 +496,8 @@ async def read_terminal(session_id: str, lines: int = 50) -> str:
     Returns:
         终端屏幕内容（已清除 ANSI 转义序列）
     """
-    pty_mgr = _get_pty_manager()
-    session = pty_mgr.get_session(session_id)
+    mgr = _get_terminal_manager()
+    session = mgr.get_session_by_id(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
@@ -581,25 +518,23 @@ async def get_session_status(session_id: Optional[str] = None) -> str:
     Returns:
         会话状态信息
     """
-    pty_mgr = _get_pty_manager()
+    mgr = _get_terminal_manager()
 
     if session_id:
-        session = pty_mgr.get_session(session_id)
+        session = mgr.get_session_by_id(session_id)
         if not session:
             return f"会话不存在: {session_id}"
         info = session.info
         return json.dumps({
             "session_id": info.session_id,
-            "host_name": info.host_name,
-            "connected": info.connected,
+            "instance_name": info.instance_name,
+            "running": info.running,
             "mode": "pty",
-            "wetty_port": info.wetty_port,
-            "screen_lines": info.screen_lines,
             "created_at": info.created_at,
-            "last_activity": info.last_activity,
+            "ws_clients": info.ws_clients,
         }, ensure_ascii=False, indent=2)
 
-    sessions = pty_mgr.list_sessions()
+    sessions = mgr.list_sessions()
     if not sessions:
         return "当前没有活跃的会话。"
 
@@ -607,10 +542,11 @@ async def get_session_status(session_id: Optional[str] = None) -> str:
     for s in sessions:
         result.append({
             "session_id": s.session_id,
-            "host_name": s.host_name,
-            "connected": s.connected,
+            "instance_name": s.instance_name,
+            "running": s.running,
+            "instance_name": s.instance_name,
+            "running": s.running,
             "mode": "pty",
-            "last_activity": s.last_activity,
         })
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -628,14 +564,14 @@ async def disconnect(session_id: str) -> str:
     Returns:
         断开结果
     """
-    pty_mgr = _get_pty_manager()
+    mgr = _get_terminal_manager()
 
-    session = pty_mgr.get_session(session_id)
+    session = mgr.get_session_by_id(session_id)
     if not session:
         return f"会话不存在: {session_id}"
 
-    host_name = session.host_name
-    closed = await pty_mgr.close_session(session_id)
+    host_name = session.instance_name
+    closed = await mgr.stop_session(session.instance_name)
 
     if closed:
         await _publish_event("session_closed", session_id, host_name)

@@ -1,24 +1,24 @@
 /**
  * TerminalView — 终端视图组件
  *
- * 整合 useTerminal（xterm.js UI）+ useWettySocket（socket.io 连接），
+ * 整合 useTerminal（xterm.js UI）+ useWebSocket（原生 WebSocket），
  * 实现完整的 Web Terminal 功能。
  *
- * 多 Tab 独立终端模式：
- *  - 每个 Tab 持有独立的 TerminalView 实例（独立的 socket.io 连接 + xterm.js）
- *  - isActive 控制显隐：非活跃时 display:none 但保持连接不销毁
- *  - 连接成功后自动获取 client_tty，通知父组件用于 per-client tmux switch
+ * 新架构（替代 WeTTY socket.io）：
+ *  - 后端 Python PTY 直接通过 FastAPI WebSocket 连接
+ *  - 无需 socket.io、无需独立端口、无需 nginx 反代
+ *  - 连接即时（无 Node.js 冷启动延迟）
  *
  * 数据流：
- *  用户键入 → onData → socket.emit('input') → WeTTY → SSH → 远程主机
- *  远程主机 → SSH → WeTTY → socket.on('data') → terminal.write()
+ *  用户键入 → onData → ws.send({type:"input"}) → FastAPI → PTY → tmux → SSH → 远端
+ *  远端 → SSH → tmux → PTY → FastAPI → ws.onmessage({type:"output"}) → terminal.write()
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Host, WeTTYInstance } from "../services/api";
-import { startWeTTY, fetchClientTtys } from "../services/api";
+import type { Host, TerminalInstance } from "../services/api";
+import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
-import { useWettySocket, type SocketStatus } from "../hooks/useWettySocket";
+import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
 
 // xterm.js 样式（必须导入，否则终端无法正确渲染）
 import "@xterm/xterm/css/xterm.css";
@@ -30,37 +30,33 @@ interface TerminalViewProps {
   host: Host;
   /** 是否为当前活跃 Tab（控制显隐，非活跃时保持连接） */
   isActive: boolean;
-  /** tmux client TTY 获取成功后的回调（用于 per-client 窗口切换） */
-  onClientTtyReady?: (tty: string) => void;
-  /** bastionName 更新回调（独立 WeTTY 实例检测后更新 Tab 状态） */
-  onBastionNameUpdate?: (bastionName: string) => void;
+  /** instanceName 更新回调（用于 Tab 关闭时 stop 正确的实例） */
+  onInstanceNameUpdate?: (instanceName: string) => void;
 }
 
 export default function TerminalView({
   host,
   isActive,
-  onClientTtyReady,
-  onBastionNameUpdate,
+  onInstanceNameUpdate,
 }: TerminalViewProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [basePath, setBasePath] = useState<string | null>(null);
+  const [wsUrl, setWsUrl] = useState<string | null>(null);
   const prevHostIdRef = useRef<number | null>(null);
-  const clientTtyReportedRef = useRef(false);
 
-  // ── xterm.js 终端 Hook（返回 callback ref） ──
+  // ── xterm.js 终端 Hook ──
   const terminal = useTerminal({
     onData: (data) => {
-      wettySocket.sendInput(data);
+      ws.sendInput(data);
     },
     onResize: (size) => {
-      wettySocket.sendResize(size);
+      ws.sendResize(size);
     },
   });
 
-  // ── socket.io 连接 Hook ─────────────────────
-  const wettySocket = useWettySocket({
-    basePath,
+  // ── 原生 WebSocket 连接 Hook ──
+  const ws = useWebSocket({
+    wsUrl,
     onData: (data) => {
       terminal.write(data);
     },
@@ -69,85 +65,29 @@ export default function TerminalView({
       requestAnimationFrame(() => {
         terminal.fit();
         terminal.focus();
-        wettySocket.sendResize(terminal.getSize());
+        ws.sendResize(terminal.getSize());
       });
     },
     onDisconnect: (reason) => {
-      if (reason === "logout") {
+      if (reason === "closed" || reason === "normal") {
         setStatus("idle");
-        setBasePath(null);
-        clientTtyReportedRef.current = false;
+        setWsUrl(null);
       }
     },
   });
 
-  // 同步 socket 状态到组件状态
+  // 同步 WebSocket 状态到组件状态
   useEffect(() => {
-    if (wettySocket.status === "error" && status !== "error") {
+    if (ws.status === "error" && status !== "error") {
       setStatus("error");
       setError("WebSocket 连接失败，请检查终端服务是否正常运行");
     }
-    if (wettySocket.status === "connecting" && status === "starting") {
+    if (ws.status === "connecting" && status === "starting") {
       setStatus("connecting");
     }
-  }, [wettySocket.status, status]);
+  }, [ws.status, status]);
 
-  // ── 获取 client_tty 并上报（仅共享 WeTTY 模式需要）──
-  // 独立 WeTTY 模式下每个 Tab 有独立的 WeTTY 实例，不需要 tmux 窗口切换
-  useEffect(() => {
-    if (status !== "connected" || clientTtyReportedRef.current || !onClientTtyReady) {
-      return;
-    }
-
-    // 从 basePath 提取堡垒机名：/wetty/t/{bastion_name}
-    const bastionFromPath = basePath?.match(/\/wetty\/t\/([^/]+)/)?.[1];
-
-    if (!bastionFromPath) return;
-
-    // 独立 WeTTY 实例名包含 "--"（如 tce-server--m12），不需要 tmux 窗口切换
-    if (bastionFromPath.includes("--")) {
-      console.log("独立 WeTTY 模式，跳过 tmux 窗口切换");
-      clientTtyReportedRef.current = true;
-      return;
-    }
-
-    // 延迟获取 client TTY（等待 tmux client 注册完成）
-    const timer = setTimeout(async () => {
-      try {
-        const clients = await fetchClientTtys(bastionFromPath);
-        
-        if (clients.length === 0) {
-          console.warn("没有找到 tmux client");
-          return;
-        }
-        
-        // 根据目标窗口名找到对应的 client
-        // - bastion 类型：窗口名是 "0"（默认窗口）或 "sshpass"
-        // - jump_host 类型：窗口名是 jump_host 名称（如 m12）
-        const targetWindow = host.host_type === "jump_host" ? host.name : "0";
-        
-        // 优先匹配目标窗口的 client（但由于 tmux window 字段可能为空，这不总是可靠）
-        let myClient = clients.find(c => c.window === targetWindow);
-        
-        // 如果没找到（窗口字段为空），取最后一个 client（最新连接的）
-        if (!myClient) {
-          myClient = clients[clients.length - 1];
-        }
-        
-        if (myClient) {
-          clientTtyReportedRef.current = true;
-          onClientTtyReady(myClient.tty);
-        }
-      } catch {
-        // 获取 client_tty 失败不阻断终端使用
-        console.warn("获取 tmux client TTY 失败，Tab 切换将使用全局模式");
-      }
-    }, 1000);  // 增加延迟，等待后台 PTY 稳定
-
-    return () => clearTimeout(timer);
-  }, [status, basePath, host, onClientTtyReady]);
-
-  // ── 活跃状态变化时 fit 终端（容器尺寸可能变化） ──
+  // ── 活跃状态变化时 fit 终端 ──
   useEffect(() => {
     if (isActive && status === "connected") {
       requestAnimationFrame(() => {
@@ -157,43 +97,35 @@ export default function TerminalView({
     }
   }, [isActive, status, terminal]);
 
-  // ── 启动 WeTTY 实例 ─────────────────────────
+  // ── 启动终端会话 ──
   const connectToHost = useCallback(async (targetHost: Host) => {
     setStatus("starting");
     setError(null);
-    setBasePath(null);
-    clientTtyReportedRef.current = false;
+    setWsUrl(null);
 
     try {
-      const instance: WeTTYInstance = await startWeTTY(targetHost.id);
+      const instance: TerminalInstance = await startTerminal(targetHost.id);
 
-      let path: string;
-      if (instance.bastion_name) {
-        path = `/wetty/t/${instance.bastion_name}`;
-        // 独立 WeTTY 实例（名称包含 "--"），更新 Tab 的 bastionName
-        // 这样 handleTabSelect 能正确跳过 tmux 切换
-        if (instance.bastion_name.includes("--") && onBastionNameUpdate) {
-          onBastionNameUpdate(instance.bastion_name);
-        }
-      } else {
-        path = instance.url.replace(/\/$/, "");
+      // 更新 Tab 的 instanceName（用于关闭时 stop 正确的实例）
+      if (onInstanceNameUpdate) {
+        onInstanceNameUpdate(instance.instance_name);
       }
 
-      setBasePath(path);
+      setWsUrl(instance.ws_url);
       setStatus("connecting");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "启动终端失败";
       setError(msg);
       setStatus("error");
     }
-  }, [onBastionNameUpdate]);
+  }, [onInstanceNameUpdate]);
 
-  // ── 当 host 变化时自动启动 WeTTY ──
+  // ── 当 host 变化时自动连接 ──
   useEffect(() => {
     if (!host) {
-      if (basePath) {
-        wettySocket.disconnect();
-        setBasePath(null);
+      if (wsUrl) {
+        ws.disconnect();
+        setWsUrl(null);
       }
       setStatus("idle");
       setError(null);
@@ -203,16 +135,16 @@ export default function TerminalView({
 
     if (host.id === prevHostIdRef.current) return;
 
-    if (basePath) {
-      wettySocket.disconnect();
-      setBasePath(null);
+    if (wsUrl) {
+      ws.disconnect();
+      setWsUrl(null);
     }
 
     prevHostIdRef.current = host.id;
     connectToHost(host);
-  }, [host, connectToHost, basePath, wettySocket]);
+  }, [host, connectToHost, wsUrl, ws]);
 
-  // ── 空状态：未选中主机 ──
+  // ── 空状态 ──
   if (!host) {
     return (
       <div className="flex items-center justify-center h-full text-gray-600">
@@ -232,11 +164,11 @@ export default function TerminalView({
       <_StatusBar
         host={host}
         status={status}
-        socketStatus={wettySocket.status}
+        socketStatus={ws.status}
         onReconnect={() => connectToHost(host)}
       />
 
-      {/* 终端容器（使用 callback ref） */}
+      {/* 终端容器 */}
       <div
         ref={terminal.containerRef}
         className="flex-1 bg-[#0a0a0a] relative overflow-hidden"
@@ -245,7 +177,6 @@ export default function TerminalView({
           display: isActive ? undefined : "none",
         }}
       >
-        {/* 连接中遮罩 */}
         {(status === "starting" || status === "connecting") && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80">
             <div className="text-center">
@@ -260,7 +191,6 @@ export default function TerminalView({
           </div>
         )}
 
-        {/* 错误遮罩 */}
         {status === "error" && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80">
             <div className="text-center max-w-sm">
@@ -308,7 +238,7 @@ function _StatusBar({
       <span>
         Terminal: {host.name}
         {status === "connected" && socketStatus === "connected" && (
-          <span className="ml-2 text-gray-700">(socket.io ✓)</span>
+          <span className="ml-2 text-gray-700">(ws ✓)</span>
         )}
       </span>
       <div className="flex items-center gap-2">

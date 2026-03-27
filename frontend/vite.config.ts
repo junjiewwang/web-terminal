@@ -11,8 +11,13 @@ export default defineConfig({
         target: "http://localhost:8000",
         changeOrigin: true,
       },
-      // WeTTY 反代（HTTP + WebSocket）
-      // 开发模式下代理到 nginx(:8000)，由 nginx 转发到 uvicorn 再到 WeTTY
+      // 新架构：Python PTY WebSocket 直连
+      "/ws": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        ws: true,
+      },
+      // WeTTY 反代（过渡期保留）
       "/wetty": {
         target: "http://localhost:8000",
         changeOrigin: true,

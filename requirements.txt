@@ -24,9 +24,6 @@ python-jose[cryptography]>=3.3.0
 # SSE
 sse-starlette>=2.1.0
 
-# PTY 交互式会话（socket.io 客户端连接 WeTTY）
-python-socketio[asyncio_client]>=5.11.0
-
 # Utilities
 python-multipart>=0.0.18
 watchfiles>=1.0.0

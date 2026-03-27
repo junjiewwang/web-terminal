@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from src.models.host import Host, JumpHostConfigSchema, LoginStepSchema
-from src.services.pty_session import PTYSession
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +85,7 @@ class JumpOrchestrator:
     DEFAULT_STEP_TIMEOUT = 15.0
     DEFAULT_LOGIN_TIMEOUT = 30.0
 
-    def __init__(self, pty_session: PTYSession) -> None:
+    def __init__(self, pty_session) -> None:
         self._session = pty_session
 
     async def execute_jump(

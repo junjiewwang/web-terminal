@@ -3,9 +3,7 @@
 # 容器入口脚本
 #
 # 启动 nginx（前端反代 :8000）和 uvicorn（后端 :8001）
-# nginx 解决浏览器 HTTP/1.1 SSE 长连接阻塞 POST 请求的问题
-#
-# tmux 依赖：WeTTY 通过 --command 参数调用 tmux-session.sh，
+# Python PTY 直接管理终端会话，不再需要 Node.js/WeTTY
 # tmux 负责会话复用（浏览器 + MCP Agent 共享 SSH PTY）
 # ══════════════════════════════════════════════
 
