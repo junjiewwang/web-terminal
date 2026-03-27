@@ -33,7 +33,7 @@ from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import JumpOrchestrator
 from src.services.pty_session import PTYSessionManager
 from src.services.tmux_manager import TmuxWindowManager
-from src.services.wetty_manager import WeTTYManager
+from src.services.wetty_manager import WeTTYManager, wait_for_port
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +248,10 @@ async def _connect_direct_host(host: Host) -> str:
         await asyncio.sleep(0.5)
         logger.info("connect_host: attach 模式 — WeTTY 实例已存在 (%s)", host.name)
     else:
-        await asyncio.sleep(2.0)
+        try:
+            await wait_for_port(instance.port)
+        except TimeoutError:
+            return f"错误：WeTTY 端口 {instance.port} 启动超时"
         logger.info("connect_host: new 模式 — 新 WeTTY 实例 (%s)", host.name)
 
     # 建立 PTY socket.io 连接
@@ -298,12 +301,14 @@ async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
     # Step 1: 为 jump_host 创建独立的 WeTTY 实例
     # 使用复合名称（bastion_name--jump_host_name）确保唯一性
     instance_name = f"{bastion.name}--{jump_host.name}"
+    is_reusing = False
 
     # 如果已有该实例，复用
     if wetty_mgr.has_running_instance(instance_name):
         instance = wetty_mgr.get_instance(instance_name)
         if instance:
             logger.info("connect_jump_host: 复用已有独立 WeTTY (%s)", instance_name)
+            is_reusing = True
         else:
             # 实例已停止，创建新实例
             instance = None
@@ -322,7 +327,10 @@ async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
             return f"错误：WeTTY 启动失败 - {e}"
 
     # 等待 WeTTY 进程就绪
-    await asyncio.sleep(2.0)
+    try:
+        await wait_for_port(instance.port)
+    except TimeoutError:
+        return f"错误：WeTTY 端口 {instance.port} 启动超时"
     logger.info("connect_jump_host: 独立 WeTTY 已启动 (%s)", instance_name)
 
     # Step 2: 建立 PTY 连接（连接到独立 WeTTY 实例）
@@ -339,8 +347,35 @@ async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
     except ConnectionError as e:
         return f"错误：PTY 连接失败 - {e}"
 
-    # Step 3: 执行跳板编排（前台执行，等待完成）
+    # Step 3: 执行跳板编排（仅新建实例时执行，复用时检测跳过）
     tmux_session = TmuxWindowManager.session_name_for(instance_name)
+
+    if is_reusing:
+        # 复用模式：检测 tmux session 是否已有活跃 SSH 连接
+        tmux_mgr = _get_tmux_manager()
+        if await tmux_mgr.is_session_logged_in(tmux_session):
+            logger.info(
+                "connect_jump_host: tmux session 已有活跃连接，跳过跳板编排 (%s)",
+                instance_name,
+            )
+            await _publish_event("session_created", pty_session.session_id, jump_host.name, {
+                "hostname": jump_host.target_ip,
+                "bastion": bastion.name,
+                "mode": "pty",
+                "tmux_mode": "reuse",
+                "instance_name": instance_name,
+                "steps_executed": 0,
+            })
+            return (
+                f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
+                f"通过堡垒机: {bastion.name}\n"
+                f"Session ID: {pty_session.session_id}\n"
+                f"复用已有连接（跳过跳板编排）\n\n"
+                f"提示：\n"
+                f"- 用 run_command 执行命令并获取输出\n"
+                f"- 用 read_terminal 查看当前终端屏幕"
+            )
+
     orchestrator = JumpOrchestrator(pty_session)
     result = await orchestrator.execute_jump(
         jump_host=jump_host,

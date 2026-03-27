@@ -55,3 +55,5 @@ Thumbs.db
 htmlcov/
 .coverage
 .playwright-mcpfrontend/tsconfig.tsbuildinfo
+.playwright-mcp/
+frontend/tsconfig.tsbuildinfo

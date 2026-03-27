@@ -21,7 +21,7 @@
 
 /* ── 滚动条样式（Chromium: Chrome / Edge / Safari） ── */
 .xterm-viewport::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
 }
 
 .xterm-viewport::-webkit-scrollbar-track {
@@ -29,18 +29,18 @@
 }
 
 .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
 }
 
 .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.35);
 }
 
 /* ── 滚动条样式（Firefox） ── */
 .xterm-viewport {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
 
 /* ── 全局：隐藏页面级滚动条（SPA 单屏布局不需要） ── */

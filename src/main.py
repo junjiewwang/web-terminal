@@ -79,6 +79,9 @@ async def lifespan(app: FastAPI):
     # 启动 hosts.yaml 文件监听后台任务
     watch_task = asyncio.create_task(_watch_hosts_yaml())
 
+    # 启动 zombie tmux session 定期清理后台任务
+    zombie_cleanup_task = asyncio.create_task(_cleanup_zombie_sessions_loop())
+
     # 启动 MCP Session Manager（app.mount 的子应用 lifespan 不会被 FastAPI 触发，
     # 需要在主应用 lifespan 中手动启动，否则请求会报 "Task group is not initialized"）
     async with mcp.session_manager.run():
@@ -89,8 +92,13 @@ async def lifespan(app: FastAPI):
         # ── 关闭 ──
         logger.info("服务关闭中...")
         watch_task.cancel()
+        zombie_cleanup_task.cancel()
         try:
             await watch_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await zombie_cleanup_task
         except asyncio.CancelledError:
             pass
         # 关闭 MCP PTY 会话（socket.io 连接）
@@ -152,6 +160,35 @@ async def _watch_hosts_yaml() -> None:
                 logger.exception("hosts.yaml 热加载同步失败")
     except asyncio.CancelledError:
         logger.info("hosts.yaml 文件监听已停止")
+        raise
+
+
+# zombie tmux session 清理间隔（秒）
+_ZOMBIE_CLEANUP_INTERVAL = 60
+
+
+async def _cleanup_zombie_sessions_loop() -> None:
+    """后台任务：定期清理 zombie tmux session
+
+    扫描所有 wetty- 前缀的 tmux session，清理没有对应活跃 WeTTY 实例的残留 session。
+    避免 SSH 连接和系统资源泄漏。
+    """
+    logger.info("启动 zombie tmux session 定期清理（间隔 %ds）", _ZOMBIE_CLEANUP_INTERVAL)
+
+    # 首次启动等待服务就绪
+    await asyncio.sleep(10)
+
+    try:
+        while True:
+            try:
+                cleaned = await wetty_manager.cleanup_zombie_sessions()
+                if cleaned:
+                    logger.info("定期清理: 清理了 %d 个 zombie tmux session", cleaned)
+            except Exception:
+                logger.exception("zombie session 清理异常")
+            await asyncio.sleep(_ZOMBIE_CLEANUP_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info("zombie session 定期清理已停止")
         raise
 
 

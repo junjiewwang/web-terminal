@@ -884,8 +884,136 @@ _run_jump_orchestration():
   - **涉及文件**：`frontend/src/components/TerminalView.tsx`、`frontend/src/App.tsx`、`frontend/src/components/TerminalTabs.tsx`、`src/api/wetty.py`、`src/services/wetty_manager.py`
   - **验证状态**：✅ 前端构建成功，待容器重启后验证
 
-### 🔲 进行中
+### ✅ 已修复（本轮）
 
-- [ ] **P1: tmux 会话超时/清理机制**
-- [ ] **P2: WeTTY 进程健康监控**
-- [ ] **P3: tmux 状态栏定制**
+- [x] **P0: tce-server 和 m12 终端同步 Bug — tmux session 残留 + 跳板编排重复执行**
+
+  **问题现象**：
+  - Agent 通过 MCP 连接 m12 后，用户在浏览器打开页面
+  - m12 Tab 显示正常（已登录到 m12 主机）
+  - 切换到 tce-server Tab 时，看到的不是堡垒机菜单，而是 m12 的内容（看起来同步了）
+  - 之后重新连接 tce-server 和 m12，两者内容完全同步、不再独立
+
+  **根因分析（通过日志和 tmux 状态确认）**：
+
+  **Bug 1: tmux session 残留 — `stop_instance` 清理 tmux session 存在竞态/遗漏**
+
+  日志时间线（12:10:36-12:10:40）：
+  ```
+  12:10:17 - stop tce-server → tmux session 清理: wetty-tce-server ✓
+  12:10:18 - stop tce-server--m12 → WeTTY 实例已停止（但 tmux session 清理日志缺失！）
+  12:10:36 - 启动 tce-server--m12 (port 3010) → tmux session: wetty-tce-server--m12
+  12:10:37 - 启动 tce-server (port 3011) → tmux session: wetty-tce-server
+  ```
+
+  **关键问题**：`stop_instance` 停止 `tce-server--m12` 时，`_cleanup_tmux_session` 可能没有成功清理
+  tmux session `wetty-tce-server--m12`。新 WeTTY 实例 (port 3010) 启动后，第一个 socket.io
+  连接（浏览器或后台编排 PTY）触发 `tmux-session.sh`，发现 `wetty-tce-server--m12` session
+  **已存在（残留的）**，执行 `tmux attach-session` 而非 `tmux new-session`。
+  这导致新连接 attach 到**上一次的 SSH 会话（已在 m12 内）**，而不是创建新的 SSH 到堡垒机。
+
+  **Bug 2: 后台编排 PTY 的 `buffer=59 lines` + 跳板编排重复执行**
+
+  ```
+  12:10:38 - PTY 终端就绪: c8d57c3e (0.0s, buffer=59 lines)  ← 已有历史输出！
+  12:10:38 - 开始跳板编排: tce-server → m12 (steps=0, skip_create=True)
+  12:10:39 - 已发送目标 IP: 10.202.16.3  ← 在已登录 m12 的终端里再次发送 IP！
+  ```
+
+  PTY 连接后立刻发现 buffer 有 59 行数据（来自残留 session 中已有的 m12 输出），
+  然后 `execute_jump` 仍然执行跳板编排（发送 target_ip），在已经登录 m12 的 shell 里
+  执行了 `10.202.16.3` 命令（被当作 shell 命令执行），导致终端混乱。
+
+  **Bug 3: tce-server WeTTY 也 attach 到残留的 tmux session**
+
+  `wetty-tce-server` (port 3011) 的 tmux session 如果在前一轮停止时没有被正确清理，
+  新的 tce-server WeTTY 启动后同样会 `tmux attach` 到旧 session。
+  如果旧 session 中的 SSH 曾经跳转到 m12，那 tce-server Tab 显示的就是 m12 的内容。
+
+  **Bug 4: WeTTY `_cleanup_tmux_session` 使用同步 `subprocess.run` 可能不可靠**
+
+  `_WeTTYProcess.stop()` 中：
+  1. 先 `terminate()` WeTTY 进程
+  2. 再调用 `_cleanup_tmux_session()` 用 `subprocess.run` 同步执行 `tmux kill-session`
+
+  问题：
+  - WeTTY 进程 `terminate()` 后，其管理的 tmux client 可能还没有完全断开
+  - `subprocess.run` 是同步阻塞调用，在 asyncio 事件循环中可能引发竞态
+  - 如果 tmux session 名中包含特殊字符 `--`，`tmux has-session -t` 可能匹配不精确
+
+  **Bug 5: 端口单调递增不回收 — 容器生命周期内端口耗尽风险**
+
+  端口从 3000 开始分配，每次 stop + start 都分配新端口（3000→3001→...→3011），
+  `_port_counter` 只增不减。长时间运行或频繁重连后端口会超过合理范围。
+  同时 nginx 反代的 upstream 端口映射需要动态更新，旧端口残留的 upstream 会导致 502。
+
+  **Bug 6: `tmux list-clients` 返回空 — 所有 tmux session 无 client attached**
+
+  当前状态确认：
+  ```
+  wetty-tce-server: attached=0
+  wetty-tce-server--m12: attached=0
+  ```
+  两个 tmux session 都没有任何 client attached！但 WeTTY 进程 (port 3010/3011) 还在运行。
+  说明浏览器的 socket.io 连接断开后（如页面刷新或 Tab 关闭），WeTTY 执行的 `tmux attach`
+  shell 进程退出，tmux client 也随之断开。再次连接时，WeTTY 对新 socket.io 连接执行
+  `tmux-session.sh`，又会 `tmux attach`。
+  但在无 client 期间，tmux session 和其中的 SSH 连接仍然保持运行（zombie session 风险）。
+
+  **修复实施（已完成）**：
+
+  1. ✅ **tmux session 清理加固**（`src/services/wetty_manager.py`）：
+     - `_cleanup_tmux_session` 改为 async（`asyncio.create_subprocess_exec`）
+     - `tmux kill-session` 后二次 `has-session` 验证确认清理成功
+     - `stop()` 顺序调换：先清理 tmux session，再终止 WeTTY 进程
+     - 使用精确匹配 `-t '=SESSION_NAME'` 避免子串匹配
+     - **关键新增**：`start()` 启动前先 `_cleanup_tmux_session()` 清理残留
+
+  2. ✅ **跳板编排防重入**（`src/mcp_server/server.py` + `src/api/wetty.py`）：
+     - `_connect_jump_host`：复用实例时通过 `is_session_logged_in()` 检测已登录状态，跳过编排
+     - `_run_jump_orchestration`：后台编排也添加防重入，检测 pane_current_command + shell 提示符
+
+  3. ✅ **端口回收机制**（`src/services/wetty_manager.py`）：
+     - `stop_instance` 后将端口归还 `_recycled_ports` 列表
+     - `_allocate_port` 优先复用回收端口
+
+  4. ✅ **tmux 精确匹配**（`scripts/tmux-session.sh` + `src/services/tmux_manager.py`）：
+     - `tmux-session.sh` 的 `has-session` 和 `attach-session` 使用 `=` 前缀精确匹配
+     - `TmuxWindowManager.session_exists()` 也改用精确匹配
+     - 新增 `is_session_logged_in()` 方法检测 pane 的 current_command
+
+  5. ✅ **zombie session 定期清理**（`src/main.py` + `src/services/wetty_manager.py`）：
+     - `WeTTYManager.cleanup_zombie_sessions()` 扫描所有 wetty- 前缀 session
+     - 清理无 client attached 且无对应活跃 WeTTY 实例的 zombie session
+     - `main.py` 注册 60s 间隔的后台清理任务
+
+  **涉及文件**：
+  - `src/services/wetty_manager.py` — tmux 清理加固 + 端口回收 + zombie 清理
+  - `src/mcp_server/server.py` — 跳板编排防重入
+  - `src/api/wetty.py` — 跳板编排防重入
+  - `scripts/tmux-session.sh` — tmux 精确匹配
+  - `src/services/tmux_manager.py` — session_exists 精确匹配 + is_session_logged_in
+  - `src/main.py` — zombie 清理后台任务
+  - **验证状态**：✅ Docker 构建成功，服务启动正常，zombie 清理任务已启动
+
+- [x] **P1: tmux scrollback 体验优化** — 部分实施
+  - **最终方案**：回滚 `mouse on`（副作用太大），保留 `history-limit 5000` + CSS 滚动条改善
+  - **修改**：
+    1. `scripts/tmux-session.sh` — `history-limit 5000`（Ctrl+B [ 进 copy mode 翻看更多历史）
+    2. `frontend/src/index.css` — 滚动条宽度 6→8px，透明度 0.08→0.2 / hover 0.15→0.35
+  - **mouse on 回滚原因**：
+    - vim/top 等全屏程序内滚轮失效（tmux 拦截滚轮进入 copy mode 而非传递给 vim）
+    - 浏览器文本选择需要 Shift+鼠标，对用户不友好
+  - **当前体验**：
+    - 鼠标滚轮在命令行模式下 → 上下键（查历史命令）——tmux Alternate Screen 的默认行为
+    - vim/top/less 内滚轮 → 正常传递给应用
+    - 文本选择 → 正常拖选
+    - 翻看历史输出 → `Ctrl+B [` 进入 copy mode，按 `q` 退出
+
+### ⏸ 已评估 — 暂不实施
+
+- [ ] **P2: WeTTY 进程健康监控** — 暂缓
+  - 当前稳定性足够（22h+ 运行无异常），等实际出现问题再做
+
+- [ ] **P3: tmux 状态栏定制** — 不做
+  - 前端 header + 状态栏已提供足够信息，属于过度设计
