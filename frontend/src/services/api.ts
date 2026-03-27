@@ -300,6 +300,13 @@ export async function stopTerminal(instanceName: string): Promise<void> {
   }
 }
 
+/** 获取所有活跃终端会话（用于页面加载时同步 Agent 已创建的会话） */
+export async function fetchTerminals(): Promise<TerminalInstance[]> {
+  const res = await fetchWithRetry(`${API_BASE}/terminal`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
 // ── tmux 窗口管理 ──────────────────────────
 
 /** tmux 客户端信息 */
