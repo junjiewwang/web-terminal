@@ -32,6 +32,38 @@ logger = logging.getLogger(__name__)
 WETTY_BASE_PORT = 3000
 
 
+async def wait_for_port(port: int, timeout: float = 10.0, interval: float = 0.2) -> None:
+    """等待端口可连接（WeTTY 进程就绪探测）
+
+    循环尝试 TCP 连接，直到端口可达或超时。
+    替代固定 sleep(2.0)，WeTTY 就绪多快就返回多快。
+
+    Args:
+        port: 目标端口
+        timeout: 最大等待秒数
+        interval: 重试间隔秒数
+
+    Raises:
+        TimeoutError: 超时未就绪
+    """
+    start = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - start < timeout:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=1.0,
+            )
+            writer.close()
+            await writer.wait_closed()
+            elapsed = asyncio.get_event_loop().time() - start
+            logger.info("WeTTY 端口就绪: port %d (%.1fs)", port, elapsed)
+            return
+        except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
+            await asyncio.sleep(interval)
+
+    raise TimeoutError(f"WeTTY 端口 {port} 在 {timeout}s 内未就绪")
+
+
 @dataclass
 class WeTTYInstance:
     """WeTTY 实例信息"""
@@ -55,6 +87,7 @@ class WeTTYManager:
         self._base_port = base_port
         self._instances: dict[str, _WeTTYProcess] = {}
         self._port_counter = base_port
+        self._recycled_ports: list[int] = []  # 回收的端口（优先复用）
         self._lock = asyncio.Lock()
 
     def get_instance_port(self, host_name: str) -> Optional[int]:
@@ -115,15 +148,19 @@ class WeTTYManager:
         return process.info
 
     async def stop_instance(self, host_name: str) -> bool:
-        """停止指定主机的 WeTTY 实例"""
+        """停止指定主机的 WeTTY 实例并回收端口"""
         async with self._lock:
             process = self._instances.pop(host_name, None)
 
         if not process:
             return False
 
+        port = process.port
         await process.stop()
-        logger.info("WeTTY 实例已停止: %s", host_name)
+        # 回收端口供后续复用
+        async with self._lock:
+            self._recycled_ports.append(port)
+        logger.info("WeTTY 实例已停止: %s (端口 %d 已回收)", host_name, port)
         return True
 
     async def stop_all(self) -> None:
@@ -140,6 +177,63 @@ class WeTTYManager:
     def list_instances(self) -> list[WeTTYInstance]:
         """列出所有 WeTTY 实例"""
         return [p.info for p in self._instances.values()]
+
+    async def cleanup_zombie_sessions(self) -> int:
+        """清理 zombie tmux session（没有对应 WeTTY 实例的残留 session）
+
+        扫描所有 wetty- 前缀的 tmux session，与当前活跃的 WeTTY 实例对比，
+        清理没有对应活跃实例的 session。
+
+        Returns:
+            清理的 session 数量
+        """
+        # 获取所有 tmux session
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "ls", "-F", "#{session_name}:#{session_attached}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+
+        if proc.returncode != 0 or not stdout:
+            return 0
+
+        # 当前活跃实例的 tmux session 名集合
+        active_sessions = set()
+        async with self._lock:
+            for process in self._instances.values():
+                if process.is_running:
+                    active_sessions.add(process.tmux_session_name)
+
+        cleaned = 0
+        for line in stdout.decode().strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.strip().split(":")
+            if len(parts) < 2:
+                continue
+            session_name = parts[0]
+            attached = int(parts[1]) if parts[1].isdigit() else 0
+
+            # 只清理 wetty- 前缀且无 client attached 且无对应活跃实例的 session
+            if (
+                session_name.startswith(_WeTTYProcess.TMUX_SESSION_PREFIX + "-")
+                and attached == 0
+                and session_name not in active_sessions
+            ):
+                kill_proc = await asyncio.create_subprocess_exec(
+                    "tmux", "kill-session", "-t", f"={session_name}",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await kill_proc.wait()
+                if kill_proc.returncode == 0:
+                    logger.info("已清理 zombie tmux session: %s", session_name)
+                    cleaned += 1
+
+        if cleaned:
+            logger.info("zombie session 清理完成: 清理了 %d 个", cleaned)
+        return cleaned
 
     def get_ssh_command(self, host_name: str) -> Optional[str]:
         """获取指定主机实例的 SSH 连接命令
@@ -212,7 +306,9 @@ class WeTTYManager:
         return process.info
 
     def _allocate_port(self) -> int:
-        """分配下一个可用端口"""
+        """分配下一个可用端口（优先复用回收的端口）"""
+        if self._recycled_ports:
+            return self._recycled_ports.pop(0)
         port = self._port_counter
         self._port_counter += 1
         return port
@@ -276,8 +372,9 @@ class _WeTTYProcess:
           - 首次连接 → tmux new-session + SSH
           - 后续连接 → tmux attach-session（共享同一个 PTY）
 
-        认证信息通过脚本参数传递给 tmux-session.sh，
-        由脚本内部构造 sshpass/ssh 命令。
+        关键：启动前先清理可能残留的同名 tmux session，
+        确保第一个连接一定走 new-session 创建全新的 SSH，
+        避免 attach 到上次的残留 session（数据泄漏/同步 Bug）。
         """
         # 验证 tmux 脚本存在
         script_path = str(self.TMUX_SCRIPT_PATH)
@@ -286,6 +383,9 @@ class _WeTTYProcess:
                 f"tmux 会话脚本不存在: {script_path}\n"
                 "请确保 scripts/tmux-session.sh 已部署。"
             )
+
+        # 🔑 启动前清理残留 tmux session（防止 tmux-session.sh attach 到旧 session）
+        await self._cleanup_tmux_session()
 
         # 构建 tmux-session.sh 的参数列表
         script_args = self._build_tmux_script_args()
@@ -353,7 +453,16 @@ class _WeTTYProcess:
         return " ".join(args)
 
     async def stop(self) -> None:
-        """停止 WeTTY 进程并清理 tmux session"""
+        """停止 WeTTY 进程并清理 tmux session
+
+        关键顺序：先清理 tmux session，再停止 WeTTY 进程。
+        如果先停 WeTTY，tmux client 断开但 session 可能残留，
+        导致下次启动时 tmux-session.sh attach 到旧 session（数据泄漏/同步 Bug）。
+        """
+        # Step 1: 先清理 tmux session（确保 SSH 连接彻底断开）
+        await self._cleanup_tmux_session()
+
+        # Step 2: 再停止 WeTTY 进程
         if self._process and self._process.returncode is None:
             self._process.terminate()
             try:
@@ -362,29 +471,59 @@ class _WeTTYProcess:
                 self._process.kill()
             self._process = None
 
-        # 清理对应的 tmux session
-        await self._cleanup_tmux_session()
-
     async def _cleanup_tmux_session(self) -> None:
-        """清理 WeTTY 对应的 tmux session"""
-        import subprocess
+        """清理 WeTTY 对应的 tmux session（异步 + 精确匹配 + 结果验证）
 
+        使用 '=session_name' 精确匹配语法，避免 tmux 将 session_name 作为前缀子串匹配。
+        例如：-t '=wetty-tce-server' 不会误匹配 'wetty-tce-server--m12'。
+        """
         session_name = self._tmux_session_name
+        # tmux 精确匹配语法：'=' 前缀
+        exact_target = f"={session_name}"
+
         try:
-            # 检查 session 是否存在
-            result = subprocess.run(
-                ["tmux", "has-session", "-t", session_name],
-                capture_output=True,
+            # 检查 session 是否存在（异步执行）
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "has-session", "-t", exact_target,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            if result.returncode == 0:
-                # Session 存在，终止它
-                subprocess.run(
-                    ["tmux", "kill-session", "-t", session_name],
-                    capture_output=True,
+            await proc.wait()
+
+            if proc.returncode != 0:
+                logger.debug("tmux session 不存在，跳过清理: %s", session_name)
+                return
+
+            # Session 存在，强制终止
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "kill-session", "-t", exact_target,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                logger.warning(
+                    "tmux kill-session 失败: %s - %s",
+                    session_name, stderr.decode().strip(),
                 )
-                logger.info("tmux session 已清理: %s", session_name)
+                return
+
+            # 验证清理结果（二次确认）
+            verify = await asyncio.create_subprocess_exec(
+                "tmux", "has-session", "-t", exact_target,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await verify.wait()
+
+            if verify.returncode == 0:
+                logger.error("tmux session 清理验证失败（仍存在）: %s", session_name)
+            else:
+                logger.info("tmux session 已清理（已验证）: %s", session_name)
+
         except Exception as e:
-            logger.warning("清理 tmux session 失败: %s", e)
+            logger.warning("清理 tmux session 异常: %s - %s", session_name, e)
 
     @property
     def is_running(self) -> bool:

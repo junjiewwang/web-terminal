@@ -23,7 +23,7 @@ from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import JumpOrchestrator
 from src.services.pty_session import PTYSessionManager
 from src.services.tmux_manager import TmuxWindowManager
-from src.services.wetty_manager import WeTTYInstance, WeTTYManager
+from src.services.wetty_manager import WeTTYInstance, WeTTYManager, wait_for_port
 
 logger = logging.getLogger(__name__)
 
@@ -198,8 +198,14 @@ async def _start_jump_host(
             detail=f"WeTTY 启动失败: {e}",
         )
 
-    # 等待 WeTTY 进程就绪
-    await asyncio.sleep(2.0)
+    # 等待 WeTTY 进程就绪（主动探测端口，替代固定 sleep）
+    try:
+        await wait_for_port(instance.port)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"WeTTY 端口 {instance.port} 启动超时",
+        )
     logger.info("start_jump_host: 独立 WeTTY 已启动 (%s)", instance_name)
 
     # Step 3: 后台执行跳板编排（PTY 自动化）
@@ -307,6 +313,19 @@ async def _run_jump_orchestration(
                 len(clients_before_pty), len(clients_after_pty),
             )
             await tmux_mgr.select_window(tmux_session, window_name)
+
+    # 防重入检测：检查 tmux session 是否已有活跃 SSH 连接
+    # 如果上次的跳板编排已成功（session 残留了已登录的 SSH），跳过本次编排
+    if is_independent_wetty and await tmux_mgr.is_session_logged_in(tmux_session):
+        screen = pty_session.read_screen(lines=5)
+        # 检查屏幕内容是否包含 shell 提示符（说明已登录到目标主机）
+        import re
+        if re.search(r"[\$#>]\s*$", screen, re.MULTILINE):
+            logger.info(
+                "跳板编排防重入: tmux session 已有活跃连接且有 shell 提示符，跳过编排 (%s)",
+                jump_host.name,
+            )
+            return
 
     # Step 2: 执行跳板编排
     orchestrator = JumpOrchestrator(pty_session)

@@ -56,14 +56,45 @@ class TmuxWindowManager:
         return f"{cls.SESSION_PREFIX}-{host_name}"
 
     async def session_exists(self, session_name: str) -> bool:
-        """检查 tmux 会话是否存在"""
+        """检查 tmux 会话是否存在（精确匹配）"""
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "has-session", "-t", session_name,
+            "tmux", "has-session", "-t", f"={session_name}",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
         return proc.returncode == 0
+
+    async def is_session_logged_in(self, session_name: str) -> bool:
+        """检测 tmux session 是否已有活跃的 SSH/sshpass 连接
+
+        用于跳板编排防重入：如果 session 中的 pane 已经在执行 SSH 相关命令，
+        说明上次的跳板编排已成功，不需要再次执行。
+
+        Returns:
+            True 如果 session 存在且 pane 的 current_command 包含 ssh/sshpass
+        """
+        if not await self.session_exists(session_name):
+            return False
+
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-t", f"={session_name}",
+            "-F", "#{pane_current_command}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+
+        if proc.returncode != 0:
+            return False
+
+        # 检查所有 pane 的命令是否包含 ssh/sshpass
+        for line in stdout.decode().strip().split("\n"):
+            cmd = line.strip().lower()
+            if cmd and cmd in ("ssh", "sshpass", "bash", "zsh", "sh"):
+                return True
+
+        return False
 
     async def create_window(
         self,

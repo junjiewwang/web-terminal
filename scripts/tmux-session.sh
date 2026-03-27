@@ -59,13 +59,39 @@ set-option -g window-size largest
 #   'tmux-256color': unknown terminal type.
 # xterm-256color 是几乎所有 Linux 发行版都预装的 terminfo，兼容性最好
 set-option -g default-terminal "xterm-256color"
+
+# history-limit 5000：tmux scrollback buffer 行数（默认 2000）
+set-option -g history-limit 5000
+
+# ── 鼠标支持（智能模式）──
+# 开启 mouse，让鼠标滚轮可以翻看历史输出
+set-option -g mouse on
+
+# 智能滚轮：根据当前是否在 Alternate Screen（vim/top/less）区分行为
+# - Normal Screen（命令行）：滚轮 → 自动进入 copy mode 翻看历史
+# - Alternate Screen（vim/top）：滚轮 → 直接传递给应用程序（vim 正常滚动）
+#
+# 文本选择说明：
+# - copy mode 内：用 tmux 内置选择（空格开始 → 方向键 → Enter 复制）
+# - 退出 copy mode 后（按 q）：正常鼠标拖选即可
+# - copy mode 内也可以 Shift+鼠标 做浏览器级别选择
+bind-key -T root WheelUpPane \
+  if-shell -Ft= "#{alternate_on}" \
+    "send-keys -M" \
+    "select-pane -t=; copy-mode -e; send-keys -M"
+bind-key -T root WheelDownPane \
+  if-shell -Ft= "#{alternate_on}" \
+    "send-keys -M" \
+    "select-pane -t=; send-keys -M"
 EOF
 
 # ── tmux 会话管理 ─────────────────────────────
-if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+# 使用 '=' 前缀精确匹配 session 名，避免子串匹配。
+# 例如：'=wetty-tce-server' 不会误匹配 'wetty-tce-server--m12'。
+if tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
     # ✅ 会话已存在 → attach（多客户端共享同一个 PTY）
     # 使用 exec 替换当前进程，避免额外 shell 层
-    exec tmux attach-session -t "$SESSION_NAME"
+    exec tmux attach-session -t "=${SESSION_NAME}"
 else
     # 🆕 会话不存在 → 创建新会话 + 在其中执行 SSH
     # tmux new-session 的命令参数：会话内执行 SSH 连接
