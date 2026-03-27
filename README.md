@@ -46,27 +46,28 @@
                          │  │ (终端画面) │  │ (操作日志)  │ │
                          │  └─────┬─────┘  └──────┬──────┘ │
                          └────────┼───────────────┼────────┘
-                           socket.io            SSE
+                           WebSocket            SSE
                                   │               │
                     ┌─────────────▼───────────────▼──────────┐
-                    │            nginx (反向代理)              │
-                    └─────┬──────────────┬──────────────┬─────┘
-                          │              │              │
-                    ┌─────▼────┐  ┌──────▼─────┐ ┌─────▼────┐
-                    │  WeTTY   │  │  FastAPI    │ │   MCP    │
-                    │(Node.js) │  │  REST API   │ │  Server  │
-                    │SSH + PTY │  │  + SSE      │ │ 7 tools  │
-                    └─────┬────┘  └────────────┘ └─────┬────┘
-                          │                            │
-                          │      socket.io (PTY)       │
-                          │◄───────────────────────────┘
-                          │
-                    ┌─────▼──────────────────┐
-                    │   SSH → 堡垒机 → 目标    │
-                    └────────────────────────┘
+                    │          nginx (:8000 反向代理)          │
+                    └──────┬──────────┬──────────────┬───────┘
+                           │          │              │
+                    ┌──────▼──────────▼──────┐ ┌─────▼────┐
+                    │   FastAPI / uvicorn     │ │   MCP    │
+                    │  ┌──────────────────┐  │ │  Server  │
+                    │  │  Python PTY      │  │ │ 10 tools │
+                    │  │  (pty.fork)      │  │ └─────┬────┘
+                    │  └────────┬─────────┘  │       │
+                    │  REST API + WebSocket   │       │
+                    │  + SSE 事件推送         │◄──────┘
+                    └──────────┬──────────────┘  共享 PTY
+                               │
+                    ┌──────────▼───────────────┐
+                    │  tmux → SSH → 堡垒机 → 目标 │
+                    └─────────────────────────┘
 ```
 
-**核心思路**：WeTTY 负责 SSH PTY，MCP Agent 和浏览器都通过 socket.io 连接到同一个 WeTTY 实例。Agent 敲命令 → WeTTY 广播输出 → 浏览器同步显示。
+**核心思路**：Python PTY 直接管理终端会话，tmux 负责会话复用（浏览器 + Agent 共享同一个 SSH PTY）。Agent 通过 MCP 敲命令 → PTY 转发到远端 → 输出通过 WebSocket 广播 → 浏览器同步显示。
 
 ---
 
@@ -121,7 +122,7 @@ docker compose up -d
 
 ## 🛠️ MCP 工具箱
 
-Agent 拿到了 **7 件装备**：
+Agent 拿到了 **10 件装备**：
 
 | 工具 | 干什么的 | 类比 |
 |------|----------|------|
@@ -131,7 +132,10 @@ Agent 拿到了 **7 件装备**：
 | `send_input` | 发送任意输入 | 键盘打字（适配堡垒机菜单选择等） |
 | `wait_for_output` | 等终端出现某段文字 | 盯着屏幕等关键字出现（expect 风格） |
 | `read_terminal` | 读当前终端屏幕 | 抬头看看屏幕上显示了什么 |
+| `get_session_status` | 查询会话状态 | 看看连了哪些机器 |
 | `disconnect` | 断开连接 | `exit` |
+| `list_windows` | 列出堡垒机的 tmux 窗口 | 查看打开了哪些二级主机 |
+| `switch_window` | 切换堡垒机的活跃窗口 | 在不同二级主机之间切换 |
 
 ### 堡垒机场景示例
 
@@ -159,11 +163,12 @@ web-terminal/
 │   ├── models/                # ORM 模型 + Pydantic Schema
 │   ├── services/              # 核心业务
 │   │   ├── host_manager.py    #   主机 CRUD + YAML 热加载同步
-│   │   ├── wetty_manager.py   #   WeTTY 进程管理（多主机多端口）
-│   │   ├── pty_session.py     #   PTY 交互式会话（socket.io + expect）
+│   │   ├── terminal_manager.py#   Python PTY 终端管理（替代 WeTTY）
+│   │   ├── tmux_manager.py    #   tmux 多窗口管理（会话复用）
+│   │   ├── jump_orchestrator.py#  堡垒机跳板连接编排引擎
 │   │   └── event_service.py   #   SSE 事件总线
-│   ├── mcp_server/            # MCP Server（7 个 Agent 工具）
-│   ├── api/                   # REST API + WeTTY 反向代理
+│   ├── mcp_server/            # MCP Server（10 个 Agent 工具）
+│   ├── api/                   # REST API + WebSocket 终端直连
 │   └── utils/                 # 安全工具（Fernet 加密、Token 认证）
 ├── frontend/                  # React + xterm.js + Tailwind CSS
 │   └── src/
@@ -188,11 +193,10 @@ web-terminal/
 |----|------|--------|
 | **后端** | FastAPI + Uvicorn | 异步原生，MCP / SSE / WebSocket 全覆盖 |
 | **MCP** | FastMCP (Streamable HTTP) | 官方 Python SDK，与 FastAPI 无缝集成 |
-| **终端** | WeTTY (Node.js) | 成熟的 Web SSH 方案，socket.io 协议可编程 |
-| **PTY 控制** | python-socketio | Agent 通过 socket.io 客户端操控 WeTTY PTY |
-| **前端** | React 18 + xterm.js + Tailwind CSS | 终端渲染 + 现代 UI |
+| **终端** | Python PTY + tmux | 原生 PTY 管理，tmux 实现浏览器与 Agent 会话共享 |
+| **前端** | React 18 + xterm.js + Tailwind CSS | 终端渲染 + 现代 UI，WebSocket 直连 PTY |
 | **数据库** | SQLite (aiosqlite) | 轻量，单文件，开箱即用 |
-| **安全** | Fernet 加密 + Bearer Token | 密码不裸奔，API 有认证 |
+| **安全** | Fernet 加密 + Bearer Token + 命令黑名单 | 密码不裸奔，API 有认证，危险命令拦截 |
 | **部署** | Docker + nginx | 一个容器搞定一切，nginx 搞定 SSE 长连接 |
 
 ---
@@ -206,12 +210,9 @@ uvicorn src.main:app --reload --port 8001
 
 # 前端
 cd frontend && npm install && npm run dev
-
-# WeTTY（需要 Node.js）
-npm install -g wetty
 ```
 
-> **提示**：本地开发需要 WeTTY 命令可用。Docker 部署则无需额外安装。
+> **提示**：本地开发需要 `tmux` 和 `sshpass` 命令可用。Docker 部署则无需额外安装。
 
 ### 环境变量
 
@@ -226,12 +227,13 @@ npm install -g wetty
 ## 🗺️ Roadmap
 
 - [x] 主机资产管理 + YAML 热加载
-- [x] MCP Server — 7 个 PTY 交互式工具
-- [x] Web Terminal — xterm.js 直连 WeTTY
+- [x] MCP Server — 10 个 PTY 交互式工具
+- [x] Web Terminal — xterm.js + WebSocket 直连 Python PTY
 - [x] Agent 操作面板 + SSE 实时推送
 - [x] 安全加固 — Fernet 加密 + API 认证 + 命令黑名单
 - [x] Docker 一键部署
-- [ ] **tmux 会话共享** — Agent 和浏览器共享同一个 SSH PTY（[方案详情](docs/tmux-session-sharing-plan.md)）
+- [x] **tmux 会话共享** — Agent 和浏览器共享同一个 SSH PTY
+- [x] 堡垒机跳板编排 — 自动化 JumpServer 多级跳转
 - [ ] CI/CD 自动化
 - [ ] PostgreSQL 生产级存储
 
