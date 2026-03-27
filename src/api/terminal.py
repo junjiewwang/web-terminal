@@ -178,17 +178,7 @@ async def _run_jump_orchestration(
             logger.info("跳板编排防重入: 已有活跃连接 (%s)", jump_host.name)
             return
 
-    # 等待终端就绪（tmux session 建立 + SSH 连接）
-    try:
-        await session.wait_for(
-            pattern=r"Opt>|[$#>%]\s*$",
-            timeout=15.0,
-        )
-    except TimeoutError:
-        logger.error("等待堡垒机就绪超时: %s", jump_host.name)
-        return
-
-    # 执行跳板编排
+    # 执行跳板编排（内部已有 _wait_for_ready 等待堡垒机就绪）
     orchestrator = JumpOrchestrator(session)  # type: ignore[arg-type]
     result = await orchestrator.execute_jump(
         jump_host=jump_host,
