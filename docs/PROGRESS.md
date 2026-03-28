@@ -829,6 +829,7 @@ _run_jump_orchestration():
 13. ~~**decrypt_password 类型错误**~~ → 已修复：`wetty_manager.py` 中添加 `password_encrypted` 的 None 检查后再调用 `decrypt_password()`
 14. ~~**WeTTY 冷启动 502 瞬态问题**~~ → 已通过方案 E 修复：前端 socket.io 静默重试，冷启动期间前 3 次连接失败不显示错误，保持 "connecting" 状态让 socket.io 自动重连
 15. ~~**MCP jump_host 连接**~~ → 已修复：更新 `_connect_jump_host` 为独立 WeTTY 实例架构，与 REST API 保持一致
+16. ~~**tmux copy-mode 文本复制功能不工作**~~ → 已通过第三轮修复解决：变量转义问题（`$TMUX_BUF` → `\$TMUX_BUF`），详见 `docs/clipboard-fix-verification.md`
 
 ## 十、开发里程碑
 
@@ -1009,6 +1010,102 @@ _run_jump_orchestration():
     - vim/top/less 内滚轮 → 正常传递给应用
     - 文本选择 → 正常拖选
     - 翻看历史输出 → `Ctrl+B [` 进入 copy mode，按 `q` 退出
+
+- [x] **P1: alternate screen 模式下文本复制（方案四：tmux copy-mode → 浏览器剪贴板）— 第三轮修复**
+  - **问题现象（第三轮）**：用户反馈"还是不行"，通过浏览器实际验证发现根本原因
+  - **根因分析（浏览器实际验证）**：
+
+    | 问题 | 原因 | 发现过程 |
+    |------|------|----------|
+    | after-copy-mode hook 变量展开错误 | `.tmux.conf` 中 `$TMUX_BUF` 被提前展开为空字符串 | 使用 `docker exec tmux show-hooks` 发现 hook 变成了 `if [ -n "" ]` |
+    | API 从未被调用 | hook 条件判断永远为 false，不会执行 curl | 后端日志无 "收到 copy-buffer 请求" |
+    | 前端无 toast | WebSocket 未收到 clipboard 消息 | 浏览器控制台无相关日志 |
+
+  - **修复方案（第三轮）**：
+
+    | 问题 | 修复 | 涉及文件 |
+    |------|------|----------|
+    | `$TMUX_BUF` 变量展开错误 | 使用 `\$TMUX_BUF` 转义，防止 tmux 在加载配置时展开，保留到运行时才展开 | `scripts/tmux-session.sh` |
+
+    **关键代码变更**：
+    ```bash
+    # 修复前（错误）
+    "run-shell 'TMUX_BUF=$(tmux save-buffer - 2>/dev/null); if [ -n \"$TMUX_BUF\" ]; then ..."
+    
+    # 修复后（正确）
+    "run-shell 'TMUX_BUF=\$(tmux save-buffer - 2>/dev/null); if [ -n \"\$TMUX_BUF\" ]; then ..."
+    ```
+
+  - **验证结果（容器内测试）**：
+
+    | 验证项 | 方法 | 结果 |
+    |--------|------|------|
+    | tmux hook 配置正确 | `tmux show-hooks -g \| grep after-copy-mode` | ✅ `if [ -n \"\$TMUX_BUF\" ]`（变量正确保留） |
+    | tmux mouse 配置 | `tmux show-options -g \| grep mouse` | ✅ `mouse on` |
+    | tmux set-clipboard 配置 | `tmux show-options -g set-clipboard` | ✅ `set-clipboard on` |
+    | 模拟 API 调用 | Python http.client POST /api/tmux/copy-buffer | ✅ 返回 204 |
+    | 后端日志确认 | `docker logs --tail 20` | ✅ "收到 copy-buffer 请求" + "读取 buffer 文件成功" + "已推送到前端" |
+    | 前端代码实现 | 检查 useWebSocket.ts + TerminalView.tsx | ✅ onClipboard 回调 + showCopyToast + toast UI |
+
+  - **用户操作流程（修复后）**：
+    ```
+    1. 鼠标拖选文本 → 自动进入 tmux copy-mode（tmux mouse on）
+    2. 松开鼠标后，按 Enter 或 Ctrl+C
+       - Enter: 复制选区 + 退出 copy-mode
+       - Ctrl+C: 复制选区 + 退出 copy-mode（重绑定后）
+    3. after-copy-mode hook 触发
+    4. hook 执行：保存 buffer → curl POST /api/tmux/copy-buffer
+    5. 后端读取 buffer → WebSocket 推送 {type: "clipboard"}
+    6. 前端收到 → navigator.clipboard.writeText() → toast "已复制到剪贴板"
+    ```
+
+  - **涉及文件**：
+
+    | 文件 | 变更 |
+    |------|------|
+    | `scripts/tmux-session.sh` | 修复 hook 中的变量转义问题 |
+    | `src/api/terminal.py` | POST /api/tmux/copy-buffer 端点实现 |
+    | `src/services/terminal_manager.py` | send_to_clients() 方法 |
+    | `frontend/src/hooks/useWebSocket.ts` | onClipboard 回调处理 |
+    | `frontend/src/components/TerminalView.tsx` | showCopyToast + toast UI |
+    | `docs/PROGRESS.md` | 记录问题发现过程和验证结果 |
+
+- [x] **P1: alternate screen 模式下文本复制（方案四：tmux copy-mode → 浏览器剪贴板）**
+  - **问题现象**：tmux `mouse on` 导致鼠标拖选直接进入 tmux copy-mode，xterm.js 的 `hasSelection()` 永远为 false，方案五（Buffer API 拦截 Ctrl+C）无效
+  - **方案选型**：
+
+    | 方案 | 评估 | 结论 |
+    |------|------|------|
+    | 方案三：tmux capture-pane 后端导出 | 只能复制整个屏幕，不支持选区 | ❌ 体验差 |
+    | **方案四：tmux copy-mode + hook** | **tmux 原生复制机制，hook 自动推送** | ✅ 采用 |
+    | 方案五：xterm.js Buffer API | Ctrl+C 拦截依赖 xterm.js hasSelection()，但 tmux mouse on 抢占选区 | ❌ 无效 |
+
+  - **实现架构**：
+    ```
+    用户鼠标拖选 → tmux 进入 copy-mode → 用户按 Enter/q 退出
+    → tmux after-copy-mode hook 触发
+    → hook 保存 buffer 到 /tmp/tmux-copy-{session}
+    → hook 调用 POST /api/tmux/copy-buffer
+    → 后端读取文件，通过 WebSocket 推送 {type: "clipboard", text: "..."}
+    → 前端收到消息 → navigator.clipboard.writeText() → toast "已复制到剪贴板"
+    ```
+
+  - **涉及文件**：
+
+    | 文件 | 变更 |
+    |------|------|
+    | `scripts/tmux-session.sh` | 添加 `set-hook -g after-copy-mode`：保存 buffer → curl POST API |
+    | `src/services/terminal_manager.py` | `TerminalSession` 新增 `send_to_clients()` 公共方法 |
+    | `src/api/terminal.py` | 新增 `POST /api/tmux/copy-buffer` 端点：读取 buffer 文件 → WebSocket 推送 |
+    | `frontend/src/hooks/useWebSocket.ts` | 新增 `onClipboard` 回调，处理 `clipboard` 消息类型 |
+    | `frontend/src/hooks/useTerminal.ts` | 方案五 Buffer API 复制逻辑（作为 Shift+鼠标选区的补充保留） |
+    | `frontend/src/components/TerminalView.tsx` | `onClipboard` 回调写入剪贴板 + toast 提示 |
+
+  - **用户体验**：
+    - 鼠标拖选 → 自动进入 tmux copy-mode → 松开鼠标或按 Enter → 文本自动复制到浏览器剪贴板
+    - 按 `q` 退出 copy-mode（取消选择）不会触发复制（buffer 无新内容）
+    - toast 提示 "已复制到剪贴板"（2s 自动消失）
+    - Shift+鼠标拖选绕过 tmux mouse mode，走 xterm.js 原生选区 + Ctrl+C 复制（方案五兜底）
 
 ### ⏸ 已评估 — 暂不实施
 

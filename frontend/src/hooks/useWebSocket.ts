@@ -33,6 +33,8 @@ export interface UseWebSocketOptions {
   onConnect?: () => void;
   /** 连接断开回调 */
   onDisconnect?: (reason?: string) => void;
+  /** 收到 tmux clipboard 推送的回调 */
+  onClipboard?: (text: string) => void;
 }
 
 /** Hook 返回值（与 useWettySocket 兼容） */
@@ -59,7 +61,7 @@ const RECONNECT_CONFIG = {
  * 原生 WebSocket 终端连接 Hook
  */
 export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
-  const { wsUrl, onData, onConnect, onDisconnect } = options;
+  const { wsUrl, onData, onConnect, onDisconnect, onClipboard } = options;
   const [status, setStatus] = useState<SocketStatus>("disconnected");
   const wsRef = useRef<WebSocket | null>(null);
   const attemptsRef = useRef(0);
@@ -70,9 +72,11 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
   const onDataRef = useRef(onData);
   const onConnectRef = useRef(onConnect);
   const onDisconnectRef = useRef(onDisconnect);
+  const onClipboardRef = useRef(onClipboard);
   onDataRef.current = onData;
   onConnectRef.current = onConnect;
   onDisconnectRef.current = onDisconnect;
+  onClipboardRef.current = onClipboard;
 
   // ── 连接生命周期 ──────────────────────────────
   useEffect(() => {
@@ -106,10 +110,43 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "output" && msg.data) {
-            onDataRef.current?.(msg.data);
+            // 添加调试日志：检查是否包含 OSC 52
+            if (msg.data.includes('\x1B]52;;')) {
+              console.log('[WebSocket] 收到包含 OSC 52 的消息');
+            }
+            
+            // 检查是否包含 OSC 52 剪贴板序列
+            // 格式: \x1B]52;;<base64-encoded-text>\x07
+            const osc52Regex = /\x1B\]52;;([A-Za-z0-9+/=]+)\x07/g;
+            let match;
+            let processedData = msg.data;
+            
+            while ((match = osc52Regex.exec(msg.data)) !== null) {
+              const base64Text = match[1];
+              try {
+                // 解码 base64
+                const text = atob(base64Text);
+                console.log('[WebSocket] 解析到 OSC 52 剪贴板内容:', text);
+                // 触发剪贴板回调
+                onClipboardRef.current?.(text);
+                
+                // 从数据中移除 OSC 52 序列，避免 xterm.js 处理可能导致的问题
+                processedData = processedData.replace(match[0], '');
+              } catch (e) {
+                console.error('[WebSocket] 解码 OSC 52 失败:', e);
+              }
+            }
+            
+            // 将处理后的数据传递给终端显示（OSC 52 序列已被移除）
+            if (processedData) {
+              onDataRef.current?.(processedData);
+            }
           } else if (msg.type === "closed") {
             setStatus("disconnected");
             onDisconnectRef.current?.(msg.reason || "closed");
+          } else if (msg.type === "clipboard" && msg.text) {
+            // 兼容后端 API 推送的 clipboard 消息
+            onClipboardRef.current?.(msg.text);
           }
         } catch {
           // 非 JSON 消息，当作原始终端输出

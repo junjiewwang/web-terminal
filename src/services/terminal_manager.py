@@ -315,6 +315,24 @@ class TerminalSession:
                 self.session_id[:8], len(self._ws_clients),
             )
 
+    async def send_to_clients(self, msg: dict) -> None:
+        """向所有 WebSocket 客户端发送自定义 JSON 消息
+
+        用于 tmux copy-mode → 浏览器剪贴板联动等场景。
+        """
+        if not self._ws_clients:
+            return
+
+        dead_clients: list[WebSocket] = []
+        for ws in self._ws_clients:
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead_clients.append(ws)
+
+        for ws in dead_clients:
+            self._ws_clients.remove(ws)
+
     # ── Agent 共享接口（兼容旧 PTYSession 的 send_input/wait_for/read_screen）──
 
     async def send_input(self, text: str) -> None:

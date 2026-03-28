@@ -45,9 +45,7 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/ssh/ssh_config.d \
     && printf 'Host *\n  HostKeyAlgorithms +ssh-rsa\n  PubkeyAcceptedAlgorithms +ssh-rsa\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
-       > /etc/ssh/ssh_config.d/legacy-compat.conf \
-    && printf 'set-option -g window-size largest\nset-option -g default-terminal "xterm-256color"\n' \
-       > /root/.tmux.conf
+       > /etc/ssh/ssh_config.d/legacy-compat.conf
 
 # 2) Python 依赖（偶尔变）
 COPY requirements.txt .
