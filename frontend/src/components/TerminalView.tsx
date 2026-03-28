@@ -62,11 +62,46 @@ export default function TerminalView({
   });
 
   // ── 原生 WebSocket 连接 Hook ──
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showCopyToast = useCallback((text: string) => {
+    // 使用 textarea + execCommand 复制到剪贴板
+    // 这种方式不需要浏览器权限提示，用户体验更好
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;left:-9999px;opacity:0;pointer-events:none";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+
+    let success = false;
+    try {
+      success = document.execCommand("copy");
+    } catch {
+      success = false;
+    }
+
+    document.body.removeChild(ta);
+
+    // 显示 toast（只在成功时显示）
+    if (success) {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      setToast("已复制到剪贴板");
+      toastTimerRef.current = setTimeout(() => setToast(null), 2000);
+    } else {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      setToast("复制失败，请手动复制");
+      toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+    }
+  }, []);
+
   const ws = useWebSocket({
     wsUrl,
     onData: (data) => {
       terminal.write(data);
     },
+    onClipboard: showCopyToast,
     onConnect: () => {
       setStatus("connected");
       requestAnimationFrame(() => {
@@ -191,6 +226,13 @@ export default function TerminalView({
           display: isActive ? undefined : "none",
         }}
       >
+        {/* tmux copy-mode 复制 toast */}
+        {toast && isActive && (
+          <div className="absolute top-2 right-2 z-20 px-3 py-1.5 bg-emerald-600/90 text-white text-xs rounded shadow-lg pointer-events-none animate-pulse">
+            {toast}
+          </div>
+        )}
+
         {(status === "starting" || status === "connecting") && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80">
             <div className="text-center">

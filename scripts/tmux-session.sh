@@ -70,11 +70,6 @@ set-option -g mouse on
 # 智能滚轮：根据当前是否在 Alternate Screen（vim/top/less）区分行为
 # - Normal Screen（命令行）：滚轮 → 自动进入 copy mode 翻看历史
 # - Alternate Screen（vim/top）：滚轮 → 直接传递给应用程序（vim 正常滚动）
-#
-# 文本选择说明：
-# - copy mode 内：用 tmux 内置选择（空格开始 → 方向键 → Enter 复制）
-# - 退出 copy mode 后（按 q）：正常鼠标拖选即可
-# - copy mode 内也可以 Shift+鼠标 做浏览器级别选择
 bind-key -T root WheelUpPane \
   if-shell -Ft= "#{alternate_on}" \
     "send-keys -M" \
@@ -83,6 +78,86 @@ bind-key -T root WheelDownPane \
   if-shell -Ft= "#{alternate_on}" \
     "send-keys -M" \
     "select-pane -t=; send-keys -M"
+
+# 鼠标拖选：始终进入 copy-mode
+# - Normal Screen（命令行）：拖选 → 进入 copy-mode
+# - Alternate Screen（vim/top）：拖选 → 也进入 copy-mode（统一行为）
+#
+# 注意：如果你希望在 vim 中使用 vim 自己的鼠标功能，
+# 请在 vim 中设置 :set mouse= ，然后使用 Shift+鼠标拖选进入 tmux copy-mode
+bind-key -T root MouseDown1Pane select-pane
+bind-key -T root MouseDrag1Pane select-pane \; copy-mode \; send-keys -X begin-selection
+
+# ── 文本选择行为优化 ──
+# 鼠标拖选文本的行为：
+# 1. 鼠标拖选 → 进入 copy-mode 并开始选择
+# 2. 松开鼠标后，保持选择状态（不自动复制）
+# 3. 用户按 Ctrl+C 确认复制，或按 ESC/q 取消
+#
+# 关键修改：MouseDragEnd1Pane 不绑定任何操作
+# 这样拖选后选择区域保持高亮，用户可以决定下一步操作
+unbind-key -T copy-mode MouseDragEnd1Pane
+
+# 禁用双击/三击选择（太容易误触）
+# 默认：双击选择单词，三击选择整行
+unbind-key -T root DoubleClick1Pane
+unbind-key -T root TripleClick1Pane
+unbind-key -T copy-mode DoubleClick1Pane
+unbind-key -T copy-mode TripleClick1Pane
+
+# ── tmux copy-mode → 浏览器剪贴板联动 ──
+# 方案：tmux copy-mode 里的选区通过 OSC 52 转义序列推送到 xterm.js，
+# xterm.js 监听后写入浏览器剪贴板。
+#
+# 关键配置：
+# 1. set-clipboard on: tmux 自动把选区内容通过 OSC 52 发送给终端
+# 2. 重绑定 Ctrl+C: 默认是 cancel，改为 copy-selection-and-cancel
+#
+# 用户操作流程：
+#   鼠标拖选 → 进入 copy-mode → 按 Enter 或 Ctrl+C → 选区内容 → 浏览器剪贴板
+#
+# 注意：xterm.js 需要配置 allowProposedApi: true 并监听 onClipboardPaste
+# 事件来接收 OSC 52 内容。但由于浏览器安全限制，xterm.js 无法直接写入剪贴板，
+# 需要通过我们自定义的消息通道（WebSocket）推送。
+
+# 启用 tmux 的 OSC 52 剪贴板支持（选区自动发送给终端）
+set-option -g set-clipboard on
+
+# ── copy-mode 键绑定重定义 ──
+# 用户友好的复制交互：
+# 1. 鼠标拖选 → 进入 copy-mode 并开始选择
+# 2. 松开鼠标 → 保持选择状态（不自动复制）
+# 3. 按 Ctrl+C → 复制 + 清除选择 + **保持在 copy-mode**
+# 4. 按 ESC → 只清除选择，不退出 copy-mode
+# 5. 按 q 或 Enter → 退出 copy-mode（不复制）
+#
+# ESC 键：只清除选择，不退出 copy-mode
+# 使用 clear-selection 命令清除选择高亮
+bind-key -T copy-mode Escape send-keys -X clear-selection
+
+# Ctrl+C：复制但不退出 copy-mode
+# 使用 copy-selection-no-clear 复制（不退出），然后 clear-selection 清除选择
+bind-key -T copy-mode C-c send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
+
+# Enter：退出但不复制
+bind-key -T copy-mode Enter send-keys -X cancel
+
+# q：取消并退出
+bind-key -T copy-mode q send-keys -X cancel
+
+# Enter 绑定为 cancel（退出但不复制）
+bind-key -T copy-mode Enter send-keys -X cancel
+
+# q 保持默认的 cancel（取消并退出）
+
+# 注意：Mac 上的 Cmd+C 无法直接绑定到 tmux（会被浏览器拦截）
+# 但 tmux 的 C-c 在 Mac 上也能工作（Ctrl+C）
+
+# after-copy-mode hook：copy-mode 退出后推送 buffer 到前端
+# 注意：只有 copy-selection-and-cancel 会往 buffer 写内容，cancel 不会
+# 使用 \$(...) 防止 tmux 在加载配置时展开变量，保留到运行时才展开
+set-hook -g after-copy-mode \
+  "run-shell 'TMUX_BUF=\$(tmux save-buffer - 2>/dev/null); if [ -n \"\$TMUX_BUF\" ]; then echo \"\$TMUX_BUF\" > /tmp/tmux-copy-#{session_name}; curl -sf -X POST -H \"Content-Type: application/json\" -d \"{\\\"session_name\\\":\\\"#{session_name}\\\"}\" http://127.0.0.1:8001/api/tmux/copy-buffer > /dev/null 2>&1 & fi; rm -f /tmp/tmux-copy-#{session_name}'"
 EOF
 
 # ── tmux 会话管理 ─────────────────────────────

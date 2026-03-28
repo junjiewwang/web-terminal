@@ -37,6 +37,9 @@ router = APIRouter(tags=["terminal"])
 terminal_manager: TerminalManager | None = None
 tmux_manager: TmuxWindowManager | None = None
 
+# tmux copy buffer 临时文件路径前缀
+_COPY_BUFFER_DIR = "/tmp"
+
 
 def _get_terminal_manager() -> TerminalManager:
     if terminal_manager is None:
@@ -220,6 +223,63 @@ async def list_terminals() -> list[TerminalResponse]:
 
 
 # ── WebSocket 端点 ────────────────────────────
+
+
+class CopyBufferRequest(BaseModel):
+    """tmux copy-buffer 通知请求（由 tmux hook 调用）"""
+    session_name: str
+
+
+@router.post("/api/tmux/copy-buffer", status_code=204)
+async def handle_copy_buffer(req: CopyBufferRequest) -> None:
+    """tmux copy-mode 退出后，读取复制的 buffer 内容并推送到前端 WebSocket
+
+    由 tmux-session.sh 中的 after-copy-mode hook 调用：
+    1. tmux 保存 buffer 到 /tmp/tmux-copy-{session_name}
+    2. hook 调用此 API
+    3. 此 API 读取文件内容，通过 WebSocket 推送给前端
+    4. 前端收到 {type: "clipboard"} 消息后写入浏览器剪贴板
+    """
+    logger.info("收到 copy-buffer 请求: session_name=%s", req.session_name)
+
+    mgr = _get_terminal_manager()
+
+    # 从 tmux session_name 反推 instance_name
+    # tmux session: "wetty-{instance_name}" → instance_name
+    session_name = req.session_name
+    if not session_name.startswith("wetty-"):
+        logger.warning("无效的 session_name 前缀: %s", session_name)
+        return
+
+    instance_name = session_name[len("wetty-"):]
+    session = mgr.get_session(instance_name)
+    if not session:
+        logger.warning("找不到终端会话: instance_name=%s", instance_name)
+        return
+    if not session.running:
+        logger.warning("终端会话未运行: instance_name=%s", instance_name)
+        return
+
+    # 读取 tmux hook 写入的临时文件
+    buffer_path = f"{_COPY_BUFFER_DIR}/tmux-copy-{session_name}"
+    try:
+        with open(buffer_path, "r") as f:
+            text = f.read().strip()
+        logger.info("读取 buffer 文件成功: %s (%d chars)", buffer_path, len(text))
+    except FileNotFoundError:
+        logger.warning("buffer 文件不存在: %s", buffer_path)
+        return
+    except Exception as e:
+        logger.error("读取 buffer 文件失败: %s - %s", buffer_path, e)
+        return
+
+    if not text:
+        logger.info("buffer 内容为空，跳过推送")
+        return
+
+    # 通过 WebSocket 推送到前端
+    await session.send_to_clients({"type": "clipboard", "text": text})
+    logger.info("tmux copy-buffer 已推送到前端: %s (%d chars)", session_name, len(text))
 
 
 @router.websocket("/ws/terminal/{session_id}")
