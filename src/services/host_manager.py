@@ -1,52 +1,57 @@
 """主机资产管理服务
 
-封装主机 CRUD 操作和 YAML 配置同步逻辑，
-所有数据库操作集中在此，上层（API / MCP）只调用服务方法。
-
-设计原则：
-- hosts.yaml 是 Single Source of Truth，DB 是运行时缓存
-- sync_from_yaml() 实现完整的增/改/删同步（非仅导入）
-- Pydantic 校验先行：任何一条格式错误则整批拒绝
-- 事务原子性：所有变更在一个事务中完成
-
-跳板主机支持：
-- bastion 类型主机可包含嵌套的 jump_hosts 二级主机配置
-- sync_from_yaml 自动解析 jump_hosts，建立父子关系
-- jump_host 的 parent_id 指向所属堡垒机，实现树形结构
+职责：
+- 封装主机 CRUD
+- 将 `config/hosts.yaml` 同步到数据库
+- 维护递归连接树结构
+- 提供从目标节点回溯到根节点的多跳路径解析能力
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import cast
 
 import yaml
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from src.models.host import (
     AuthType,
+    EntrySpecSchema,
+    EntryType,
     Host,
     HostCreate,
+    HostResponse,
+    HostTreeYAMLSchema,
     HostType,
     HostUpdate,
-    JumpHostConfigSchema,
-    JumpHostYAMLSchema,
-    LoginStepSchema,
 )
-from src.utils.security import decrypt_password, encrypt_password
+from src.utils.security import encrypt_password
 
 logger = logging.getLogger(__name__)
+
+JsonDict = dict[str, object]
+_UPDATABLE_FIELDS: tuple[str, ...] = (
+    "name",
+    "hostname",
+    "port",
+    "username",
+    "auth_type",
+    "private_key_path",
+    "description",
+    "ready_pattern",
+    "host_type",
+    "parent_id",
+)
 
 
 @dataclass
 class SyncResult:
-    """YAML 同步结果"""
+    """YAML 同步结果。"""
 
     added: int = 0
     updated: int = 0
@@ -57,7 +62,7 @@ class SyncResult:
     def total_changes(self) -> int:
         return self.added + self.updated + self.deleted
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> JsonDict:
         return {
             "added": self.added,
             "updated": self.updated,
@@ -66,42 +71,69 @@ class SyncResult:
         }
 
 
+@dataclass
+class _RootConnection:
+    hostname: str
+    port: int
+    username: str
+    auth_type: AuthType
+    private_key_path: str | None
+
+
+@dataclass
+class _FlattenedNode:
+    data: HostCreate
+    parent_name: str | None
+
+
 class HostManager:
-    """主机资产管理器"""
+    """主机资产管理器。"""
 
     def __init__(self, session: AsyncSession) -> None:
-        self._session = session
+        self._session: AsyncSession = session
 
     # ── 查询 ──────────────────────────────────
 
-    async def list_hosts(self, tag: Optional[str] = None) -> list[Host]:
-        """列出所有主机，可按标签过滤
+    async def list_hosts(self, tag: str | None = None) -> list[Host]:
+        """列出主机树（仅返回顶层根节点）。"""
+        hosts = await self._list_all_hosts(tag=tag)
+        return self._build_host_tree(hosts)
 
-        显式 eager load children 关系，确保异步模式下
-        不会触发 lazy load 导致 MissingGreenlet 错误。
-        """
-        stmt = select(Host).options(selectinload(Host.children)).order_by(Host.name)
-        if tag:
-            stmt = stmt.where(Host.tags.contains(tag))
-        result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+    async def list_host_responses(self, tag: str | None = None) -> list[HostResponse]:
+        """直接返回递归响应对象，避免路由层重复组装。"""
+        return [HostResponse.from_orm_model(host) for host in await self.list_hosts(tag=tag)]
 
-    async def get_host_by_id(self, host_id: int) -> Optional[Host]:
-        """按 ID 获取主机"""
-        stmt = select(Host).options(selectinload(Host.children)).where(Host.id == host_id)
+    async def get_host_by_id(self, host_id: int) -> Host | None:
+        stmt = select(Host).where(Host.id == host_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def get_host_by_name(self, name: str) -> Optional[Host]:
-        """按名称获取主机"""
-        stmt = select(Host).options(selectinload(Host.children)).where(Host.name == name)
+    async def get_host_by_name(self, name: str) -> Host | None:
+        stmt = select(Host).where(Host.name == name)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_connection_path(self, host: Host) -> list[Host]:
+        """从当前节点回溯到根节点，返回 root -> target 的路径。"""
+        path: list[Host] = [host]
+        current = host
+        while current.parent_id:
+            parent = await self.get_host_by_id(current.parent_id)
+            if not parent:
+                raise ValueError(f"节点 '{current.name}' 的父节点不存在 (id={current.parent_id})")
+            path.append(parent)
+            current = parent
+        path.reverse()
+        return path
+
+    @staticmethod
+    def build_instance_name(path: list[Host]) -> str:
+        """根据连接路径生成唯一终端实例名。"""
+        return "--".join(node.name for node in path)
 
     # ── 创建 ──────────────────────────────────
 
     async def create_host(self, data: HostCreate) -> Host:
-        """创建新主机"""
         host = Host(
             name=data.name,
             hostname=data.hostname,
@@ -113,22 +145,15 @@ class HostManager:
             tags=",".join(data.tags) if data.tags else None,
             host_type=data.host_type,
             parent_id=data.parent_id,
-            target_ip=data.target_ip,
+            ready_pattern=data.ready_pattern,
         )
-        # 密码认证时加密存储
+
         if data.auth_type == AuthType.PASSWORD and data.password:
             host.password_encrypted = encrypt_password(data.password)
-
-        # 堡垒机配置 → JSON
-        if data.jump_config:
-            host.jump_config = data.jump_config.model_dump_json()
-
-        # 登录步骤链 → JSON
-        if data.login_steps:
-            host.login_steps = json.dumps(
-                [s.model_dump() for s in data.login_steps],
-                ensure_ascii=False,
-            )
+        if data.entry_password:
+            host.entry_password_encrypted = encrypt_password(data.entry_password)
+        if data.entry:
+            host.entry_spec = data.entry.model_dump_json()
 
         self._session.add(host)
         await self._session.flush()
@@ -137,47 +162,28 @@ class HostManager:
 
     # ── 更新 ──────────────────────────────────
 
-    async def update_host(self, host_id: int, data: HostUpdate) -> Optional[Host]:
-        """更新主机信息"""
+    async def update_host(self, host_id: int, data: HostUpdate) -> Host | None:
         host = await self.get_host_by_id(host_id)
         if not host:
             return None
 
-        update_data = data.model_dump(exclude_unset=True)
+        fields_set = set(data.model_fields_set)
 
-        # 特殊处理 tags（list -> CSV）
-        if "tags" in update_data:
-            tags = update_data.pop("tags")
-            host.tags = ",".join(tags) if tags else None
+        if "tags" in fields_set:
+            host.tags = ",".join(data.tags) if data.tags else None
 
-        # 特殊处理 password（加密后存储）
-        if "password" in update_data:
-            password = update_data.pop("password")
-            if password:
-                host.password_encrypted = encrypt_password(password)
+        if "password" in fields_set:
+            host.password_encrypted = encrypt_password(data.password) if data.password else None
 
-        # 特殊处理 jump_config（Pydantic → JSON string）
-        if "jump_config" in update_data:
-            jc = update_data.pop("jump_config")
-            if jc is not None:
-                host.jump_config = JumpHostConfigSchema(**jc).model_dump_json() if isinstance(jc, dict) else jc.model_dump_json()
-            else:
-                host.jump_config = None
+        if "entry_password" in fields_set:
+            host.entry_password_encrypted = encrypt_password(data.entry_password) if data.entry_password else None
 
-        # 特殊处理 login_steps（Pydantic list → JSON string）
-        if "login_steps" in update_data:
-            ls = update_data.pop("login_steps")
-            if ls is not None:
-                steps = [
-                    (LoginStepSchema(**s).model_dump() if isinstance(s, dict) else s.model_dump())
-                    for s in ls
-                ]
-                host.login_steps = json.dumps(steps, ensure_ascii=False)
-            else:
-                host.login_steps = None
+        if "entry" in fields_set:
+            host.entry_spec = data.entry.model_dump_json() if data.entry else None
 
-        for key, value in update_data.items():
-            setattr(host, key, value)
+        for field_name in _UPDATABLE_FIELDS:
+            if field_name in fields_set:
+                setattr(host, field_name, getattr(data, field_name))
 
         await self._session.flush()
         await self._session.refresh(host)
@@ -186,7 +192,6 @@ class HostManager:
     # ── 删除 ──────────────────────────────────
 
     async def delete_host(self, host_id: int) -> bool:
-        """删除主机"""
         host = await self.get_host_by_id(host_id)
         if not host:
             return False
@@ -197,7 +202,7 @@ class HostManager:
     # ── YAML 同步（Single Source of Truth）──────
 
     async def sync_from_yaml(self, yaml_path: str | Path) -> SyncResult:
-        """从 YAML 同步主机到 DB，支持 bastion + jump_hosts 嵌套"""
+        """从新的递归节点 YAML 结构同步到 DB。"""
         result = SyncResult()
         path = Path(yaml_path)
         if not path.exists():
@@ -206,54 +211,20 @@ class HostManager:
 
         try:
             with open(path, encoding="utf-8") as f:
-                config = yaml.safe_load(f)
+                loaded: object = yaml.safe_load(f)
         except yaml.YAMLError as e:
             result.errors.append(f"YAML 解析失败: {e}")
             return result
 
-        hosts_config = config.get("hosts") if config else []
-        if not hosts_config:
-            hosts_config = []
-
-        # ── 校验顶层主机 + 收集 jump_hosts ──
-        validated_top: list[HostCreate] = []
-        jump_hosts_map: dict[str, list[JumpHostYAMLSchema]] = {}
+        config: JsonDict = loaded if isinstance(loaded, dict) else {}
+        raw_hosts: object = config.get("hosts")
+        hosts_config: list[object] = raw_hosts if isinstance(raw_hosts, list) else []
+        flattened: list[_FlattenedNode] = []
 
         for idx, item in enumerate(hosts_config):
             try:
-                host_type = HostType(item.get("type", "direct"))
-                jump_config = None
-                if host_type == HostType.BASTION:
-                    jc_data = {}
-                    if item.get("ready_pattern"):
-                        jc_data["ready_pattern"] = item["ready_pattern"]
-                    if item.get("login_success_pattern"):
-                        jc_data["login_success_pattern"] = item["login_success_pattern"]
-                    if jc_data:
-                        jump_config = JumpHostConfigSchema(**jc_data)
-
-                data = HostCreate(
-                    name=item.get("name", ""), hostname=item.get("hostname", ""),
-                    port=item.get("port", 22), username=item.get("username", ""),
-                    auth_type=AuthType(item.get("auth_type", "key")),
-                    private_key_path=item.get("private_key_path"),
-                    password=item.get("password"), description=item.get("description"),
-                    tags=item.get("tags"), host_type=host_type, jump_config=jump_config,
-                )
-                validated_top.append(data)
-
-                # 解析嵌套 jump_hosts
-                if host_type == HostType.BASTION and item.get("jump_hosts"):
-                    jh_list: list[JumpHostYAMLSchema] = []
-                    for jidx, jitem in enumerate(item["jump_hosts"]):
-                        try:
-                            jh_list.append(JumpHostYAMLSchema(**jitem))
-                        except (ValidationError, ValueError) as je:
-                            result.errors.append(
-                                f"主机 '{item.get('name', '?')}' 的第 {jidx + 1} 个 jump_host 校验失败: {je}"
-                            )
-                    if jh_list:
-                        jump_hosts_map[data.name] = jh_list
+                node = HostTreeYAMLSchema.model_validate(item)
+                flattened.extend(self._flatten_yaml_node(node))
             except (ValidationError, ValueError) as e:
                 result.errors.append(f"第 {idx + 1} 条主机配置校验失败: {e}")
 
@@ -261,60 +232,55 @@ class HostManager:
             logger.error("hosts.yaml 校验失败，拒绝同步: %s", result.errors)
             return result
 
-        # ── 全局 name 唯一性检查 ──
-        all_names = [d.name for d in validated_top]
-        for jh_list in jump_hosts_map.values():
-            all_names.extend(jh.name for jh in jh_list)
-        duplicates = {n for n in all_names if all_names.count(n) > 1}
+        all_names = [item.data.name for item in flattened]
+        duplicates = {name for name in all_names if all_names.count(name) > 1}
         if duplicates:
-            result.errors.append(f"YAML 中存在重复的主机名: {duplicates}")
+            result.errors.append(f"YAML 中存在重复的主机名: {sorted(duplicates)}")
             return result
 
-        # ── 同步顶层主机（direct / bastion）──
-        yaml_top_names = {d.name for d in validated_top}
-        yaml_top_by_name = {d.name: d for d in validated_top}
-        db_hosts = await self.list_hosts()
-        db_top = {h.name: h for h in db_hosts if h.host_type != HostType.JUMP_HOST}
+        existing_hosts = await self._list_all_hosts()
+        existing_by_name = {host.name: host for host in existing_hosts}
+        created_or_updated: dict[str, Host] = {}
 
-        for name in yaml_top_names - set(db_top):
-            await self.create_host(yaml_top_by_name[name])
-            result.added += 1
-            logger.info("[SYNC] 新增主机: %s", name)
+        for item in flattened:
+            parent_id: int | None = None
+            if item.parent_name:
+                parent = created_or_updated.get(item.parent_name) or existing_by_name.get(item.parent_name)
+                if not parent:
+                    result.errors.append(f"父节点不存在: {item.parent_name} -> {item.data.name}")
+                    continue
+                parent_id = parent.id
 
-        for name in yaml_top_names & set(db_top):
-            if self._host_needs_update(db_top[name], yaml_top_by_name[name]):
-                await self.update_host(db_top[name].id, self._build_update_data(yaml_top_by_name[name]))
-                result.updated += 1
-                logger.info("[SYNC] 更新主机: %s", name)
-
-        for name in set(db_top) - yaml_top_names:
-            await self.delete_host(db_top[name].id)
-            result.deleted += 1
-            logger.info("[SYNC] 删除主机: %s (id=%d)", name, db_top[name].id)
-
-        # ── 同步 jump_hosts（二级主机）──
-        for bastion_name, jh_list in jump_hosts_map.items():
-            bastion = await self.get_host_by_name(bastion_name)
-            if not bastion:
-                continue
-            db_jh = {h.name: h for h in await self._list_jump_hosts(bastion.id)}
-            yaml_jh = {jh.name: jh for jh in jh_list}
-
-            for jname in set(yaml_jh) - set(db_jh):
-                await self.create_host(self._build_jump_host_create(yaml_jh[jname], bastion))
+            data = item.data.model_copy(update={"parent_id": parent_id})
+            existing = existing_by_name.get(data.name)
+            if existing is None:
+                host = await self.create_host(data)
                 result.added += 1
-                logger.info("[SYNC] 新增二级主机: %s → %s", jname, bastion_name)
-
-            for jname in set(yaml_jh) & set(db_jh):
-                if self._jump_host_needs_update(db_jh[jname], yaml_jh[jname]):
-                    await self.update_host(db_jh[jname].id, self._build_jump_host_update(yaml_jh[jname]))
+                logger.info("[SYNC] 新增节点: %s", data.name)
+            else:
+                if self._host_needs_update(existing, data, parent_id):
+                    _ = await self.update_host(existing.id, self._build_update_data(data, parent_id))
+                    host = await self.get_host_by_id(existing.id)
                     result.updated += 1
-                    logger.info("[SYNC] 更新二级主机: %s", jname)
+                    logger.info("[SYNC] 更新节点: %s", data.name)
+                else:
+                    host = existing
 
-            for jname in set(db_jh) - set(yaml_jh):
-                await self.delete_host(db_jh[jname].id)
+            if host is None:
+                result.errors.append(f"同步后无法读取节点: {data.name}")
+                continue
+            created_or_updated[data.name] = host
+
+        yaml_names = {item.data.name for item in flattened}
+        for name, host in existing_by_name.items():
+            if name not in yaml_names:
+                _ = await self.delete_host(host.id)
                 result.deleted += 1
-                logger.info("[SYNC] 删除二级主机: %s", jname)
+                logger.info("[SYNC] 删除节点: %s", name)
+
+        if result.errors:
+            logger.error("hosts.yaml 同步失败: %s", result.errors)
+            return result
 
         if result.total_changes:
             logger.info("[SYNC] 同步完成: +%d ~%d -%d", result.added, result.updated, result.deleted)
@@ -322,23 +288,124 @@ class HostManager:
             logger.info("[SYNC] 配置无变化")
         return result
 
-    # ── 查询辅助 ──────────────────────────────────
+    # ── 内部辅助方法 ──────────────────────────────
 
-    async def _list_jump_hosts(self, bastion_id: int) -> list[Host]:
-        """列出指定堡垒机下的所有 jump_host"""
-        stmt = (
-            select(Host)
-            .where(Host.parent_id == bastion_id, Host.host_type == HostType.JUMP_HOST)
-            .order_by(Host.name)
-        )
+    async def _list_all_hosts(self, tag: str | None = None) -> list[Host]:
+        stmt = select(Host).order_by(Host.name)
+        if tag:
+            stmt = stmt.where(Host.tags.contains(tag))
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
-    # ── 内部辅助方法 ──────────────────────────────
+    @staticmethod
+    def _coerce_json_dict(value: object) -> JsonDict:
+        if not isinstance(value, dict):
+            return {}
+        return {str(key): item for key, item in value.items()}
 
     @staticmethod
-    def _host_needs_update(db_host: Host, yaml_data: HostCreate) -> bool:
-        """比较顶层主机是否需要更新"""
+    def _runtime_children(host: Host) -> list[Host]:
+        existing = host.__dict__.get("children")
+        if isinstance(existing, list):
+            return cast(list[Host], existing)
+
+        runtime_children: list[Host] = []
+        host.__dict__["children"] = runtime_children
+        return runtime_children
+
+    @classmethod
+    def _build_host_tree(cls, hosts: list[Host]) -> list[Host]:
+        by_id = {host.id: host for host in hosts}
+        for host in hosts:
+            cls._runtime_children(host).clear()
+
+        roots: list[Host] = []
+        for host in hosts:
+            if host.parent_id and host.parent_id in by_id:
+                cls._runtime_children(by_id[host.parent_id]).append(host)
+            else:
+                roots.append(host)
+
+        def _sort_recursively(node: Host) -> None:
+            runtime_children = cls._runtime_children(node)
+            runtime_children.sort(key=lambda child: child.name.lower())
+            for child in runtime_children:
+                _sort_recursively(child)
+
+        roots.sort(key=lambda node: node.name.lower())
+        for root in roots:
+            _sort_recursively(root)
+        return roots
+
+    @classmethod
+    def _flatten_yaml_node(
+        cls,
+        node: HostTreeYAMLSchema,
+        parent_name: str | None = None,
+        root_conn: _RootConnection | None = None,
+    ) -> list[_FlattenedNode]:
+        if parent_name is None:
+            if not node.hostname or not node.username:
+                raise ValueError(f"根节点 '{node.name}' 必须配置 hostname 和 username")
+            if node.entry and node.entry.type != EntryType.NONE:
+                raise ValueError(f"根节点 '{node.name}' 不能配置入口动作 entry")
+            root_conn = _RootConnection(
+                hostname=node.hostname,
+                port=node.port,
+                username=node.username,
+                auth_type=node.auth_type,
+                private_key_path=node.private_key_path,
+            )
+            current = HostCreate(
+                name=node.name,
+                hostname=node.hostname,
+                port=node.port,
+                username=node.username,
+                auth_type=node.auth_type,
+                private_key_path=node.private_key_path,
+                password=node.password,
+                entry_password=node.entry_password,
+                description=node.description,
+                tags=node.tags,
+                ready_pattern=node.ready_pattern,
+                host_type=HostType.ROOT,
+                entry=EntrySpecSchema(type=EntryType.NONE),
+            )
+        else:
+            if root_conn is None:
+                raise ValueError(f"节点 '{node.name}' 缺少根连接上下文")
+            if not node.entry or node.entry.type == EntryType.NONE or not node.entry.value:
+                raise ValueError(f"嵌套节点 '{node.name}' 必须配置有效的 entry")
+            current = HostCreate(
+                name=node.name,
+                hostname=root_conn.hostname,
+                port=root_conn.port,
+                username=root_conn.username,
+                auth_type=root_conn.auth_type,
+                private_key_path=root_conn.private_key_path,
+                password=None,
+                entry_password=node.entry_password,
+                description=node.description,
+                tags=node.tags,
+                ready_pattern=node.ready_pattern,
+                host_type=HostType.NESTED,
+                entry=node.entry,
+            )
+
+        flattened = [_FlattenedNode(data=current, parent_name=parent_name)]
+        for child in node.children:
+            flattened.extend(cls._flatten_yaml_node(child, parent_name=node.name, root_conn=root_conn))
+        return flattened
+
+    @staticmethod
+    def _entry_dict(data: HostCreate) -> JsonDict:
+        if data.entry is None:
+            return {}
+        entry_dump: dict[str, object] = data.entry.model_dump(exclude_none=True)
+        return entry_dump
+
+    @classmethod
+    def _host_needs_update(cls, db_host: Host, yaml_data: HostCreate, parent_id: int | None) -> bool:
         if db_host.hostname != yaml_data.hostname:
             return True
         if db_host.port != yaml_data.port:
@@ -353,64 +420,41 @@ class HostManager:
             return True
         if db_host.host_type != yaml_data.host_type:
             return True
+        if db_host.parent_id != parent_id:
+            return True
+        if db_host.ready_pattern != yaml_data.ready_pattern:
+            return True
+
         db_tags = sorted(t.strip() for t in db_host.tags.split(",") if t.strip()) if db_host.tags else []
         yaml_tags = sorted(yaml_data.tags) if yaml_data.tags else []
         if db_tags != yaml_tags:
             return True
-        if yaml_data.password:
+
+        db_entry = db_host.get_entry_spec()
+        yaml_entry = cls._entry_dict(yaml_data)
+        if db_entry != yaml_entry:
+            return True
+
+        if yaml_data.password is not None:
+            return True
+        if yaml_data.entry_password is not None:
             return True
         return False
 
     @staticmethod
-    def _build_update_data(yaml_data: HostCreate) -> HostUpdate:
-        """从 HostCreate 构建 HostUpdate"""
+    def _build_update_data(yaml_data: HostCreate, parent_id: int | None) -> HostUpdate:
         return HostUpdate(
-            hostname=yaml_data.hostname, port=yaml_data.port,
-            username=yaml_data.username, auth_type=yaml_data.auth_type,
+            hostname=yaml_data.hostname,
+            port=yaml_data.port,
+            username=yaml_data.username,
+            auth_type=yaml_data.auth_type,
             private_key_path=yaml_data.private_key_path,
-            password=yaml_data.password, description=yaml_data.description,
-            tags=yaml_data.tags, host_type=yaml_data.host_type,
-            jump_config=yaml_data.jump_config,
-        )
-
-    @staticmethod
-    def _jump_host_needs_update(db_host: Host, jh: JumpHostYAMLSchema) -> bool:
-        """比较二级主机是否需要更新"""
-        if db_host.target_ip != jh.target_ip:
-            return True
-        if db_host.description != jh.description:
-            return True
-        # login_steps 比较（JSON 序列化后比较）
-        db_steps = db_host.get_login_steps()
-        yaml_steps = [s.model_dump() for s in jh.login_steps] if jh.login_steps else []
-        if db_steps != yaml_steps:
-            return True
-        if jh.password:
-            return True
-        return False
-
-    @staticmethod
-    def _build_jump_host_create(jh: JumpHostYAMLSchema, bastion: Host) -> HostCreate:
-        """从 JumpHostYAMLSchema 构建 HostCreate（二级主机）"""
-        return HostCreate(
-            name=jh.name,
-            # jump_host 继承堡垒机的连接信息（自身不直连）
-            hostname=bastion.hostname, port=bastion.port,
-            username=bastion.username, auth_type=bastion.auth_type,
-            description=jh.description,
-            host_type=HostType.JUMP_HOST,
-            parent_id=bastion.id,
-            target_ip=jh.target_ip,
-            login_steps=jh.login_steps,
-            password=jh.password,
-        )
-
-    @staticmethod
-    def _build_jump_host_update(jh: JumpHostYAMLSchema) -> HostUpdate:
-        """从 JumpHostYAMLSchema 构建 HostUpdate（二级主机）"""
-        return HostUpdate(
-            target_ip=jh.target_ip,
-            description=jh.description,
-            login_steps=jh.login_steps,
-            password=jh.password,
+            password=yaml_data.password,
+            entry_password=yaml_data.entry_password,
+            description=yaml_data.description,
+            tags=yaml_data.tags,
+            ready_pattern=yaml_data.ready_pattern,
+            host_type=yaml_data.host_type,
+            parent_id=parent_id,
+            entry=yaml_data.entry,
         )

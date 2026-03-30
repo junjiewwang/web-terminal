@@ -1,15 +1,14 @@
-"""跳板连接编排引擎
+"""多跳连接编排引擎
 
-编排堡垒机 → 二级主机的自动跳转流程：
-1. 在堡垒机 tmux 会话中创建新窗口
-2. 发送目标 IP
-3. 执行 login_steps 步骤链（wait → send 原子操作）
-4. 等待登录成功标志
+负责按 root -> ... -> target 的路径顺序执行每一跳：
+1. 等待当前节点 ready_pattern
+2. 执行子节点 entry（menu_send / ssh_command）
+3. 执行 entry.steps（wait → send）
+4. 等待 success_pattern，确认进入下一跳成功
 
-设计原则：
-- 每步同时检测 login_success_pattern，提前匹配则跳过剩余步骤
-- 支持变量替换：{{password}} → 密码, {{manual}} → 暂停等待人工输入
-- 超时和错误信息清晰，方便 Agent 理解和重试
+说明：
+- 文件名保留为 jump_orchestrator.py，便于与现有模块关系保持稳定；
+  但内部实现已升级为通用多跳连接编排器。
 """
 
 from __future__ import annotations
@@ -17,43 +16,30 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
-from src.models.host import Host, JumpHostConfigSchema, LoginStepSchema
+from src.models.host import EntrySpecSchema, EntryType, Host, LoginStepSchema
 
 logger = logging.getLogger(__name__)
 
-
-# ── 编排结果 ──────────────────────────────────
+_DEFAULT_READY_PATTERN = r"[\$#>%]\s*$|Opt>|password:|Password:"
+_DEFAULT_SUCCESS_PATTERN = r"Last login|[\$#>%]\s*$"
+_VAR_PATTERN = re.compile(r"\{\{(\w+)\}\}")
 
 
 @dataclass
-class JumpResult:
-    """跳板连接编排结果"""
+class ConnectionResult:
+    """连接编排结果"""
 
     success: bool
     message: str
     window_name: Optional[str] = None
-    steps_executed: int = 0
+    actions_executed: int = 0
     skipped_reason: Optional[str] = None
 
 
-# ── 变量替换 ──────────────────────────────────
-
-# 变量占位符正则
-_VAR_PATTERN = re.compile(r"\{\{(\w+)\}\}")
-
-
 def _resolve_variables(text: str, password: Optional[str] = None) -> tuple[str, bool]:
-    """解析 login_steps 中的变量占位符
-
-    Args:
-        text: 含变量的文本（如 "{{password}}"）
-        password: jump_host 配置的密码
-
-    Returns:
-        (resolved_text, needs_manual) - 解析后的文本 + 是否需要人工输入
-    """
+    """解析步骤中的变量占位符。"""
     needs_manual = False
 
     def _replacer(match: re.Match) -> str:
@@ -63,7 +49,7 @@ def _resolve_variables(text: str, password: Optional[str] = None) -> tuple[str, 
             return password or ""
         if var_name == "manual":
             needs_manual = True
-            return ""  # manual 变量不替换，由调用方处理
+            return ""
         logger.warning("未知变量: {{%s}}，保持原样", var_name)
         return match.group(0)
 
@@ -71,16 +57,9 @@ def _resolve_variables(text: str, password: Optional[str] = None) -> tuple[str, 
     return resolved, needs_manual
 
 
-# ── 编排引擎 ──────────────────────────────────
+class ConnectionOrchestrator:
+    """通用多跳连接编排器。"""
 
-
-class JumpOrchestrator:
-    """跳板连接编排器
-
-    协调 PTYSession 和 tmux 窗口管理，执行堡垒机跳板流程。
-    """
-
-    # 默认超时配置
     DEFAULT_READY_TIMEOUT = 15.0
     DEFAULT_STEP_TIMEOUT = 15.0
     DEFAULT_LOGIN_TIMEOUT = 30.0
@@ -88,284 +67,215 @@ class JumpOrchestrator:
     def __init__(self, pty_session) -> None:
         self._session = pty_session
 
-    async def execute_jump(
+    async def execute_path(
         self,
-        jump_host: Host,
-        bastion: Host,
+        path: Sequence[Host],
         tmux_session_name: str,
         window_name: str,
         skip_window_creation: bool = False,
-    ) -> JumpResult:
-        """执行完整的跳板连接编排
+    ) -> ConnectionResult:
+        """按路径依次进入目标节点。"""
+        if not path:
+            return ConnectionResult(success=False, message="连接路径为空", window_name=window_name)
 
-        流程：
-        1. 在堡垒机 tmux session 中创建新窗口（可跳过）
-        2. 等待堡垒机就绪（ready_pattern）
-        3. 发送目标 IP
-        4. 执行 login_steps（如有）
-        5. 等待登录成功
-
-        Args:
-            jump_host: 二级主机 ORM 对象
-            bastion: 父堡垒机 ORM 对象
-            tmux_session_name: 堡垒机的 tmux 会话名
-            window_name: 要创建的 tmux 窗口名
-            skip_window_creation: 是否跳过 tmux 窗口创建。
-                当调用方已通过 TmuxWindowManager.create_window(command=ssh_cmd)
-                创建了带 SSH 命令的窗口时，应设为 True，避免重复创建。
-
-        Returns:
-            JumpResult 编排结果
-        """
-        # 解析堡垒机配置
-        jump_config = self._parse_jump_config(bastion)
-        login_steps = self._parse_login_steps(jump_host)
-
-        # 解密 jump_host 密码（用于 {{password}} 变量替换）
-        jump_password = self._decrypt_jump_password(jump_host)
+        if len(path) == 1:
+            return ConnectionResult(success=True, message="根节点会话已就绪", window_name=window_name)
 
         logger.info(
-            "开始跳板编排: %s → %s (window=%s, steps=%d, skip_create=%s)",
-            bastion.name, jump_host.name, window_name, len(login_steps),
+            "开始多跳编排: %s (window=%s, skip_create=%s)",
+            " -> ".join(node.name for node in path),
+            window_name,
             skip_window_creation,
         )
 
-        # Step 1: 创建 tmux 新窗口（可跳过）
         if not skip_window_creation:
             try:
                 await self._create_tmux_window(tmux_session_name, window_name)
             except Exception as e:
-                return JumpResult(
+                return ConnectionResult(
                     success=False,
                     message=f"创建 tmux 窗口失败: {e}",
                     window_name=window_name,
                 )
 
-        # Step 2: 等待堡垒机就绪
-        try:
-            await self._wait_for_ready(jump_config.ready_pattern)
-        except TimeoutError:
-            return JumpResult(
-                success=False,
-                message=f"等待堡垒机就绪超时 ({self.DEFAULT_READY_TIMEOUT}s)，"
-                        f"未匹配到 ready_pattern: {jump_config.ready_pattern}",
-                window_name=window_name,
-            )
+        actions_executed = 0
+        current = path[0]
 
-        # Step 3: 发送目标 IP
-        target_ip = jump_host.target_ip
-        if not target_ip:
-            return JumpResult(
-                success=False,
-                message=f"二级主机 {jump_host.name} 未配置 target_ip",
-                window_name=window_name,
-            )
-
-        await self._session.send_input(f"{target_ip}\r")
-        logger.info("已发送目标 IP: %s", target_ip)
-
-        # Step 4: 执行 login_steps
-        steps_executed = 0
-        for i, step in enumerate(login_steps):
-            result = await self._execute_step(
-                step, i + 1, len(login_steps),
-                jump_config.login_success_pattern,
-                jump_password,
-            )
-
-            if result.skipped_reason:
-                # 提前匹配到登录成功，跳过剩余步骤
-                logger.info(
-                    "步骤 %d/%d 检测到登录成功，跳过剩余: %s",
-                    i + 1, len(login_steps), result.skipped_reason,
-                )
-                return JumpResult(
-                    success=True,
-                    message=f"跳板连接成功（提前匹配登录标志，执行了 {steps_executed} 步）",
+        for next_node in path[1:]:
+            ready_pattern = current.ready_pattern or _DEFAULT_READY_PATTERN
+            try:
+                await self._wait_for_pattern(ready_pattern, self.DEFAULT_READY_TIMEOUT)
+            except TimeoutError:
+                return ConnectionResult(
+                    success=False,
+                    message=f"等待节点 '{current.name}' 就绪超时 ({self.DEFAULT_READY_TIMEOUT}s)，未匹配到: {ready_pattern}",
                     window_name=window_name,
-                    steps_executed=steps_executed,
+                    actions_executed=actions_executed,
+                )
+
+            result = await self._enter_node(next_node)
+            actions_executed += result.actions_executed
+
+            if not result.success:
+                return ConnectionResult(
+                    success=False,
+                    message=f"进入节点 '{next_node.name}' 失败: {result.message}",
+                    window_name=window_name,
+                    actions_executed=actions_executed,
                     skipped_reason=result.skipped_reason,
                 )
 
-            if not result.success:
-                return JumpResult(
-                    success=False,
-                    message=f"步骤 {i + 1}/{len(login_steps)} 失败: {result.message}",
+            if result.skipped_reason == "manual_input_required":
+                return ConnectionResult(
+                    success=True,
+                    message=f"已进入到需要人工输入的步骤，请在浏览器终端中继续完成：{next_node.name}",
                     window_name=window_name,
-                    steps_executed=steps_executed,
+                    actions_executed=actions_executed,
+                    skipped_reason=result.skipped_reason,
                 )
 
-            steps_executed += 1
+            current = next_node
 
-        # Step 5: 等待登录成功
-        try:
-            await self._session.wait_for(
-                pattern=jump_config.login_success_pattern,
-                timeout=self.DEFAULT_LOGIN_TIMEOUT,
-            )
-        except TimeoutError:
-            return JumpResult(
-                success=False,
-                message=f"等待登录成功超时 ({self.DEFAULT_LOGIN_TIMEOUT}s)，"
-                        f"未匹配到: {jump_config.login_success_pattern}",
-                window_name=window_name,
-                steps_executed=steps_executed,
-            )
-
-        logger.info(
-            "跳板编排完成: %s → %s (执行了 %d 步)",
-            bastion.name, jump_host.name, steps_executed,
-        )
-
-        return JumpResult(
+        return ConnectionResult(
             success=True,
-            message=f"跳板连接成功（执行了 {steps_executed} 步）",
+            message=f"多跳连接成功，已到达目标节点 '{current.name}'",
             window_name=window_name,
-            steps_executed=steps_executed,
+            actions_executed=actions_executed,
         )
 
-    # ── 内部步骤 ──────────────────────────────────
+    async def _enter_node(self, node: Host) -> ConnectionResult:
+        entry = self._parse_entry_spec(node)
+        if entry.type == EntryType.NONE or not entry.value:
+            return ConnectionResult(success=False, message=f"节点 '{node.name}' 缺少有效入口动作")
 
-    async def _create_tmux_window(self, tmux_session: str, window_name: str) -> None:
-        """在 tmux session 中创建新窗口
+        await self._send_text(entry.value)
+        actions_executed = 1
+        logger.info("执行入口动作: %s -> %s (%s)", entry.type.value, node.name, entry.value)
 
-        使用 send_input 通过 PTY 发送 tmux 命令，
-        而不是直接 subprocess，因为 PTY 连接是到 WeTTY 内部的。
+        entry_password = self._decrypt_entry_password(node)
+        success_pattern = entry.success_pattern or node.ready_pattern or _DEFAULT_SUCCESS_PATTERN
 
-        Args:
-            tmux_session: tmux 会话名
-            window_name: 窗口名
-        """
-        # 通过 tmux 命令前缀键(C-b)创建新窗口不可靠，
-        # 改为在 PTY 中直接执行 tmux new-window 命令
-        cmd = f"tmux new-window -t {tmux_session} -n {window_name}\r"
-        await self._session.send_input(cmd)
+        for idx, step in enumerate(entry.steps, start=1):
+            step_result = await self._execute_step(
+                step=step,
+                success_pattern=success_pattern,
+                password=entry_password,
+                step_num=idx,
+                total_steps=len(entry.steps),
+            )
+            actions_executed += step_result.actions_executed
+            if step_result.skipped_reason:
+                return ConnectionResult(
+                    success=True,
+                    message=step_result.message,
+                    actions_executed=actions_executed,
+                    skipped_reason=step_result.skipped_reason,
+                )
+            if not step_result.success:
+                return ConnectionResult(
+                    success=False,
+                    message=step_result.message,
+                    actions_executed=actions_executed,
+                )
 
-        # 短暂等待窗口创建
-        import asyncio
-        await asyncio.sleep(0.5)
+        try:
+            await self._wait_for_pattern(success_pattern, self.DEFAULT_LOGIN_TIMEOUT)
+        except TimeoutError:
+            return ConnectionResult(
+                success=False,
+                message=f"等待节点 '{node.name}' 进入成功超时 ({self.DEFAULT_LOGIN_TIMEOUT}s)，未匹配到: {success_pattern}",
+                actions_executed=actions_executed,
+            )
 
-        # 切换到新窗口
-        select_cmd = f"tmux select-window -t {tmux_session}:{window_name}\r"
-        await self._session.send_input(select_cmd)
-        await asyncio.sleep(0.5)
-
-        logger.info("tmux 窗口已创建: %s:%s", tmux_session, window_name)
-
-    async def _wait_for_ready(self, ready_pattern: str) -> None:
-        """等待堡垒机就绪标志"""
-        await self._session.wait_for(
-            pattern=ready_pattern,
-            timeout=self.DEFAULT_READY_TIMEOUT,
-        )
+        return ConnectionResult(success=True, message="OK", actions_executed=actions_executed)
 
     async def _execute_step(
         self,
         step: LoginStepSchema,
+        success_pattern: str,
+        password: Optional[str],
         step_num: int,
         total_steps: int,
-        login_success_pattern: str,
-        password: Optional[str],
-    ) -> JumpResult:
-        """执行单个 login_step
-
-        同时检测 step.wait 和 login_success_pattern：
-        - 匹配 step.wait → 发送 step.send
-        - 匹配 login_success_pattern → 跳过（已登录成功）
-
-        Args:
-            step: LoginStepSchema 步骤
-            step_num: 当前步骤编号
-            total_steps: 总步骤数
-            login_success_pattern: 登录成功标志
-            password: 密码（用于 {{password}} 替换）
-        """
-        # 组合模式：step.wait OR login_success_pattern
-        combined_pattern = f"(?P<step_wait>{step.wait})|(?P<login_ok>{login_success_pattern})"
+    ) -> ConnectionResult:
+        combined_pattern = f"(?P<step_wait>{step.wait})|(?P<login_ok>{success_pattern})"
         timeout = step.timeout or self.DEFAULT_STEP_TIMEOUT
 
         logger.info(
-            "执行步骤 %d/%d: wait='%s', timeout=%.0fs",
-            step_num, total_steps, step.wait, timeout,
+            "执行附加步骤 %d/%d: wait='%s', timeout=%.0fs",
+            step_num,
+            total_steps,
+            step.wait,
+            timeout,
         )
 
         try:
-            output = await self._session.wait_for(
-                pattern=combined_pattern,
-                timeout=timeout,
-            )
+            output = await self._session.wait_for(pattern=combined_pattern, timeout=timeout)
         except TimeoutError:
-            return JumpResult(
-                success=False,
-                message=f"等待模式超时 ({timeout}s): {step.wait}",
-            )
+            return ConnectionResult(success=False, message=f"等待步骤超时 ({timeout}s): {step.wait}")
 
-        # 判断匹配的是哪个分组
         match = re.search(combined_pattern, output, re.MULTILINE)
         if match and match.group("login_ok"):
-            return JumpResult(
+            return ConnectionResult(
                 success=True,
                 message="提前检测到登录成功",
-                skipped_reason=f"匹配到 login_success_pattern: {match.group('login_ok')[:50]}",
+                skipped_reason=f"matched_success_pattern:{match.group('login_ok')[:50]}",
             )
 
-        # 匹配到 step.wait，解析并发送 send 内容
         send_text, needs_manual = _resolve_variables(step.send, password)
-
         if needs_manual:
-            logger.info(
-                "步骤 %d/%d 需要人工输入（{{manual}}变量），暂停编排",
-                step_num, total_steps,
-            )
-            return JumpResult(
+            logger.info("步骤 %d/%d 需要人工输入", step_num, total_steps)
+            return ConnectionResult(
                 success=True,
-                message=f"步骤 {step_num} 需要人工输入（如 MFA 验证码），"
-                        "请在浏览器终端中手动完成",
+                message=f"步骤 {step_num} 需要人工输入（如验证码 / MFA）",
                 skipped_reason="manual_input_required",
             )
 
-        # 发送内容（自动添加回车）
-        if not send_text.endswith("\r") and not send_text.endswith("\n"):
-            send_text += "\r"
+        await self._send_text(send_text)
+        return ConnectionResult(success=True, message="OK", actions_executed=1)
 
-        await self._session.send_input(send_text)
-        logger.info("步骤 %d/%d 已发送: %s", step_num, total_steps, repr(send_text[:30]))
+    async def _create_tmux_window(self, tmux_session: str, window_name: str) -> None:
+        cmd = f"tmux new-window -t {tmux_session} -n {window_name}\r"
+        await self._session.send_input(cmd)
 
-        return JumpResult(success=True, message="OK", steps_executed=1)
+        import asyncio
+        await asyncio.sleep(0.5)
 
-    # ── 辅助方法 ──────────────────────────────────
+        select_cmd = f"tmux select-window -t {tmux_session}:{window_name}\r"
+        await self._session.send_input(select_cmd)
+        await asyncio.sleep(0.5)
+        logger.info("tmux 窗口已创建: %s:%s", tmux_session, window_name)
+
+    async def _send_text(self, text: str) -> None:
+        if not text.endswith("\r") and not text.endswith("\n"):
+            text = f"{text}\r"
+        await self._session.send_input(text)
+
+    async def _wait_for_pattern(self, pattern: str, timeout: float) -> None:
+        await self._session.wait_for(pattern=pattern, timeout=timeout)
 
     @staticmethod
-    def _parse_jump_config(bastion: Host) -> JumpHostConfigSchema:
-        """解析堡垒机的 jump_config，使用默认值兜底"""
-        raw = bastion.get_jump_config()
-        if raw:
-            try:
-                return JumpHostConfigSchema(**raw)
-            except Exception:
-                logger.warning("堡垒机 %s 的 jump_config 解析失败，使用默认值", bastion.name)
-        return JumpHostConfigSchema()
-
-    @staticmethod
-    def _parse_login_steps(jump_host: Host) -> list[LoginStepSchema]:
-        """解析二级主机的 login_steps"""
-        raw_steps = jump_host.get_login_steps()
-        if not raw_steps:
-            return []
+    def _parse_entry_spec(node: Host) -> EntrySpecSchema:
+        raw = node.get_entry_spec()
+        if not raw:
+            return EntrySpecSchema()
         try:
-            return [LoginStepSchema(**s) for s in raw_steps]
+            return EntrySpecSchema(**raw)
         except Exception:
-            logger.warning("二级主机 %s 的 login_steps 解析失败", jump_host.name)
-            return []
+            logger.warning("节点 %s 的 entry_spec 解析失败，使用默认值", node.name)
+            return EntrySpecSchema()
 
     @staticmethod
-    def _decrypt_jump_password(jump_host: Host) -> Optional[str]:
-        """解密二级主机的密码"""
-        if not jump_host.password_encrypted:
+    def _decrypt_entry_password(node: Host) -> Optional[str]:
+        if not node.entry_password_encrypted:
             return None
         try:
             from src.utils.security import decrypt_password
-            return decrypt_password(jump_host.password_encrypted)
+            return decrypt_password(node.entry_password_encrypted)
         except Exception as e:
-            logger.warning("二级主机 %s 密码解密失败: %s", jump_host.name, e)
+            logger.warning("节点 %s 的 entry_password 解密失败: %s", node.name, e)
             return None
+
+
+# 兼容旧导入名，避免局部重构时出现大范围断裂
+JumpOrchestrator = ConnectionOrchestrator
+JumpResult = ConnectionResult
