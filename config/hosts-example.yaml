@@ -1,52 +1,47 @@
-# WeTTY + MCP 智能终端服务 - 主机资产配置
+# WeTTY + MCP 智能终端服务 - 主机资产配置示例
 #
 # 使用方法：
-#   1. 复制本文件为 hosts.yaml:  cp hosts-example.yaml hosts.yaml
+#   1. 复制本文件为 hosts.yaml:  cp config/hosts-example.yaml config/hosts.yaml
 #   2. 按实际环境修改主机信息
 #   3. hosts.yaml 已被 .gitignore 忽略，不会提交到仓库（含敏感凭据）
 #
-# 本文件是主机配置的 Single Source of Truth（唯一真相）
-# 数据库是运行时缓存，所有变更以本文件为准
+# 当前模型：
+#   - 顶层 hosts 为 root 节点：负责建立首跳 SSH 连接
+#   - children 为递归子节点：描述从父节点进入当前节点的方式
+#   - entry.type 支持：menu_send | ssh_command
+#   - entry.success_pattern 用于判断本跳是否已进入成功
+#   - entry.steps 用于处理登录后的附加交互（密码、MFA、菜单确认等）
+#
+# one-key 密码方案（当前推荐写法）：
+#   1. 在目标节点配置 entry_password
+#   2. 在 entry.steps 中引用 {{password}}
+#   3. 建议配合 YAML anchor 复用常见密码步骤，做到“写一次，到处引用”
+#
+# 运行时行为：
+#   - entry_password / password 会在入库时自动加密
+#   - {{password}} 在连接编排时会自动替换为当前节点的 entry_password
+#   - {{manual}} 表示遇到该步骤时暂停，转为人工输入
 #
 # 同步机制：
 #   1. 启动时自动同步到数据库
 #   2. 运行中修改 hosts.yaml 会自动热加载（watchfiles 监听 + 2s 防抖）
 #   3. 也可通过 POST /api/hosts/sync 手动触发同步
-#
-# 同步规则：
-#   - 本文件中有、DB 中无 → 新增
-#   - 本文件中有、DB 中有且字段变化 → 更新
-#   - 本文件中无、DB 中有 → 删除
-#   - 校验先行：任何一条格式错误则整批拒绝
-#
-# 字段说明：
-#   name          - 主机别名（唯一标识，用于 MCP 工具和 URL 路径）
-#   hostname      - 主机地址（IP 或域名）
-#   port          - SSH 端口（默认 22）
-#   username      - SSH 用户名
-#   auth_type     - 认证方式：key（密钥）| password（密码）
-#   private_key_path - SSH 私钥路径（auth_type: key 时必填）
-#   password      - SSH 密码（auth_type: password 时必填，存储时自动加密）
-#   description   - 主机描述（可选）
-#   tags          - 标签列表（可选，用于分类筛选）
-#
-# 堡垒机扩展字段（type: bastion 时使用）：
-#   type          - 主机类型：direct（直连，默认）| bastion（堡垒机）
-#   ready_pattern - 堡垒机就绪检测正则（登录后出现的标志性文本）
-#   login_success_pattern - 二级主机登录成功正则（用于检测跳转成功）
-#   jump_hosts    - 二级主机列表（通过堡垒机跳转的目标主机）
-#
-# 二级主机字段（jump_hosts 列表中的每一项）：
-#   name          - 二级主机别名（全局唯一，可直接用于 connect_host）
-#   target_ip     - 目标主机 IP（在堡垒机中输入的地址）
-#   description   - 描述（可选）
-#   password      - 目标主机密码（可选，用于 login_steps 中的 {{password}} 替换）
-#   login_steps   - 登录交互步骤链（可选，为空则输入 IP 后直接等待登录成功）
-#     - wait      - 等待出现的正则模式
-#       send      - 匹配后发送的内容（支持 {{password}} 变量替换）
+
+one_key_templates:
+  password_step: &password_step
+    wait: "[Pp]assword:"
+    send: "{{password}}"
+
+  sudo_password_step: &sudo_password_step
+    wait: '\[sudo\] password for .*:|[Pp]assword:'
+    send: "{{password}}"
+
+  manual_mfa_step: &manual_mfa_step
+    wait: "Verification code|MFA token|动态口令"
+    send: "{{manual}}"
 
 hosts:
-  # ── 密钥认证示例（推荐） ──────────────────────
+  # ── 根节点：密钥认证示例（推荐） ──────────────────────
   - name: dev-server
     hostname: 192.168.1.100
     port: 22
@@ -57,50 +52,81 @@ hosts:
     tags:
       - dev
       - linux
+    ready_pattern: "[\\$#>%]\\s*$"
 
-  # ── 密码认证示例 ──────────────────────────────
+  # ── 根节点：密码认证示例 ──────────────────────────────
   - name: prod-server
     hostname: 10.0.0.50
     port: 22
     username: admin
     auth_type: password
-    password: "your-password-here"    # 启动时自动加密存储
+    password: "replace-with-root-password"
     description: 生产环境服务器
     tags:
       - prod
       - linux
+    ready_pattern: "[\\$#>]\\s*$"
 
-  # ── 堡垒机 + 二级主机示例 ──────────────────────
-  # - name: my-bastion
-  #   hostname: bastion.example.com
-  #   port: 36000
-  #   username: operator
-  #   auth_type: password
-  #   password: "bastion-password"
-  #   description: 堡垒机 / JumpServer
-  #   type: bastion
-  #   tags:
-  #     - bastion
-  #     - prod
-  #   ready_pattern: "\\[Host\\]>|Opt>"
-  #   login_success_pattern: "Last login|\\]#|\\]\\$"
-  #   jump_hosts:
-  #     # 直连型：输入 IP 后直接等待登录成功（无额外交互步骤）
-  #     - name: app-server-1
-  #       target_ip: "10.0.0.3"
-  #       description: "应用服务器 A"
-  #     # 选择账号型：需要在登录过程中选择账号
-  #     - name: db-server
-  #       target_ip: "10.0.0.5"
-  #       description: "数据库服务器"
-  #       login_steps:
-  #         - wait: "请选择账号|Select account"
-  #           send: "1"
-  #     # 密码型：需要在登录过程中输入目标主机密码
-  #     - name: prod-app
-  #       target_ip: "10.0.0.20"
-  #       description: "生产应用服务器"
-  #       login_steps:
-  #         - wait: "password:"
-  #           send: "{{password}}"
-  #       password: "target-password"
+  # ── 多跳示例：堡垒机 -> 子机 -> 再 ssh 到 root（one-key 密码） ─────
+  - name: bastion
+    hostname: bastion.example.com
+    port: 36000
+    username: operator
+    auth_type: password
+    password: "replace-with-bastion-password"
+    description: 堡垒机
+    tags:
+      - bastion
+      - prod
+    ready_pattern: "\\[Host\\]>|Opt>"
+    children:
+      - name: prod-app
+        description: 通过堡垒机菜单进入生产应用机
+        ready_pattern: "Last login|\\]#|\\]\\$|[\\$#>]\\s*$"
+        entry:
+          type: menu_send
+          value: "10.10.16.3"
+          success_pattern: "Last login|\\]#|\\]\\$|[\\$#>]\\s*$"
+
+      - name: prod-root-hop
+        description: 在堡垒机里直接 ssh 到 root 机器（需要密码）
+        ready_pattern: "Last login|[\\$#>]\\s*$"
+        entry_password: "replace-with-hop-password"
+        entry:
+          type: ssh_command
+          value: "ssh root@10.10.3.5 -p 36000"
+          success_pattern: "Last login|[\\$#>]\\s*$"
+          steps:
+            - *password_step
+
+      - name: prod-root-hop-with-mfa
+        description: 需要密码 + MFA 的多跳登录示例
+        ready_pattern: "Last login|[\\$#>]\\s*$"
+        entry_password: "replace-with-hop-password"
+        entry:
+          type: ssh_command
+          value: "ssh root@10.10.3.6 -p 36000"
+          success_pattern: "Last login|[\\$#>]\\s*$"
+          steps:
+            - *password_step
+            - *manual_mfa_step
+
+      - name: sudo-after-login
+        description: 登录后还需要执行 sudo 并再次输入密码
+        ready_pattern: "root@host:~#|[\\$#>]\\s*$"
+        entry_password: "replace-with-sudo-password"
+        entry:
+          type: ssh_command
+          value: "ssh ops@10.10.3.8 -p 22"
+          success_pattern: "ops@.*[\\$#>]\\s*$"
+          steps:
+            - *password_step
+            - wait: "ops@.*[\\$#>]\\s*$"
+              send: "sudo -i"
+            - *sudo_password_step
+
+# 说明：
+#   - 如果某个 nested 节点只需要“命令 + 自动输密码”，最小配置就是：
+#       entry_password + entry.value + steps: [*password_step]
+#   - 如果密码提示语不同，可单独覆写 wait
+#   - 如果无需自动输入密码，则不配 entry_password / steps 即可
