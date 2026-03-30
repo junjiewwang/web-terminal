@@ -43,20 +43,25 @@ async function fetchWithRetry(
 
 // ── 类型定义 ──────────────────────────────────
 
-/** 主机类型 */
-export type HostType = "direct" | "bastion" | "jump_host";
+/** 节点类型 */
+export type HostType = "root" | "nested";
 
-/** 登录交互步骤（堡垒机跳转时的 wait→send 原子操作） */
+/** 入口动作类型 */
+export type EntryType = "none" | "menu_send" | "ssh_command";
+
+/** 登录交互步骤（wait → send 原子操作） */
 export interface LoginStep {
   wait: string;
   send: string;
   timeout: number;
 }
 
-/** 堡垒机跳板配置 */
-export interface JumpHostConfig {
-  ready_pattern: string;
-  login_success_pattern: string;
+/** 当前节点的入口动作定义 */
+export interface EntrySpec {
+  type: EntryType;
+  value?: string | null;
+  success_pattern?: string | null;
+  steps: LoginStep[];
 }
 
 export interface Host {
@@ -69,16 +74,11 @@ export interface Host {
   private_key_path?: string;
   description?: string;
   tags: string[];
-
-  // ── 跳板主机字段 ──
   host_type: HostType;
   parent_id?: number | null;
-  target_ip?: string | null;
-  jump_config?: JumpHostConfig | null;
-  login_steps?: LoginStep[] | null;
-  /** 二级主机列表（仅 bastion 类型） */
+  ready_pattern?: string | null;
+  entry: EntrySpec;
   children: Host[];
-
   created_at: string;
   updated_at: string;
 }
@@ -117,8 +117,6 @@ export interface WeTTYInstance {
   port: number;
   url: string;
   running: boolean;
-  /** 堡垒机名称（仅 jump_host 时由后端返回） */
-  bastion_name?: string | null;
 }
 
 /** 新架构：终端会话信息（替代 WeTTYInstance） */
@@ -127,7 +125,6 @@ export interface TerminalInstance {
   instance_name: string;
   running: boolean;
   ws_url: string;
-  bastion_name?: string | null;
 }
 
 export interface CreateHostRequest {
@@ -138,15 +135,13 @@ export interface CreateHostRequest {
   auth_type?: "key" | "password";
   private_key_path?: string;
   password?: string;
+  entry_password?: string;
   description?: string;
   tags?: string[];
-
-  // ── 跳板主机字段 ──
+  ready_pattern?: string;
   host_type?: HostType;
   parent_id?: number;
-  target_ip?: string;
-  jump_config?: JumpHostConfig;
-  login_steps?: LoginStep[];
+  entry?: EntrySpec;
 }
 
 // ── 主机管理 ──────────────────────────────────
