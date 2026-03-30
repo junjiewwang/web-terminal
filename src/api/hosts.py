@@ -1,49 +1,43 @@
-"""主机资产管理 REST API
-
-提供主机的 CRUD 接口和 YAML 导入功能，供前端管理 UI 使用。
-"""
+"""主机资产管理 REST API。"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.database import get_db
-from src.models.host import HostCreate, HostResponse, HostType, HostUpdate
+from src.models.host import HostCreate, HostResponse, HostUpdate
 from src.services.host_manager import HostManager
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 
+DbSessionDep = Annotated[AsyncSession, Depends(get_db)]
 
-def _get_manager(session: AsyncSession = Depends(get_db)) -> HostManager:
-    """依赖注入：获取 HostManager 实例"""
+
+def _get_manager(session: DbSessionDep) -> HostManager:
     return HostManager(session)
+
+
+HostManagerDep = Annotated[HostManager, Depends(_get_manager)]
 
 
 @router.get("", response_model=list[HostResponse])
 async def list_hosts(
+    manager: HostManagerDep,
     tag: str | None = None,
-    manager: HostManager = Depends(_get_manager),
 ) -> list[HostResponse]:
-    """获取主机列表（树形结构），支持按标签过滤
-
-    返回顶层主机列表（direct / bastion），不包含 jump_host 类型。
-    jump_host 作为其所属 bastion 的 children 子列表返回。
-    """
-    hosts = await manager.list_hosts(tag=tag)
-    # jump_host 通过 bastion.children 递归返回，不出现在顶层列表
-    top_level = [h for h in hosts if h.host_type != HostType.JUMP_HOST]
-    return [HostResponse.from_orm_model(h) for h in top_level]
+    """获取递归主机树，支持按标签过滤。"""
+    return await manager.list_host_responses(tag=tag)
 
 
 @router.get("/{host_id}", response_model=HostResponse)
 async def get_host(
     host_id: int,
-    manager: HostManager = Depends(_get_manager),
+    manager: HostManagerDep,
 ) -> HostResponse:
-    """获取单个主机详情"""
     host = await manager.get_host_by_id(host_id)
     if not host:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"主机不存在: {host_id}")
@@ -53,9 +47,8 @@ async def get_host(
 @router.post("", response_model=HostResponse, status_code=status.HTTP_201_CREATED)
 async def create_host(
     data: HostCreate,
-    manager: HostManager = Depends(_get_manager),
+    manager: HostManagerDep,
 ) -> HostResponse:
-    """创建新主机"""
     existing = await manager.get_host_by_name(data.name)
     if existing:
         raise HTTPException(
@@ -70,9 +63,8 @@ async def create_host(
 async def update_host(
     host_id: int,
     data: HostUpdate,
-    manager: HostManager = Depends(_get_manager),
+    manager: HostManagerDep,
 ) -> HostResponse:
-    """更新主机信息"""
     host = await manager.update_host(host_id, data)
     if not host:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"主机不存在: {host_id}")
@@ -82,27 +74,18 @@ async def update_host(
 @router.delete("/{host_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_host(
     host_id: int,
-    manager: HostManager = Depends(_get_manager),
+    manager: HostManagerDep,
 ) -> None:
-    """删除主机"""
     deleted = await manager.delete_host(host_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"主机不存在: {host_id}")
 
 
-@router.post("/sync", response_model=dict)
+@router.post("/sync", response_model=dict[str, object])
 async def sync_hosts_from_yaml(
-    manager: HostManager = Depends(_get_manager),
-) -> dict:
-    """从 config/hosts.yaml 同步主机配置到数据库
-
-    YAML 是唯一真相，执行完整的增/改/删同步：
-    - YAML 中有、DB 中无 → 新增
-    - YAML 中有、DB 中有且字段变化 → 更新
-    - YAML 中无、DB 中有 → 删除
-
-    如果 YAML 格式校验失败，整批拒绝，不做任何变更。
-    """
+    manager: HostManagerDep,
+) -> dict[str, object]:
+    """从新的递归连接树 YAML 配置同步主机。"""
     yaml_path = Path(__file__).resolve().parent.parent.parent / "config" / "hosts.yaml"
     result = await manager.sync_from_yaml(yaml_path)
 
