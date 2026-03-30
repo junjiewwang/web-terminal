@@ -16,23 +16,23 @@ PTY 模式工具：
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
-from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from src.models.database import async_session_factory
-from src.models.host import Host, HostType
+from src.models.host import Host, HostResponse
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
-from src.services.jump_orchestrator import JumpOrchestrator
-from src.services.terminal_manager import TerminalManager, TerminalSession
+from src.services.jump_orchestrator import ConnectionOrchestrator
+from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
 
 logger = logging.getLogger(__name__)
+
+JsonDict = dict[str, object]
 
 # ── 全局引用（通过 init_mcp_server 注入）──
 _terminal_manager: TerminalManager | None = None
@@ -72,7 +72,7 @@ def get_pty_manager() -> None:
 # ── 命令安全过滤 ──────────────────────────────
 
 # 危险命令黑名单（正则匹配命令开头）
-_BLOCKED_COMMANDS: list[re.Pattern] = [
+_BLOCKED_COMMANDS: list[re.Pattern[str]] = [
     re.compile(r"^\s*rm\s+(-[rfR]+\s+)?/\s*$"),           # rm -rf /
     re.compile(r"^\s*mkfs\b"),                               # 格式化磁盘
     re.compile(r"^\s*dd\s+.*of=/dev/"),                      # 覆写磁盘设备
@@ -110,7 +110,7 @@ def _get_tmux_manager() -> TmuxWindowManager:
     return _tmux_manager
 
 
-async def _publish_event(event_type: str, session_id: str, host_name: str, data: dict | None = None) -> None:
+async def _publish_event(event_type: str, session_id: str, host_name: str, data: JsonDict | None = None) -> None:
     """发布 SSE 事件"""
     await event_bus.publish(
         AgentEvent(
@@ -138,219 +138,106 @@ def _decrypt_host_password(host: Host) -> str | None:
 
 
 @mcp.tool()
-async def list_hosts(tag: Optional[str] = None) -> str:
+async def list_hosts(tag: str | None = None) -> str:
     """列出所有可用的 SSH 主机
 
-    返回树形结构：bastion 类型主机会列出其下的二级主机（jump_host）。
-    可直接使用主机名连接，包括二级主机名。
-
-    Args:
-        tag: 可选，按标签过滤主机列表
-
-    Returns:
-        主机列表信息（JSON 格式）
+    返回递归树结构：任意节点都可以继续包含 children，
+    适用于 root -> nested -> nested 的多跳链路。
     """
     async with async_session_factory() as session:
         mgr = HostManager(session)
-        hosts = await mgr.list_hosts(tag=tag)
+        hosts = await mgr.list_host_responses(tag=tag)
 
-    result = []
-    for h in hosts:
-        # 跳过 jump_host（它们在 bastion 的 children 中展示）
-        if h.host_type == HostType.JUMP_HOST:
-            continue
-
-        tags = [t.strip() for t in h.tags.split(",") if t.strip()] if h.tags else []
-        host_info: dict = {
-            "id": h.id,
-            "name": h.name,
-            "hostname": h.hostname,
-            "port": h.port,
-            "username": h.username,
-            "description": h.description,
-            "tags": tags,
-            "type": h.host_type.value,
-        }
-
-        # bastion 类型展示二级主机列表
-        if h.is_bastion and h.children:
-            host_info["jump_hosts"] = [
-                {
-                    "name": c.name,
-                    "target_ip": c.target_ip,
-                    "description": c.description,
-                }
-                for c in h.children
-            ]
-
-        result.append(host_info)
-
-    if not result:
+    if not hosts:
         return "没有找到可用的主机。请先通过管理界面添加主机。"
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    def _to_dict(host: HostResponse) -> JsonDict:
+        entry_data: JsonDict = host.entry.model_dump(exclude_none=True)
+        return {
+            "id": host.id,
+            "name": host.name,
+            "hostname": host.hostname,
+            "port": host.port,
+            "username": host.username,
+            "description": host.description,
+            "tags": host.tags,
+            "type": host.host_type.value,
+            "entry": entry_data,
+            "children": [_to_dict(child) for child in host.children],
+        }
+
+    return json.dumps([_to_dict(host) for host in hosts], ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def connect_host(host_name: str) -> str:
-    """连接到指定的 SSH 主机
-
-    自动识别主机类型并执行对应连接流程：
-    - direct / bastion: 启动 WeTTY 实例 + PTY 会话
-    - jump_host: 复用父堡垒机的 WeTTY 实例，自动编排跳板连接
-
-    Args:
-        host_name: 主机名称（在 list_hosts 中查看，包括二级主机名）
-
-    Returns:
-        连接结果，包含 session_id 供后续命令使用
-    """
-    # 查找主机（jump_host 需同时获取父堡垒机）
+    """连接到指定的 SSH 主机节点。"""
     async with async_session_factory() as session:
         mgr = HostManager(session)
         host = await mgr.get_host_by_name(host_name)
-        bastion = None
-        if host and host.is_jump_host and host.parent_id:
-            bastion = await mgr.get_host_by_id(host.parent_id)
+        if host:
+            path = await mgr.get_connection_path(host)
+        else:
+            path = []
 
     if not host:
         return f"错误：未找到名为 '{host_name}' 的主机。请先用 list_hosts 查看可用主机。"
 
-    # 按主机类型分发
-    if host.is_jump_host:
-        if not bastion:
-            return f"错误：二级主机 '{host_name}' 的父堡垒机不存在。请检查配置。"
-        return await _connect_jump_host(host, bastion)
-
-    return await _connect_direct_host(host)
+    return await _connect_path(path)
 
 
-async def _connect_direct_host(host: Host) -> str:
-    """直连主机 / 堡垒机的连接流程（Python PTY 直连）"""
+async def _connect_path(path: list[Host]) -> str:
     mgr = _get_terminal_manager()
+    target = path[-1]
+    root = path[0]
+    instance_name = HostManager.build_instance_name(path)
+    is_reusing = mgr.has_running_session(instance_name)
 
-    is_reusing = mgr.has_running_session(host.name)
+    password = _decrypt_host_password(root)
 
-    # 解密密码
-    password = _decrypt_host_password(host)
-
-    # 创建终端会话（已有则复用）
     try:
         session = await mgr.create_session(
-            instance_name=host.name,
-            host=host,
+            instance_name=instance_name,
+            host=root,
             decrypted_password=password,
         )
     except Exception as e:
         return f"错误：终端启动失败 - {e}"
 
-    # 等待终端就绪
-    if not is_reusing:
-        try:
-            await session.wait_for(
-                pattern=r"[\$#>%]\s*$|Opt>|password:|Password:",
-                timeout=15.0,
-            )
-        except TimeoutError:
-            pass  # 超时不阻断，继续使用
+    if not is_reusing and len(path) > 1:
+        orchestrator = ConnectionOrchestrator(session)  # type: ignore[arg-type]
+        result = await orchestrator.execute_path(
+            path=path,
+            tmux_session_name=session.tmux_session_name,
+            window_name="0",
+            skip_window_creation=True,
+        )
+        if not result.success:
+            await _publish_event("session_error", session.session_id, target.name, {
+                "error": result.message,
+                "instance_name": instance_name,
+            })
+            return f"错误：多跳连接失败 - {result.message}"
 
     mode_label = "复用已有终端" if is_reusing else "新建终端"
-    await _publish_event("session_created", session.session_id, host.name, {
-        "hostname": host.hostname,
-        "username": host.username,
+    await _publish_event("session_created", session.session_id, target.name, {
+        "hostname": root.hostname,
+        "username": root.username,
         "mode": "pty",
+        "instance_name": instance_name,
+        "path": [node.name for node in path],
     })
 
+    path_text = " -> ".join(node.name for node in path)
     return (
-        f"已连接到 {host.username}@{host.hostname}:{host.port}"
-        f"（{mode_label}）\n"
+        f"已连接到 {target.name}（{mode_label}）\n"
+        f"连接路径: {path_text}\n"
         f"Session ID: {session.session_id}\n"
         f"终端已在浏览器中实时显示。\n\n"
         f"提示：\n"
         f"- 用 run_command 执行命令并获取输出\n"
         f"- 用 read_terminal 查看当前终端屏幕"
     )
-
-
-async def _connect_jump_host(jump_host: Host, bastion: Host) -> str:
-    """二级主机的连接流程（Python PTY 直连）"""
-    mgr = _get_terminal_manager()
-    tmux_mgr = _get_tmux_manager()
-
-    instance_name = f"{bastion.name}--{jump_host.name}"
-    is_reusing = mgr.has_running_session(instance_name)
-
-    # 解密堡垒机密码
-    password = _decrypt_host_password(bastion)
-
-    # 创建终端会话（使用堡垒机连接信息）
-    try:
-        session = await mgr.create_session(
-            instance_name=instance_name,
-            host=bastion,
-            decrypted_password=password,
-        )
-    except Exception as e:
-        return f"错误：终端启动失败 - {e}"
-
-    # 复用模式：检测是否已登录，跳过编排
-    if is_reusing:
-        tmux_session = TmuxWindowManager.session_name_for(instance_name)
-        if await tmux_mgr.is_session_logged_in(tmux_session):
-            logger.info("connect_jump_host: 复用已有连接 (%s)", instance_name)
-            await _publish_event("session_created", session.session_id, jump_host.name, {
-                "hostname": jump_host.target_ip,
-                "bastion": bastion.name,
-                "mode": "pty",
-            })
-            return (
-                f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
-                f"通过堡垒机: {bastion.name}\n"
-                f"Session ID: {session.session_id}\n"
-                f"复用已有连接\n\n"
-                f"提示：\n"
-                f"- 用 run_command 执行命令并获取输出\n"
-                f"- 用 read_terminal 查看当前终端屏幕"
-            )
-
-    # 新建模式：执行跳板编排
-    orchestrator = JumpOrchestrator(session)  # type: ignore[arg-type]
-    result = await orchestrator.execute_jump(
-        jump_host=jump_host,
-        bastion=bastion,
-        tmux_session_name=session.tmux_session_name,
-        window_name="0",
-        skip_window_creation=True,
-    )
-
-    if not result.success:
-        await _publish_event("session_error", session.session_id, jump_host.name, {
-            "error": result.message,
-        })
-        return f"错误：跳板连接失败 - {result.message}"
-
-    await _publish_event("session_created", session.session_id, jump_host.name, {
-        "hostname": jump_host.target_ip,
-        "bastion": bastion.name,
-        "mode": "pty",
-        "instance_name": instance_name,
-        "steps_executed": result.steps_executed,
-    })
-
-    msg = (
-        f"已连接到 {jump_host.name}（{jump_host.target_ip}）\n"
-        f"通过堡垒机: {bastion.name}\n"
-        f"Session ID: {session.session_id}\n"
-        f"{result.message}\n\n"
-        f"提示：\n"
-        f"- 用 run_command 执行命令并获取输出\n"
-        f"- 用 read_terminal 查看当前终端屏幕"
-    )
-
-    if result.skipped_reason:
-        msg += f"\n\n注意：{result.skipped_reason}"
-
-    return msg
 
 
 @mcp.tool()
@@ -509,7 +396,7 @@ async def read_terminal(session_id: str, lines: int = 50) -> str:
 
 
 @mcp.tool()
-async def get_session_status(session_id: Optional[str] = None) -> str:
+async def get_session_status(session_id: str | None = None) -> str:
     """查询 SSH 会话状态
 
     Args:
@@ -538,7 +425,7 @@ async def get_session_status(session_id: Optional[str] = None) -> str:
     if not sessions:
         return "当前没有活跃的会话。"
 
-    result = []
+    result: list[JsonDict] = []
     for s in sessions:
         result.append({
             "session_id": s.session_id,
