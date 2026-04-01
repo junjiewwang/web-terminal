@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.host import (
     AuthType,
+    CredentialSpecSchema,
     EntrySpecSchema,
     EntryType,
     Host,
@@ -44,6 +45,7 @@ _UPDATABLE_FIELDS: tuple[str, ...] = (
     "private_key_path",
     "description",
     "ready_pattern",
+    "credential_ref",
     "host_type",
     "parent_id",
 )
@@ -146,6 +148,7 @@ class HostManager:
             host_type=data.host_type,
             parent_id=data.parent_id,
             ready_pattern=data.ready_pattern,
+            credential_ref=data.credential_ref,
         )
 
         if data.auth_type == AuthType.PASSWORD and data.password:
@@ -217,6 +220,12 @@ class HostManager:
             return result
 
         config: JsonDict = loaded if isinstance(loaded, dict) else {}
+        try:
+            credentials = self._parse_yaml_credentials(config.get("credentials"))
+        except ValueError as e:
+            result.errors.append(str(e))
+            return result
+
         raw_hosts: object = config.get("hosts")
         hosts_config: list[object] = raw_hosts if isinstance(raw_hosts, list) else []
         flattened: list[_FlattenedNode] = []
@@ -224,7 +233,7 @@ class HostManager:
         for idx, item in enumerate(hosts_config):
             try:
                 node = HostTreeYAMLSchema.model_validate(item)
-                flattened.extend(self._flatten_yaml_node(node))
+                flattened.extend(self._flatten_yaml_node(node, credentials=credentials))
             except (ValidationError, ValueError) as e:
                 result.errors.append(f"第 {idx + 1} 条主机配置校验失败: {e}")
 
@@ -304,6 +313,35 @@ class HostManager:
         return {str(key): item for key, item in value.items()}
 
     @staticmethod
+    def _parse_yaml_credentials(raw_credentials: object) -> dict[str, str]:
+        if raw_credentials is None:
+            return {}
+        if not isinstance(raw_credentials, dict):
+            raise ValueError("顶层 credentials 必须是对象映射")
+
+        credentials: dict[str, str] = {}
+        for raw_name, raw_value in raw_credentials.items():
+            name = str(raw_name).strip()
+            if not name:
+                raise ValueError("credentials 中存在空名称引用")
+
+            if isinstance(raw_value, str):
+                password = raw_value.strip()
+            elif isinstance(raw_value, dict):
+                try:
+                    spec = CredentialSpecSchema.model_validate(raw_value)
+                except ValidationError as e:
+                    raise ValueError(f"共享凭据 '{name}' 配置非法: {e}") from e
+                password = spec.password.strip()
+            else:
+                raise ValueError(f"共享凭据 '{name}' 必须是字符串或 {{password: ...}} 对象")
+
+            if not password:
+                raise ValueError(f"共享凭据 '{name}' 的密码不能为空")
+            credentials[name] = password
+        return credentials
+
+    @staticmethod
     def _runtime_children(host: Host) -> list[Host]:
         existing = host.__dict__.get("children")
         if isinstance(existing, list):
@@ -343,7 +381,9 @@ class HostManager:
         node: HostTreeYAMLSchema,
         parent_name: str | None = None,
         root_conn: _RootConnection | None = None,
+        credentials: dict[str, str] | None = None,
     ) -> list[_FlattenedNode]:
+        credentials = credentials or {}
         if parent_name is None:
             if not node.hostname or not node.username:
                 raise ValueError(f"根节点 '{node.name}' 必须配置 hostname 和 username")
@@ -356,6 +396,7 @@ class HostManager:
                 auth_type=node.auth_type,
                 private_key_path=node.private_key_path,
             )
+            password, entry_password = cls._resolve_node_credentials(node, credentials, is_root=True)
             current = HostCreate(
                 name=node.name,
                 hostname=node.hostname,
@@ -363,8 +404,9 @@ class HostManager:
                 username=node.username,
                 auth_type=node.auth_type,
                 private_key_path=node.private_key_path,
-                password=node.password,
-                entry_password=node.entry_password,
+                password=password,
+                entry_password=entry_password,
+                credential_ref=node.credential_ref,
                 description=node.description,
                 tags=node.tags,
                 ready_pattern=node.ready_pattern,
@@ -376,6 +418,7 @@ class HostManager:
                 raise ValueError(f"节点 '{node.name}' 缺少根连接上下文")
             if not node.entry or node.entry.type == EntryType.NONE or not node.entry.value:
                 raise ValueError(f"嵌套节点 '{node.name}' 必须配置有效的 entry")
+            _, entry_password = cls._resolve_node_credentials(node, credentials, is_root=False)
             current = HostCreate(
                 name=node.name,
                 hostname=root_conn.hostname,
@@ -384,7 +427,8 @@ class HostManager:
                 auth_type=root_conn.auth_type,
                 private_key_path=root_conn.private_key_path,
                 password=None,
-                entry_password=node.entry_password,
+                entry_password=entry_password,
+                credential_ref=node.credential_ref,
                 description=node.description,
                 tags=node.tags,
                 ready_pattern=node.ready_pattern,
@@ -394,8 +438,33 @@ class HostManager:
 
         flattened = [_FlattenedNode(data=current, parent_name=parent_name)]
         for child in node.children:
-            flattened.extend(cls._flatten_yaml_node(child, parent_name=node.name, root_conn=root_conn))
+            flattened.extend(
+                cls._flatten_yaml_node(child, parent_name=node.name, root_conn=root_conn, credentials=credentials)
+            )
         return flattened
+
+    @staticmethod
+    def _resolve_node_credentials(
+        node: HostTreeYAMLSchema,
+        credentials: dict[str, str],
+        *,
+        is_root: bool,
+    ) -> tuple[str | None, str | None]:
+        shared_password: str | None = None
+        if node.credential_ref:
+            shared_password = credentials.get(node.credential_ref)
+            if shared_password is None:
+                raise ValueError(f"节点 '{node.name}' 引用了不存在的 credential_ref: {node.credential_ref}")
+
+        password = node.password
+        entry_password = node.entry_password
+
+        if is_root and node.auth_type == AuthType.PASSWORD and password is None:
+            password = shared_password
+        if not is_root and entry_password is None:
+            entry_password = shared_password
+
+        return password, entry_password
 
     @staticmethod
     def _entry_dict(data: HostCreate) -> JsonDict:
@@ -424,6 +493,8 @@ class HostManager:
             return True
         if db_host.ready_pattern != yaml_data.ready_pattern:
             return True
+        if db_host.credential_ref != yaml_data.credential_ref:
+            return True
 
         db_tags = sorted(t.strip() for t in db_host.tags.split(",") if t.strip()) if db_host.tags else []
         yaml_tags = sorted(yaml_data.tags) if yaml_data.tags else []
@@ -451,6 +522,7 @@ class HostManager:
             private_key_path=yaml_data.private_key_path,
             password=yaml_data.password,
             entry_password=yaml_data.entry_password,
+            credential_ref=yaml_data.credential_ref,
             description=yaml_data.description,
             tags=yaml_data.tags,
             ready_pattern=yaml_data.ready_pattern,

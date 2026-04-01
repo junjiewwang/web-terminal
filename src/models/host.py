@@ -47,6 +47,7 @@ class Host(Base):
     private_key_path: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="根 SSH 私钥路径")
     password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True, comment="根 SSH 加密密码")
     entry_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True, comment="当前节点入口动作使用的加密密码")
+    credential_ref: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="共享凭据引用名")
     description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="主机描述")
     tags: Mapped[str | None] = mapped_column(Text, nullable=True, comment="标签，逗号分隔")
 
@@ -99,6 +100,10 @@ class LoginStepSchema(BaseModel):
     timeout: float = Field(default=15.0, ge=1.0, le=120.0, description="本步骤超时秒数")
 
 
+class CredentialSpecSchema(BaseModel):
+    password: str = Field(..., min_length=1, description="共享凭据中的密码")
+
+
 class EntrySpecSchema(BaseModel):
     type: EntryType = Field(default=EntryType.NONE, description="入口动作类型")
     value: str | None = Field(default=None, description="入口动作内容（如 IP、ssh 命令）")
@@ -121,6 +126,7 @@ class HostCreate(HostBase):
     name: str = Field(..., min_length=1, max_length=128, description="主机别名（唯一）")
     password: str | None = Field(default=None, description="根 SSH 密码（仅 auth_type=password 时使用）")
     entry_password: str | None = Field(default=None, description="入口动作使用的密码（供 {{password}} 变量替换）")
+    credential_ref: str | None = Field(default=None, max_length=128, description="共享凭据引用名")
     host_type: HostType = Field(default=HostType.ROOT, description="节点类型")
     parent_id: int | None = Field(default=None, description="父节点 ID")
     entry: EntrySpecSchema | None = Field(default=None, description="从父节点进入当前节点的动作定义")
@@ -135,6 +141,7 @@ class HostUpdate(BaseModel):
     private_key_path: str | None = Field(default=None, max_length=512)
     password: str | None = Field(default=None, description="新 SSH 密码，传入时会重新加密")
     entry_password: str | None = Field(default=None, description="新的入口密码，传入时会重新加密")
+    credential_ref: str | None = Field(default=None, max_length=128, description="新的共享凭据引用名")
     description: str | None = None
     tags: list[str] | None = None
     ready_pattern: str | None = None
@@ -154,6 +161,7 @@ class HostResponse(BaseModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     ready_pattern: str | None = None
+    credential_ref: str | None = None
     host_type: HostType = Field(default=HostType.ROOT)
     parent_id: int | None = None
     entry: EntrySpecSchema = Field(default_factory=EntrySpecSchema)
@@ -190,6 +198,7 @@ class HostResponse(BaseModel):
             description=host.description,
             tags=tags,
             ready_pattern=host.ready_pattern,
+            credential_ref=host.credential_ref,
             host_type=host.host_type,
             parent_id=host.parent_id,
             entry=entry,
@@ -208,6 +217,7 @@ class HostTreeYAMLSchema(BaseModel):
     private_key_path: str | None = Field(default=None, max_length=512, description="根 SSH 私钥路径")
     password: str | None = Field(default=None, description="根 SSH 密码（仅根节点使用）")
     entry_password: str | None = Field(default=None, description="入口动作使用的密码")
+    credential_ref: str | None = Field(default=None, max_length=128, description="共享凭据引用名")
     description: str | None = Field(default=None, description="节点描述")
     tags: list[str] = Field(default_factory=list, description="标签")
     ready_pattern: str | None = Field(default=None, description="当前节点就绪模式")

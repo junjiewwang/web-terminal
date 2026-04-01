@@ -20,7 +20,7 @@ def _make_host(
     username: str = "root",
     ready_pattern: str | None = None,
     parent_id: int | None = None,
-    entry: dict | None = None,
+    entry: dict[str, object] | None = None,
     entry_password_encrypted: str | None = None,
 ) -> Host:
     host = Host()
@@ -61,7 +61,7 @@ def _make_nested(
     entry_type: EntryType,
     entry_value: str,
     success_pattern: str | None = r"Last login|[\$#>]\s*$",
-    steps: list[dict] | None = None,
+    steps: list[dict[str, object]] | None = None,
     ready_pattern: str | None = r"[\$#>]\s*$",
     entry_password_encrypted: str | None = None,
 ) -> Host:
@@ -275,3 +275,33 @@ class TestExecutePath:
 
         assert result.success is False
         assert "超时" in result.message
+
+    @pytest.mark.asyncio
+    async def test_password_placeholder_without_secret_fails_fast(self):
+        pty = _mock_pty_session()
+        pty.wait_for = AsyncMock(side_effect=[
+            "[Host]>",
+            "password:",
+        ])
+
+        root = _make_root()
+        child = _make_nested(
+            "missing-secret-hop",
+            parent_id=root.id,
+            entry_type=EntryType.SSH_COMMAND,
+            entry_value="ssh root@10.23.3.5 -p 36000",
+            steps=[{"wait": "password:", "send": "{{password}}", "timeout": 5}],
+        )
+        orchestrator = ConnectionOrchestrator(pty)
+
+        result = await orchestrator.execute_path(
+            path=[root, child],
+            tmux_session_name="wetty-root--missing-secret-hop",
+            window_name="0",
+            skip_window_creation=True,
+        )
+
+        assert result.success is False
+        assert "entry_password 或 credential_ref" in result.message
+        pty.send_input.assert_any_call("ssh root@10.23.3.5 -p 36000\r")
+        assert pty.send_input.await_count == 1

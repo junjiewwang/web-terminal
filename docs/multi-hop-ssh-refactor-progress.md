@@ -77,6 +77,8 @@ sequenceDiagram
 - [x] 完成配置模型与数据模型重构，切换为 `root / nested + entry` 递归节点树。
 - [x] 完成连接编排器重构，支持按 `root -> ... -> target` 路径逐跳进入。
 - [x] 完成 MCP / REST / 前端主机树接口重构，统一按递归结构和 `instance_name` 工作。
+- [x] 完成前端工作台品牌收口：统一为 `WebTerminal`，并将“操作轨迹”改为默认隐藏抽屉。
+- [x] 完成左侧栏减法优化：弱化顶部信息层级，统一品牌区与主机树的视觉语言。
 - [x] 完成多跳核心测试与编译验证。
 
 ## 本轮实施内容
@@ -88,14 +90,22 @@ sequenceDiagram
 - 调整 `src/api/hosts.py` 与 `src/mcp_server/server.py`，使 REST / MCP 接口按新模型工作。
 - 补充 `one-key` 密码方案文档：明确根节点使用 `password`、多跳节点使用 `entry_password`，并用 YAML anchor 复用 `password_step` / `manual_mfa_step`。
 - 更新 `config/hosts-example.yaml`，将配置模板切换为当前递归树模型，不再保留旧版 `bastion + jump_hosts` 示例。
+- 继续补充 `config/hosts-example.yaml` 使用案例：增加根节点 `credential_ref` 复用、`menu_send`、`ssh_command`、MFA 人工接管、显式密码覆盖共享密码、sudo 二次输密以及 fail-fast 错误示例，方便用户按场景直接参考。
+- 收敛 `WebTerminal` 左侧栏：移除过重的“当前工作区”卡片，将品牌区改成更克制的状态头部，并将 `HostList` 搜索区、统计区、节点项统一为轻量玻璃面板风格，减少产品头部与工程树控件之间的违和感。
+- 优化主机节点选中态：由“整卡发光 + 选中后展开更多信息”改为“左侧强调条 + 轻背景 + 内部元素同步高亮”的导航式选中态，避免点击后列表项高度跳变和视觉用力过猛。
+- 修复 tmux copy-mode 中文复制乱码：前端对 `OSC 52` 的 Base64 内容改为按 UTF-8 字节流解码，后端 `copy-buffer` fallback 读取显式指定 `utf-8`，避免中文被按 Latin-1/环境默认编码错误还原。
 
 ## 验证结果
 - 使用项目内 `.venv` 虚拟环境验证，Python 版本为 `3.13.7`。
 - 执行 `./.venv/bin/python -m pytest tests/test_database_migrations.py tests/test_host_manager.py tests/test_jump_orchestrator.py -q`，结果为 `18 passed`。
 - 执行 `./.venv/bin/python -m compileall src tests`，语法编译通过。
+- 执行 `cd frontend && npm run build`，前端构建通过；当前仅有既有的 chunk size warning，不影响本次中文复制乱码修复。
 
 ## 未完成任务
 - 无阻塞性的未完成实施任务。
+- 如需进一步增强，可在 `credential_ref` 之上继续抽象声明式 `entry.auth`，把密码/MFA/确认交互从 `steps` 中进一步解耦。
+- 如需进一步增强，可补充左侧栏折叠、收藏节点、最近连接等工作台能力。
+- 如需进一步增强，可补充主机节点拖拽排序、批量分组等列表工作流能力。
 - 如需进一步增强，可补充“操作轨迹”按事件类型过滤、清空历史、面板宽度记忆等增强交互。
 - 如需进一步增强，可补充更多真实配置样例和端到端联调验证。
 

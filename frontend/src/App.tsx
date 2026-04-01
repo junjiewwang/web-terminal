@@ -251,27 +251,33 @@ export default function App() {
   }, [tabs, activeTabId]);
 
   const headerText = headerForTab(activeTab);
+  const sidebarSubline = activeTab
+    ? `当前目标 · ${headerText}`
+    : "Multi-hop SSH Workspace";
 
   return (
     <div className="relative flex h-screen overflow-hidden bg-[#050816] text-gray-100">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
 
-      <aside className="relative z-10 flex w-72 flex-col border-r border-white/8 bg-gray-950/80 backdrop-blur-xl">
-        <div className="border-b border-white/8 px-5 py-5">
-          <p className="text-[11px] font-medium uppercase tracking-[0.28em] text-emerald-300/70">
-            Workspace
-          </p>
-          <h1 className="mt-2 text-xl font-semibold tracking-tight text-white">WebTerminal</h1>
-          <p className="mt-2 text-xs text-gray-500">Multi-hop SSH Workspace</p>
-
-          <div className="mt-4 rounded-2xl border border-white/8 bg-white/4 px-3 py-2 shadow-[0_12px_40px_rgba(0,0,0,0.22)]">
-            <div className="flex items-center justify-between text-[11px] text-gray-500">
-              <span>当前工作区</span>
-              <span>{tabs.length > 0 ? `${tabs.length} 个会话` : "等待连接"}</span>
+      <aside className="relative z-10 flex w-[296px] flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl">
+        <div className="border-b border-white/8 px-5 pb-4 pt-5">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300 shadow-[0_12px_28px_rgba(16,185,129,0.12)]">
+              ⌘
             </div>
-            <p className="mt-1 truncate text-xs text-gray-300">
-              {activeTab ? headerText : "选择左侧节点开始连接"}
-            </p>
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold tracking-tight text-white">WebTerminal</h1>
+              <p className="mt-1 truncate text-xs text-gray-500">{sidebarSubline}</p>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
+            <span className="inline-flex items-center rounded-full border border-white/8 bg-white/5 px-2.5 py-1">
+              {tabs.length > 0 ? `${tabs.length} 个会话` : "等待连接"}
+            </span>
+            <span className="inline-flex items-center rounded-full border border-white/8 bg-white/5 px-2.5 py-1">
+              {connectedHostIds.size > 0 ? `${connectedHostIds.size} 已连接` : "尚无活跃连接"}
+            </span>
           </div>
         </div>
 

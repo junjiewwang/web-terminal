@@ -200,6 +200,10 @@ function _HostItem({
   const hasChildren = host.children && host.children.length > 0;
   const typeConfig = HOST_TYPE_CONFIG[host.host_type] ?? HOST_TYPE_CONFIG.root;
   const isConnected = connectedHostIds?.has(host.id) ?? false;
+  const rowIndent = depth * 14;
+  const secondaryText = host.description
+    ? `${entryDisplay(host)} · ${host.description}`
+    : entryDisplay(host);
 
   const filteredChildren = useMemo(() => {
     if (!searchQuery?.trim() || !hasChildren) return host.children ?? [];
@@ -216,69 +220,102 @@ function _HostItem({
 
   return (
     <>
-      <button
-        onClick={() => onSelect(host)}
-        className={`w-full text-left transition-colors group
-          ${isSelected
-            ? "bg-emerald-900/30 border-l-2 border-l-emerald-400"
-            : "hover:bg-gray-900/80 border-l-2 border-l-transparent"
-          }
-        `}
-        style={{ paddingLeft: `${depth * 14 + 12}px` }}
-      >
-        <div className="py-2 pr-3">
-          <div className="flex items-center gap-1.5">
+      <div className="py-1" style={{ paddingLeft: `${rowIndent}px` }}>
+        <button
+          onClick={() => onSelect(host)}
+          className={`group relative w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${
+            isSelected
+              ? "border-white/10 bg-white/[0.07]"
+              : "border-transparent bg-transparent hover:border-white/8 hover:bg-white/[0.04]"
+          }`}
+        >
+          <span
+            className={`absolute bottom-2 left-1.5 top-2 w-0.5 rounded-full transition-colors ${
+              isSelected ? "bg-emerald-400" : "bg-transparent group-hover:bg-white/10"
+            }`}
+          />
+
+          <div className="flex items-center gap-2 pl-1">
             {hasChildren ? (
               <span
                 onClick={toggleExpand}
-                className="text-gray-600 hover:text-gray-400 cursor-pointer select-none text-[10px] w-3 text-center transition-transform"
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] transition-transform ${
+                  isSelected
+                    ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
+                    : "border-white/8 bg-white/[0.03] text-gray-500"
+                }`}
                 style={{ transform: expanded ? "rotate(90deg)" : "rotate(0deg)" }}
               >
                 ▶
               </span>
             ) : (
-              <span className="w-3" />
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-transparent text-[10px] text-gray-700">
+                •
+              </span>
             )}
-            <span className="text-xs shrink-0" title={typeConfig.label}>{typeConfig.icon}</span>
-            <span className="font-medium text-sm truncate">
-              <_Highlight text={host.name} query={searchQuery} />
+
+            <span
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-sm transition-colors ${
+                isSelected
+                  ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-100"
+                  : "border-white/8 bg-white/[0.05] text-gray-300"
+              }`}
+              title={typeConfig.label}
+            >
+              {typeConfig.icon}
             </span>
-            {isConnected && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0 animate-pulse" title="已连接" />
-            )}
+
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className={`truncate text-sm font-medium ${isSelected ? "text-white" : "text-gray-100"}`}>
+                  <_Highlight text={host.name} query={searchQuery} />
+                </span>
+                {isConnected && (
+                  <span
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                      isSelected
+                        ? "bg-emerald-300 shadow-[0_0_10px_rgba(110,231,183,0.5)]"
+                        : "bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.5)]"
+                    }`}
+                    title="已连接"
+                  />
+                )}
+              </div>
+              <div className={`mt-1 truncate text-[11px] ${isSelected ? "text-gray-400" : "text-gray-500"}`}>
+                <_Highlight text={secondaryText} query={searchQuery} />
+              </div>
+            </div>
+
             {hasChildren && (
-              <span className="text-[10px] px-1.5 bg-gray-800 text-gray-500 rounded-full ml-auto shrink-0">
+              <span
+                className={`ml-2 inline-flex shrink-0 items-center rounded-full border px-1.5 py-0.5 text-[10px] transition-colors ${
+                  isSelected
+                    ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
+                    : "border-white/8 bg-white/[0.03] text-gray-500"
+                }`}
+              >
                 {filteredChildren.length}
               </span>
             )}
           </div>
 
-          <div className="text-[11px] text-gray-500 mt-0.5 ml-[18px] truncate">
-            <_Highlight text={entryDisplay(host)} query={searchQuery} />
-            {host.description && (
-              <span className="text-gray-600 ml-1.5">
-                · <_Highlight text={host.description} query={searchQuery} />
-              </span>
-            )}
-          </div>
-
-          {host.tags.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-1 ml-[18px]">
+          {Boolean(searchQuery) && host.tags.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5 pl-8">
               {host.tags.map((tag) => (
                 <span
                   key={tag}
-                  className="text-[10px] px-1 py-0 bg-gray-800/80 text-gray-500 rounded"
+                  className="rounded-full border border-white/8 bg-white/[0.03] px-2 py-0.5 text-[10px] text-gray-400"
                 >
                   <_Highlight text={tag} query={searchQuery} />
                 </span>
               ))}
             </div>
           )}
-        </div>
-      </button>
+        </button>
+      </div>
 
       {hasChildren && expanded && (
-        <div>
+        <div className="relative before:absolute before:bottom-2 before:left-[22px] before:top-0 before:w-px before:bg-white/6">
           {filteredChildren.map((child) => (
             <_HostItem
               key={child.id}

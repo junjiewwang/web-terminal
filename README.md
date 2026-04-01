@@ -93,6 +93,35 @@ hosts:
     tags: [prod, linux]
 ```
 
+如果多个节点共用同一份密码，推荐使用顶层 `credentials` + `credential_ref`，避免在多处重复写明文：
+
+```yaml
+credentials:
+  bastion-login: "replace-with-bastion-password"
+  root-hop:
+    password: "replace-with-hop-password"
+
+hosts:
+  - name: bastion
+    hostname: bastion.example.com
+    port: 36000
+    username: operator
+    auth_type: password
+    credential_ref: bastion-login
+    ready_pattern: "\\[Host\\]>|Opt>"
+    children:
+      - name: prod-root-hop
+        credential_ref: root-hop
+        entry:
+          type: ssh_command
+          value: "ssh root@10.10.3.5 -p 36000"
+          steps:
+            - wait: "[Pp]assword:"
+              send: "{{password}}"
+```
+
+> 当某个步骤里使用了 `{{password}}`，但当前节点既没有 `entry_password` 也没有可解析的 `credential_ref` 时，系统会直接失败并给出明确提示，**不会再静默发送空密码**。
+
 ### 2. 一键启动
 
 ```bash

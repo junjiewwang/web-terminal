@@ -136,6 +136,7 @@ export interface CreateHostRequest {
   private_key_path?: string;
   password?: string;
   entry_password?: string;
+  credential_ref?: string;
   description?: string;
   tags?: string[];
   ready_pattern?: string;

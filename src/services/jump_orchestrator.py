@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_READY_PATTERN = r"[\$#>%]\s*$|Opt>|password:|Password:"
 _DEFAULT_SUCCESS_PATTERN = r"Last login|[\$#>%]\s*$"
+_PASSWORD_PLACEHOLDER = "{{password}}"
 _VAR_PATTERN = re.compile(r"\{\{(\w+)\}\}")
 
 
@@ -42,7 +43,7 @@ def _resolve_variables(text: str, password: Optional[str] = None) -> tuple[str, 
     """解析步骤中的变量占位符。"""
     needs_manual = False
 
-    def _replacer(match: re.Match) -> str:
+    def _replacer(match: re.Match[str]) -> str:
         nonlocal needs_manual
         var_name = match.group(1)
         if var_name == "password":
@@ -157,6 +158,7 @@ class ConnectionOrchestrator:
 
         for idx, step in enumerate(entry.steps, start=1):
             step_result = await self._execute_step(
+                node_name=node.name,
                 step=step,
                 success_pattern=success_pattern,
                 password=entry_password,
@@ -191,6 +193,7 @@ class ConnectionOrchestrator:
 
     async def _execute_step(
         self,
+        node_name: str,
         step: LoginStepSchema,
         success_pattern: str,
         password: Optional[str],
@@ -219,6 +222,16 @@ class ConnectionOrchestrator:
                 success=True,
                 message="提前检测到登录成功",
                 skipped_reason=f"matched_success_pattern:{match.group('login_ok')[:50]}",
+            )
+
+        if _PASSWORD_PLACEHOLDER in step.send and not password:
+            logger.warning("节点 %s 的步骤 %d/%d 需要密码，但未配置 entry_password 或 credential_ref", node_name, step_num, total_steps)
+            return ConnectionResult(
+                success=False,
+                message=(
+                    f"节点 '{node_name}' 的步骤 {step_num} 需要密码，但未配置 entry_password 或 credential_ref，"
+                    "已阻止发送空密码"
+                ),
             )
 
         send_text, needs_manual = _resolve_variables(step.send, password)
@@ -259,7 +272,7 @@ class ConnectionOrchestrator:
         if not raw:
             return EntrySpecSchema()
         try:
-            return EntrySpecSchema(**raw)
+            return EntrySpecSchema.model_validate(raw)
         except Exception:
             logger.warning("节点 %s 的 entry_spec 解析失败，使用默认值", node.name)
             return EntrySpecSchema()

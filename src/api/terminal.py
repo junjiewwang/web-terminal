@@ -158,7 +158,7 @@ async def handle_copy_buffer(req: CopyBufferRequest) -> None:
 
     buffer_path = f"{_COPY_BUFFER_DIR}/tmux-copy-{session_name}"
     try:
-        with open(buffer_path, "r") as f:
+        with open(buffer_path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read().strip()
         logger.info("读取 buffer 文件成功: %s (%d chars)", buffer_path, len(text))
     except FileNotFoundError:

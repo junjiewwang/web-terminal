@@ -57,6 +57,12 @@ const RECONNECT_CONFIG = {
   maxAttempts: 10,
 };
 
+function _decodeBase64Utf8(base64Text: string): string {
+  const binary = atob(base64Text);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
 /**
  * 原生 WebSocket 终端连接 Hook
  */
@@ -124,12 +130,10 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
             while ((match = osc52Regex.exec(msg.data)) !== null) {
               const base64Text = match[1];
               try {
-                // 解码 base64
-                const text = atob(base64Text);
+                const text = _decodeBase64Utf8(base64Text);
                 console.log('[WebSocket] 解析到 OSC 52 剪贴板内容:', text);
-                // 触发剪贴板回调
                 onClipboardRef.current?.(text);
-                
+
                 // 从数据中移除 OSC 52 序列，避免 xterm.js 处理可能导致的问题
                 processedData = processedData.replace(match[0], '');
               } catch (e) {

@@ -12,121 +12,184 @@
 #   - entry.success_pattern 用于判断本跳是否已进入成功
 #   - entry.steps 用于处理登录后的附加交互（密码、MFA、菜单确认等）
 #
-# one-key 密码方案（当前推荐写法）：
-#   1. 在目标节点配置 entry_password
-#   2. 在 entry.steps 中引用 {{password}}
-#   3. 建议配合 YAML anchor 复用常见密码步骤，做到“写一次，到处引用”
+# 推荐写法：
+#   1. 优先在顶层 credentials 定义共享凭据
+#   2. 在节点里通过 credential_ref 引用共享密码
+#   3. 在 entry.steps 中继续复用 {{password}} / {{manual}}
+#   4. 如需覆盖共享密码，可继续显式配置 password / entry_password（优先级更高）
 #
 # 运行时行为：
-#   - entry_password / password 会在入库时自动加密
+#   - password / entry_password / credential_ref 解析出的密码会在入库时自动加密
 #   - {{password}} 在连接编排时会自动替换为当前节点的 entry_password
 #   - {{manual}} 表示遇到该步骤时暂停，转为人工输入
+#   - 若步骤中写了 {{password}} 但当前节点没有可解析的密码，系统会 fail-fast，阻止发送空密码
 #
 # 同步机制：
 #   1. 启动时自动同步到数据库
 #   2. 运行中修改 hosts.yaml 会自动热加载（watchfiles 监听 + 2s 防抖）
 #   3. 也可通过 POST /api/hosts/sync 手动触发同步
+#
+# 案例目录：
+#   1. 根节点：密钥认证直连
+#   2. 根节点：显式密码直连
+#   3. 根节点：通过 credential_ref 复用密码
+#   4. 堡垒机 menu_send 菜单跳转
+#   5. ssh_command + credential_ref 自动输密码
+#   6. ssh_command + MFA 人工接管
+#   7. credential_ref + entry_password 显式覆盖
+#   8. 登录后执行 sudo 并再次输密码
+#   9. fail-fast 错误示例（注释演示）
 
 one_key_templates:
   password_step: &password_step
-    wait: "[Pp]assword:"
-    send: "{{password}}"
+    wait: '[Pp]assword:'
+    send: '{{password}}'
 
   sudo_password_step: &sudo_password_step
     wait: '\[sudo\] password for .*:|[Pp]assword:'
-    send: "{{password}}"
+    send: '{{password}}'
 
   manual_mfa_step: &manual_mfa_step
-    wait: "Verification code|MFA token|动态口令"
-    send: "{{manual}}"
+    wait: 'Verification code|MFA token|动态口令'
+    send: '{{manual}}'
+
+credentials:
+  direct-root-login: 'replace-with-direct-root-password'
+  bastion-login: 'replace-with-bastion-password'
+  prod-root-login:
+    password: 'replace-with-hop-password'
+  override-login: 'replace-with-shared-password'
+  sudo-login: 'replace-with-sudo-password'
 
 hosts:
-  # ── 根节点：密钥认证示例（推荐） ──────────────────────
-  - name: dev-server
+  # 案例 1：根节点 - 密钥认证直连（推荐）
+  - name: direct-key-host
     hostname: 192.168.1.100
     port: 22
     username: deploy
     auth_type: key
     private_key_path: ~/.ssh/id_rsa
-    description: 开发环境服务器
+    description: 开发环境服务器，使用私钥直连
     tags:
       - dev
       - linux
-    ready_pattern: "[\\$#>%]\\s*$"
+    ready_pattern: '[\$#>%]\s*$'
 
-  # ── 根节点：密码认证示例 ──────────────────────────────
-  - name: prod-server
+  # 案例 2：根节点 - 显式密码直连
+  - name: direct-password-host
     hostname: 10.0.0.50
     port: 22
     username: admin
     auth_type: password
-    password: "replace-with-root-password"
-    description: 生产环境服务器
+    password: 'replace-with-root-password'
+    description: 生产环境服务器，直接在节点上写 root SSH 密码
     tags:
       - prod
       - linux
-    ready_pattern: "[\\$#>]\\s*$"
+    ready_pattern: '[\$#>]\s*$'
 
-  # ── 多跳示例：堡垒机 -> 子机 -> 再 ssh 到 root（one-key 密码） ─────
+  # 案例 3：根节点 - 通过 credential_ref 复用密码
+  - name: direct-password-host-by-ref
+    hostname: 10.0.0.51
+    port: 22
+    username: admin
+    auth_type: password
+    credential_ref: direct-root-login
+    description: 生产环境服务器，通过 credential_ref 复用根 SSH 密码
+    tags:
+      - prod
+      - linux
+      - credential-ref
+    ready_pattern: '[\$#>]\s*$'
+
+  # 案例 4-8：多跳登录示例（堡垒机 -> 子机 / ssh hop / sudo）
   - name: bastion
     hostname: bastion.example.com
     port: 36000
     username: operator
     auth_type: password
-    password: "replace-with-bastion-password"
-    description: 堡垒机
+    credential_ref: bastion-login
+    description: 堡垒机入口，后续子节点均从这里进入
     tags:
       - bastion
       - prod
-    ready_pattern: "\\[Host\\]>|Opt>"
+    ready_pattern: '\[Host\]>|Opt>'
     children:
-      - name: prod-app
-        description: 通过堡垒机菜单进入生产应用机
-        ready_pattern: "Last login|\\]#|\\]\\$|[\\$#>]\\s*$"
+      # 案例 4：menu_send 菜单跳转
+      - name: menu-target-host
+        description: 通过堡垒机菜单输入 IP，直接进入目标机器
+        ready_pattern: 'Last login|\]#|\]\$|[\$#>]\s*$'
         entry:
           type: menu_send
-          value: "10.10.16.3"
-          success_pattern: "Last login|\\]#|\\]\\$|[\\$#>]\\s*$"
+          value: '10.10.16.3'
+          success_pattern: 'Last login|\]#|\]\$|[\$#>]\s*$'
 
-      - name: prod-root-hop
-        description: 在堡垒机里直接 ssh 到 root 机器（需要密码）
-        ready_pattern: "Last login|[\\$#>]\\s*$"
-        entry_password: "replace-with-hop-password"
+      # 案例 5：ssh_command + credential_ref 自动输密码
+      - name: ssh-hop-by-ref
+        description: 从堡垒机中再 ssh 到 root 主机，密码来自 credential_ref
+        credential_ref: prod-root-login
+        ready_pattern: 'Last login|[\$#>]\s*$'
         entry:
           type: ssh_command
-          value: "ssh root@10.10.3.5 -p 36000"
-          success_pattern: "Last login|[\\$#>]\\s*$"
+          value: 'ssh root@10.10.3.5 -p 36000'
+          success_pattern: 'Last login|[\$#>]\s*$'
           steps:
             - *password_step
 
-      - name: prod-root-hop-with-mfa
-        description: 需要密码 + MFA 的多跳登录示例
-        ready_pattern: "Last login|[\\$#>]\\s*$"
-        entry_password: "replace-with-hop-password"
+      # 案例 6：ssh_command + MFA 人工接管
+      - name: ssh-hop-with-mfa
+        description: 自动输入密码后，遇到 MFA 令牌改为人工接管
+        credential_ref: prod-root-login
+        ready_pattern: 'Last login|[\$#>]\s*$'
         entry:
           type: ssh_command
-          value: "ssh root@10.10.3.6 -p 36000"
-          success_pattern: "Last login|[\\$#>]\\s*$"
+          value: 'ssh root@10.10.3.6 -p 36000'
+          success_pattern: 'Last login|[\$#>]\s*$'
           steps:
             - *password_step
             - *manual_mfa_step
 
-      - name: sudo-after-login
-        description: 登录后还需要执行 sudo 并再次输入密码
-        ready_pattern: "root@host:~#|[\\$#>]\\s*$"
-        entry_password: "replace-with-sudo-password"
+      # 案例 7：credential_ref + entry_password 显式覆盖
+      - name: ssh-hop-with-override
+        description: 默认引用共享密码，但当前节点用 entry_password 显式覆盖
+        credential_ref: override-login
+        entry_password: 'replace-with-override-password'
+        ready_pattern: 'Last login|[\$#>]\s*$'
         entry:
           type: ssh_command
-          value: "ssh ops@10.10.3.8 -p 22"
-          success_pattern: "ops@.*[\\$#>]\\s*$"
+          value: 'ssh root@10.10.3.7 -p 36000'
+          success_pattern: 'Last login|[\$#>]\s*$'
           steps:
             - *password_step
-            - wait: "ops@.*[\\$#>]\\s*$"
-              send: "sudo -i"
+
+      # 案例 8：登录后执行 sudo 并再次输密码
+      - name: sudo-after-login
+        description: 先登录普通账号，再执行 sudo -i 并输入 sudo 密码
+        credential_ref: sudo-login
+        ready_pattern: 'root@host:~#|[\$#>]\s*$'
+        entry:
+          type: ssh_command
+          value: 'ssh ops@10.10.3.8 -p 22'
+          success_pattern: 'ops@.*[\$#>]\s*$'
+          steps:
+            - *password_step
+            - wait: 'ops@.*[\$#>]\s*$'
+              send: 'sudo -i'
             - *sudo_password_step
 
-# 说明：
-#   - 如果某个 nested 节点只需要“命令 + 自动输密码”，最小配置就是：
-#       entry_password + entry.value + steps: [*password_step]
+# 案例 9：fail-fast 错误示例（仅注释演示，不要直接启用）
+# - name: broken-hop-missing-password
+#   description: 这里写了 {{password}}，但没有 entry_password / credential_ref，会直接失败
+#   entry:
+#     type: ssh_command
+#     value: 'ssh root@10.10.3.9 -p 36000'
+#     steps:
+#       - wait: '[Pp]assword:'
+#         send: '{{password}}'
+#
+# 补充说明：
+#   - nested 节点如果只需要“命令 + 自动输密码”，推荐最小配置：
+#       credential_ref + entry.value + steps: [*password_step]
+#   - 如果你在节点里同时配置了 credential_ref 和 entry_password / password，则显式字段优先
 #   - 如果密码提示语不同，可单独覆写 wait
-#   - 如果无需自动输入密码，则不配 entry_password / steps 即可
+#   - 如果无需自动输入密码，则不配 credential_ref / entry_password / steps 即可
