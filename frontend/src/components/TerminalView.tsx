@@ -196,12 +196,12 @@ export default function TerminalView({
   // ── 空状态 ──
   if (!host) {
     return (
-      <div className="flex items-center justify-center h-full text-gray-600">
+      <div className="flex h-full items-center justify-center text-gray-600">
         <div className="text-center">
-          <div className="text-4xl mb-4">🖥</div>
+          <div className="mb-4 text-4xl">🖥</div>
           <p className="text-lg">选择左侧主机开始使用</p>
-          <p className="text-sm mt-2 text-gray-700">
-            或通过 MCP Client 连接 Agent 工具
+          <p className="mt-2 text-sm text-gray-700">
+            也可由 Agent 自动创建会话后在此接管
           </p>
         </div>
       </div>
@@ -290,20 +290,20 @@ function _StatusBar({
 }) {
   const cfg = STATUS_MAP[status];
   return (
-    <div className="flex items-center justify-between px-3 py-1.5 bg-gray-900/80 text-xs text-gray-500">
-      <span>
-        Terminal: {host.name}
+    <div className="flex items-center justify-between border-b border-white/8 bg-gray-950/70 px-3 py-2 text-xs text-gray-500 backdrop-blur-sm">
+      <span className="truncate">
+        WebTerminal · {host.name}
         {status === "connected" && socketStatus === "connected" && (
           <span className="ml-2 text-gray-700">(ws ✓)</span>
         )}
       </span>
-      <div className="flex items-center gap-2">
+      <div className="ml-3 flex items-center gap-2 shrink-0">
         <span className={cfg.dot}>●</span>
         <span>{cfg.label}</span>
         {status === "error" && onReconnect && (
           <button
             onClick={onReconnect}
-            className="ml-2 px-1.5 py-0.5 text-[10px] text-gray-500 hover:text-emerald-400 hover:bg-gray-800 rounded transition-colors"
+            className="ml-2 rounded px-1.5 py-0.5 text-[10px] text-gray-500 transition-colors hover:bg-gray-800 hover:text-emerald-400"
             title="重新连接"
           >
             ↻
