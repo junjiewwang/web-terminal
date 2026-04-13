@@ -170,8 +170,13 @@ async def list_hosts(tag: str | None = None) -> str:
 
 
 @mcp.tool()
-async def connect_host(host_name: str) -> str:
-    """连接到指定的 SSH 主机节点。"""
+async def connect_host(host_name: str, backend: str | None = None) -> str:
+    """连接到指定的 SSH 主机节点。
+
+    Args:
+        host_name: 目标主机名
+        backend: 可选终端后端，支持 tmux / broker；不传则使用服务默认值
+    """
     async with async_session_factory() as session:
         mgr = HostManager(session)
         host = await mgr.get_host_by_name(host_name)
@@ -183,10 +188,10 @@ async def connect_host(host_name: str) -> str:
     if not host:
         return f"错误：未找到名为 '{host_name}' 的主机。请先用 list_hosts 查看可用主机。"
 
-    return await _connect_path(path)
+    return await _connect_path(path, backend=backend)
 
 
-async def _connect_path(path: list[Host]) -> str:
+async def _connect_path(path: list[Host], backend: str | None = None) -> str:
     mgr = _get_terminal_manager()
     target = path[-1]
     root = path[0]
@@ -200,6 +205,7 @@ async def _connect_path(path: list[Host]) -> str:
             instance_name=instance_name,
             host=root,
             decrypted_password=password,
+            backend=backend,
         )
     except Exception as e:
         return f"错误：终端启动失败 - {e}"
@@ -224,6 +230,7 @@ async def _connect_path(path: list[Host]) -> str:
         "hostname": root.hostname,
         "username": root.username,
         "mode": "pty",
+        "backend": session.backend.value,
         "instance_name": instance_name,
         "path": [node.name for node in path],
     })
@@ -232,6 +239,7 @@ async def _connect_path(path: list[Host]) -> str:
     return (
         f"已连接到 {target.name}（{mode_label}）\n"
         f"连接路径: {path_text}\n"
+        f"Backend: {session.backend.value}\n"
         f"Session ID: {session.session_id}\n"
         f"终端已在浏览器中实时显示。\n\n"
         f"提示：\n"
@@ -417,6 +425,7 @@ async def get_session_status(session_id: str | None = None) -> str:
             "instance_name": info.instance_name,
             "running": info.running,
             "mode": "pty",
+            "backend": info.backend,
             "created_at": info.created_at,
             "ws_clients": info.ws_clients,
         }, ensure_ascii=False, indent=2)
@@ -432,6 +441,7 @@ async def get_session_status(session_id: str | None = None) -> str:
             "instance_name": s.instance_name,
             "running": s.running,
             "mode": "pty",
+            "backend": s.backend,
         })
     return json.dumps(result, ensure_ascii=False, indent=2)
 

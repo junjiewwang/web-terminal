@@ -2,7 +2,7 @@ services:
   wetty-mcp:
     build: .
     ports:
-      - "8000:8000"
+      - "8000"
     volumes:
       - wetty-data:/app/data
       - ./config:/app/config:ro

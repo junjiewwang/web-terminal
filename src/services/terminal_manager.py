@@ -23,15 +23,20 @@ import struct
 import termios
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from fastapi import WebSocket
 
-from src.models.host import AuthType, Host
-from src.utils.ssh_command import build_ssh_command
+from src.models.host import Host
+from src.services.terminal_backend import (
+    TerminalBackend,
+    read_default_terminal_backend,
+    resolve_terminal_backend,
+)
+from src.utils.ssh_command import build_ssh_command_for_host
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,7 @@ class TerminalInfo:
     """终端会话信息（供 API 返回）"""
     session_id: str
     instance_name: str
+    backend: str
     pid: int | None
     running: bool
     created_at: str
@@ -65,9 +71,15 @@ class TerminalSession:
 
     MAX_BUFFER_LINES = 500
 
-    def __init__(self, session_id: str, instance_name: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        instance_name: str,
+        backend: TerminalBackend = TerminalBackend.TMUX,
+    ) -> None:
         self.session_id = session_id
         self.instance_name = instance_name
+        self.backend = backend
         self.tmux_session_name = f"{_TMUX_SESSION_PREFIX}-{instance_name}"
 
         # PTY 进程
@@ -99,6 +111,7 @@ class TerminalSession:
         return TerminalInfo(
             session_id=self.session_id,
             instance_name=self.instance_name,
+            backend=self.backend.value,
             pid=self._pid,
             running=self._running,
             created_at=self._created_at.isoformat(),
@@ -108,55 +121,41 @@ class TerminalSession:
     # ── 生命周期 ──────────────────────────────────
 
     async def start(self, host: Host, decrypted_password: str | None = None) -> None:
-        """启动 PTY 子进程（exec tmux-session.sh）
-
-        Args:
-            host: 主机 ORM 对象（用于 SSH 连接参数）
-            decrypted_password: 已解密的密码
-        """
+        """启动 PTY 子进程。"""
         if self._running:
             logger.warning("终端会话已在运行: %s", self.session_id[:8])
             return
 
-        # 启动前清理残留 tmux session
-        await self._cleanup_tmux_session()
+        argv = self._build_backend_argv(host, decrypted_password)
+        if self.backend == TerminalBackend.TMUX:
+            await self._cleanup_tmux_session()
 
-        # 构建 tmux-session.sh 参数
-        script_path = str(_TMUX_SCRIPT_PATH)
-        if not _TMUX_SCRIPT_PATH.exists():
-            raise FileNotFoundError(f"tmux 脚本不存在: {script_path}")
-
-        args = self._build_script_args(host, decrypted_password)
-
-        # fork PTY
         pid, fd = pty.fork()
 
         if pid == 0:
-            # 子进程：exec tmux-session.sh
             try:
-                os.execvp("bash", ["bash", script_path] + args)
+                os.execvp(argv[0], argv)
             except Exception:
                 os._exit(1)
         else:
-            # 父进程：保存 fd，注册 asyncio reader
             self._pid = pid
             self._fd = fd
             self._running = True
 
-            # 设置 fd 为非阻塞
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-            # 注册 asyncio fd reader
             loop = asyncio.get_event_loop()
             loop.add_reader(fd, self._on_pty_readable)
 
             logger.info(
-                "终端会话已启动: %s (pid=%d, tmux=%s)",
-                self.session_id[:8], pid, self.tmux_session_name,
+                "终端会话已启动: %s (pid=%d, backend=%s, tmux=%s)",
+                self.session_id[:8],
+                pid,
+                self.backend.value,
+                self.tmux_session_name if self.backend == TerminalBackend.TMUX else "-",
             )
 
-            # 启动子进程监控任务
             asyncio.create_task(self._monitor_child())
 
     async def stop(self) -> None:
@@ -174,8 +173,9 @@ class TerminalSession:
             except Exception:
                 pass
 
-        # 先清理 tmux session
-        await self._cleanup_tmux_session()
+        # tmux backend 需要额外清理残留 session
+        if self.backend == TerminalBackend.TMUX:
+            await self._cleanup_tmux_session()
 
         # 再终止子进程
         if self._pid is not None:
@@ -315,7 +315,7 @@ class TerminalSession:
                 self.session_id[:8], len(self._ws_clients),
             )
 
-    async def send_to_clients(self, msg: dict) -> None:
+    async def send_to_clients(self, msg: dict[str, object]) -> None:
         """向所有 WebSocket 客户端发送自定义 JSON 消息
 
         用于 tmux copy-mode → 浏览器剪贴板联动等场景。
@@ -426,17 +426,25 @@ class TerminalSession:
 
     # ── 内部方法 ──────────────────────────────────
 
-    def _build_script_args(self, host: Host, password: str | None) -> list[str]:
-        """构建 tmux-session.sh 参数列表"""
-        args = [
-            self.tmux_session_name,
-            host.hostname,
-            str(host.port),
-            host.username,
-            password or "",
-            host.private_key_path or "",
-        ]
-        return args
+    def _build_backend_argv(self, host: Host, password: str | None) -> list[str]:
+        """根据 backend 构建子进程启动命令。"""
+        if self.backend == TerminalBackend.TMUX:
+            script_path = str(_TMUX_SCRIPT_PATH)
+            if not _TMUX_SCRIPT_PATH.exists():
+                raise FileNotFoundError(f"tmux 脚本不存在: {script_path}")
+            return [
+                "bash",
+                script_path,
+                self.tmux_session_name,
+                host.hostname,
+                str(host.port),
+                host.username,
+                password or "",
+                host.private_key_path or "",
+            ]
+
+        ssh_command = build_ssh_command_for_host(host, decrypted_password=password)
+        return ["bash", "-lc", ssh_command]
 
     async def _monitor_child(self) -> None:
         """监控子进程退出"""
@@ -493,41 +501,59 @@ class TerminalManager:
     管理所有终端会话的生命周期，替代 WeTTYManager。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, default_backend: TerminalBackend | None = None) -> None:
         self._sessions: dict[str, TerminalSession] = {}
         self._lock = asyncio.Lock()
+        self._default_backend = default_backend or read_default_terminal_backend()
+
+    @property
+    def default_backend(self) -> TerminalBackend:
+        return self._default_backend
 
     async def create_session(
         self,
         instance_name: str,
         host: Host,
         decrypted_password: str | None = None,
+        backend: str | TerminalBackend | None = None,
     ) -> TerminalSession:
-        """创建并启动终端会话
+        """创建并启动终端会话。"""
+        selected_backend = resolve_terminal_backend(backend, fallback=self._default_backend)
+        previous_session: TerminalSession | None = None
 
-        Args:
-            instance_name: 实例名（如 "tce-server" 或 "tce-server--m12"）
-            host: 主机 ORM 对象
-            decrypted_password: 已解密的密码
-
-        Returns:
-            已启动的 TerminalSession
-        """
         async with self._lock:
-            # 复用已有会话
-            if instance_name in self._sessions:
-                existing = self._sessions[instance_name]
-                if existing.running:
-                    return existing
-                # 已停止，清理后重建
-                del self._sessions[instance_name]
+            existing = self._sessions.get(instance_name)
+            if existing and existing.running and existing.backend == selected_backend:
+                return existing
+            if existing is not None:
+                previous_session = self._sessions.pop(instance_name, None)
 
             session_id = str(uuid.uuid4())
-            session = TerminalSession(session_id=session_id, instance_name=instance_name)
+            session = TerminalSession(
+                session_id=session_id,
+                instance_name=instance_name,
+                backend=selected_backend,
+            )
             self._sessions[instance_name] = session
 
-        await session.start(host, decrypted_password)
-        logger.info("终端会话已创建: %s -> %s", session_id[:8], instance_name)
+        if previous_session is not None:
+            await previous_session.stop()
+
+        try:
+            await session.start(host, decrypted_password)
+        except Exception:
+            async with self._lock:
+                current = self._sessions.get(instance_name)
+                if current is session:
+                    self._sessions.pop(instance_name, None)
+            raise
+
+        logger.info(
+            "终端会话已创建: %s -> %s (backend=%s)",
+            session_id[:8],
+            instance_name,
+            selected_backend.value,
+        )
         return session
 
     def get_session(self, instance_name: str) -> TerminalSession | None:
@@ -577,21 +603,26 @@ class TerminalManager:
         return [s.info for s in self._sessions.values()]
 
     async def cleanup_zombie_sessions(self) -> int:
-        """清理 zombie tmux session"""
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "ls", "-F", "#{session_name}:#{session_attached}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        """清理 zombie tmux session。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "ls", "-F", "#{session_name}:#{session_attached}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.debug("tmux 未安装，跳过 zombie session 清理")
+            return 0
+
         stdout, _ = await proc.communicate()
 
         if proc.returncode != 0 or not stdout:
             return 0
 
-        active_sessions = set()
+        active_sessions: set[str] = set()
         async with self._lock:
             for session in self._sessions.values():
-                if session.running:
+                if session.running and session.backend == TerminalBackend.TMUX:
                     active_sessions.add(session.tmux_session_name)
 
         cleaned = 0

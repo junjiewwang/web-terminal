@@ -46,6 +46,9 @@ async function fetchWithRetry(
 /** 节点类型 */
 export type HostType = "root" | "nested";
 
+/** 终端会话后端 */
+export type TerminalBackend = "tmux" | "broker";
+
 /** 入口动作类型 */
 export type EntryType = "none" | "menu_send" | "ssh_command";
 

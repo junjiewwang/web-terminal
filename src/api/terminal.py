@@ -13,6 +13,7 @@ from src.models.database import async_session_factory
 from src.models.host import Host
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
+from src.services.terminal_backend import TerminalBackend
 from src.services.terminal_manager import TerminalManager, TerminalSession
 from src.services.tmux_manager import TmuxWindowManager
 
@@ -48,11 +49,13 @@ def _get_tmux_manager() -> TmuxWindowManager:
 
 class StartTerminalRequest(BaseModel):
     host_id: int
+    backend: TerminalBackend | None = None
 
 
 class TerminalResponse(BaseModel):
     session_id: str
     instance_name: str
+    backend: TerminalBackend
     running: bool
     ws_url: str
 
@@ -83,6 +86,7 @@ async def start_terminal(req: StartTerminalRequest) -> TerminalResponse:
         instance_name=instance_name,
         host=root,
         decrypted_password=password,
+        backend=req.backend,
     )
 
     if not is_reusing and len(path) > 1:
@@ -91,6 +95,7 @@ async def start_terminal(req: StartTerminalRequest) -> TerminalResponse:
     return TerminalResponse(
         session_id=session.session_id,
         instance_name=session.instance_name,
+        backend=session.backend,
         running=session.running,
         ws_url=f"/ws/terminal/{session.session_id}",
     )
@@ -127,6 +132,7 @@ async def list_terminals() -> list[TerminalResponse]:
         TerminalResponse(
             session_id=s.session_id,
             instance_name=s.instance_name,
+            backend=TerminalBackend(s.backend),
             running=s.running,
             ws_url=f"/ws/terminal/{s.session_id}",
         )
