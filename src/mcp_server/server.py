@@ -196,12 +196,11 @@ async def _connect_path(path: list[Host], backend: str | None = None) -> str:
     target = path[-1]
     root = path[0]
     instance_name = HostManager.build_instance_name(path)
-    is_reusing = mgr.has_running_session(instance_name)
 
     password = _decrypt_host_password(root)
 
     try:
-        session = await mgr.create_session(
+        session, is_new = await mgr.create_session(
             instance_name=instance_name,
             host=root,
             decrypted_password=password,
@@ -210,7 +209,7 @@ async def _connect_path(path: list[Host], backend: str | None = None) -> str:
     except Exception as e:
         return f"错误：终端启动失败 - {e}"
 
-    if not is_reusing and len(path) > 1:
+    if is_new and len(path) > 1:
         orchestrator = ConnectionOrchestrator(session)  # type: ignore[arg-type]
         result = await orchestrator.execute_path(
             path=path,
@@ -225,7 +224,7 @@ async def _connect_path(path: list[Host], backend: str | None = None) -> str:
             })
             return f"错误：多跳连接失败 - {result.message}"
 
-    mode_label = "复用已有终端" if is_reusing else "新建终端"
+    mode_label = "复用已有终端" if not is_new else "新建终端"
     await _publish_event("session_created", session.session_id, target.name, {
         "hostname": root.hostname,
         "username": root.username,

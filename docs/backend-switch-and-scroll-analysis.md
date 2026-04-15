@@ -185,7 +185,11 @@ pyte 可以通过 `Screen.mode` 中的 `?1049`（alternate screen buffer）来�
 | 3 | 问题 2：VirtualTerminal 增加 alternate screen 检测 | P0 | 1h | ✅ 已完成 |
 | 4 | 问题 2：输出路径改为 Normal=直通 / Alternate=差分 | P0 | 2h | ✅ 已完成 |
 | 5 | 问题 2-bugfix：切换时重置 xterm.js DEC Private Mode | P0 | 0.5h | ✅ 已完成 |
-| 6 | 回归测试 | P0 | 1h | ⏳ 待验证 |
+| 6 | 问题 3：修复 is_reusing 多跳编排 bug | P0 | 1h | ✅ 已完成 |
+| 7 | 问题 4：全局 backend 切换（Per-Tab → Global） | P0 | 2h | ✅ 已完成 |
+| 9 | 问题 5a：Broker 模式 vim 退出后鼠标滚轮失效 — alt→normal 切换帧 mode reset 注入 | P0 | 1h | ✅ 已完成（被 5b 替代） |
+| 10 | 问题 5b：vim 退出画面残留 — alt→normal 切换帧改为直通原始数据 | P0 | 0.5h | ✅ 已完成 |
+| 11 | 回归测试 | P0 | 1h | ⏳ 待验证 |
 
 ## 变更清单
 
@@ -212,6 +216,61 @@ pyte 可以通过 `Screen.mode` 中的 `?1049`（alternate screen buffer）来�
 | `frontend/src/hooks/useTerminal.ts` | 新增 `reset()` 方法：写入 DEC Private Mode 重置序列（关闭 `?1000`/`?1002`/`?1003`/`?1006` 鼠标追踪、`?2004` Bracketed Paste、`?1` DECCKM、`?1049` Alternate Screen）+ 清空屏幕和 scrollback |
 | `frontend/src/components/TerminalView.tsx` | Backend 切换时从 `terminal.clear()` 改为 `terminal.reset()`，确保重置 TMUX 遗留的鼠标追踪状态 |
 | `src/services/terminal_manager.py` | 移除 `_on_pty_readable()` 中的临时诊断日志 |
+
+### 问题 3：修复 is_reusing 多跳编排 bug
+
+**根因**：`is_reusing` 标志在 `create_session()` 之前通过 `has_running_session()` 检查，但 `create_session()` 在 backend 不同时会销毁旧会话并创建新会话。导致 `is_reusing=True` 但实际是新会话 → 多跳编排被跳过。
+
+**修复方案**：`create_session()` 返回 `tuple[TerminalSession, bool]`，其中 `bool` 为 `is_new`（`True` = 新建，`False` = 复用），调用方直接使用 `is_new` 判断是否执行编排。
+
+| 文件 | 改动 |
+|------|------|
+| `src/services/terminal_manager.py` | `create_session()` 返回类型从 `TerminalSession` 改为 `tuple[TerminalSession, bool]`，复用时 `return existing, False`，新建时 `return session, True` |
+| `src/api/terminal.py` | `start_terminal()` 适配 `(session, is_new)` 元组，用 `is_new` 替代 `is_reusing` 判断编排触发 |
+| `src/mcp_server/server.py` | `_connect_path()` 适配 `(session, is_new)` 元组，同步修复编排判断逻辑 |
+
+### 问题 4：全局 Backend 切换（Per-Tab → Global）
+
+**需求**：Backend 模式应为全局设置，切换后所有终端会话统一使用新模式。
+
+**设计**：
+1. 后端 `TerminalManager` 新增 `switch_backend()` 方法：更新 `_default_backend`、stop 所有现有会话、返回停止的实例名列表
+2. 新增 REST API：`GET /api/terminal/backend`（查询当前模式）、`PUT /api/terminal/backend`（全局切换）
+3. 前端 App.tsx 维护 `globalBackend` state，Header 区域渲染全局切换按钮
+4. 切换时：`PUT backend` → 后端停止所有会话 → 前端 `Promise.allSettled` 逐个 Tab 重连 → 更新 Tab 状态
+5. TerminalView `_StatusBar` 保留只读 backend badge，移除 per-tab 切换按钮
+
+| 文件 | 改动 |
+|------|------|
+| `src/services/terminal_manager.py` | 新增 `default_backend` setter、`switch_backend()` 方法 |
+| `src/api/terminal.py` | 新增 `BackendResponse`、`SwitchBackendRequest`、`SwitchBackendResponse` 模型；新增 `GET/PUT /api/terminal/backend` 端点 |
+| `frontend/src/services/api.ts` | 新增 `fetchBackend()`、`switchBackend()`、`SwitchBackendResult` 接口 |
+| `frontend/src/App.tsx` | 新增 `globalBackend`/`backendSwitching` state、`handleGlobalBackendSwitch` 回调、Header 全局切换按钮；移除 per-tab `onBackendSwitch` prop 传递 |
+| `frontend/src/components/TerminalView.tsx` | 移除 `onBackendSwitch` prop、移除 `_StatusBar` per-tab 切换按钮，保留只读 backend badge |
+
+### 问题 5a：Broker 模式 vim 退出后鼠标滚轮失效（已被 5b 替代）
+
+**根因**：`_on_pty_readable()` 在 Alternate Screen 模式下使用 `feed_and_render()` 差分渲染。当 vim/less 退出时，原始数据中的 `\x1b[?1000l`（禁用鼠标追踪）和 `\x1b[?1049l`（退出 Alternate Screen）序列被 pyte 内部消化，差分渲染只输出字符矩阵变更，不会透传这些 DEC Private Mode reset 序列。xterm.js 未收到 `\x1b[?1000l` → 鼠标追踪状态残留 → 滚轮事件被编码为鼠标序列 → 后端 `write()` 检测到 pyte `mouse_tracking_enabled=False` 后过滤丢弃 → 滚轮完全失效。
+
+**初版修复**：在 `_on_pty_readable()` 中捕获 `feed_and_render` 前后的 mode 状态（`was_alt`/`now_alt`、`was_mouse`/`now_mouse`），当检测到 alt→normal 切换时，显式注入 DEC Private Mode reset 序列（`_build_mode_reset_seq()`）+ `full_screen_dump()` 替代差分渲染输出。
+
+**问题**：`full_screen_dump()` 内部先执行 `\x1b[2J`（清屏），会抹掉 xterm.js 通过 `\x1b[?1049l` 应该恢复出来的 normal screen 画面。导致 vim 退出后屏幕残留 vim 内容（实际是 pyte normal screen buffer 的字符矩阵覆写），不符合终端标准交互。
+
+### 问题 5b：vim 退出画面残留 — alt→normal 切换帧改为直通原始数据
+
+**根因**：5a 的修复用 `_build_mode_reset_seq() + full_screen_dump()` 手动重建退出画面，但 `full_screen_dump()` 的 `\x1b[2J` 清屏破坏了 xterm.js 通过 `\x1b[?1049l` 恢复的正确 normal screen 画面和 scrollback buffer。
+
+**修复方案**：alt→normal 切换帧改为**直通原始 `text`** 给 xterm.js。原始数据中包含完整的终端控制序列：
+- `\x1b[?1049l` → xterm.js 自行切回 normal screen 并恢复之前的画面
+- `\x1b[?1000l` → xterm.js 自行关闭鼠标追踪
+- shell prompt 等后续输出 → 正确显示
+
+同时删除不再需要的 `_build_mode_reset_seq()` 辅助函数（无调用方）。
+
+| 文件 | 改动 |
+|------|------|
+| `src/services/terminal_manager.py` | `_on_pty_readable()` alt→normal 分支：移除 `_build_mode_reset_seq() + full_screen_dump()`，改为直通原始 `text`（`self._broadcast_output(text)`）；`feed_and_render` 仅用于让 pyte 状态同步 |
+| `src/services/terminal_manager.py` | 删除无调用方的 `_build_mode_reset_seq()` 模块级函数；移除 `was_mouse`/`now_mouse` 变量（不再需要跟踪鼠标状态变化） |
 
 ## 调试排查记录
 
@@ -244,4 +303,6 @@ pyte 可以通过 `Screen.mode` 中的 `?1049`（alternate screen buffer）来�
 
 ## 遗留问题
 
-- 暂无
+- 回归测试待验证：全局切换后所有 Tab 自动重连、多跳编排正常触发、xterm.js 滚动正常
+- 问题 5 验证场景：Broker 模式下 vim → `:q` 退出 → 鼠标滚轮应恢复正常滚动；less/top 等全屏程序退出后同理
+- 边缘场景：Normal→Alternate 切换帧（进入 vim）目前走 `else` 分支直通，`\x1b[?1049h` 原始序列直接广播给 xterm.js，应可正常切换

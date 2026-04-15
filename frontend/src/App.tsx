@@ -15,6 +15,8 @@ import {
   stopTerminal,
   fetchTerminals,
   startTerminal,
+  fetchBackend,
+  switchBackend,
 } from "./services/api";
 
 const EVENT_LABELS: Record<string, string> = {
@@ -69,6 +71,10 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [isAgentPanelOpen, setIsAgentPanelOpen] = useState(false);
   const [unreadEventCount, setUnreadEventCount] = useState(0);
+  /** 全局 terminal backend（页面加载时从后端获取） */
+  const [globalBackend, setGlobalBackend] = useState<TerminalBackend | null>(null);
+  /** backend 切换进行中标志（防止重复点击） */
+  const [backendSwitching, setBackendSwitching] = useState(false);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hostsRef = useRef<Host[]>([]);
@@ -99,6 +105,13 @@ export default function App() {
   useEffect(() => {
     loadHosts();
   }, [loadHosts]);
+
+  // 初始化全局 backend
+  useEffect(() => {
+    fetchBackend()
+      .then(setGlobalBackend)
+      .catch((err) => console.error("获取全局 backend 失败:", err));
+  }, []);
 
   useEffect(() => {
     isAgentPanelOpenRef.current = isAgentPanelOpen;
@@ -224,33 +237,52 @@ export default function App() {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, instanceName } : t)));
   }, []);
 
-  /** backend 切换：直接用新 backend 重新启动（后端 create_session 自动处理旧会话清理）
+  /** 全局 backend 切换：通知后端停止所有会话，然后逐个 Tab 重新建立连接。
    *
-   * 优化：跳过前端 stopTerminal 调用，因为后端 create_session 检测到 backend 不同时
-   * 会自动 pop + stop 旧 session，避免多余的一次 RTT。
+   * 后端 PUT /api/terminal/backend 会：
+   * 1. 更新 default_backend
+   * 2. stop 所有现有会话
+   * 前端收到响应后，逐个 Tab 调用 startTerminal 用新 backend 重建。
    */
-  const handleBackendSwitch = useCallback(async (tabId: string, newBackend: TerminalBackend) => {
-    const tab = tabsRef.current.find((t) => t.id === tabId);
-    if (!tab) return;
+  const handleGlobalBackendSwitch = useCallback(async () => {
+    if (backendSwitching || !globalBackend) return;
+    const newBackend: TerminalBackend = globalBackend === "tmux" ? "broker" : "tmux";
 
+    setBackendSwitching(true);
     try {
-      const instance = await startTerminal(tab.host.id, newBackend);
+      // 1. 通知后端切换（后端会 stop 所有会话）
+      await switchBackend(newBackend);
+      setGlobalBackend(newBackend);
+
+      // 2. 逐个 Tab 重新建立连接
+      const currentTabs = tabsRef.current;
+      const reconnectResults = await Promise.allSettled(
+        currentTabs.map((tab) => startTerminal(tab.host.id)),
+      );
+
+      // 3. 更新每个 Tab 的 wsUrl/backend/instanceName
       setTabs((prev) =>
-        prev.map((t) =>
-          t.id === tabId
-            ? {
-                ...t,
-                instanceName: instance.instance_name,
-                wsUrl: instance.ws_url,
-                backend: instance.backend,
-              }
-            : t,
-        ),
+        prev.map((tab, idx) => {
+          const result = reconnectResults[idx];
+          if (result.status === "fulfilled") {
+            const inst = result.value;
+            return {
+              ...tab,
+              instanceName: inst.instance_name,
+              wsUrl: inst.ws_url,
+              backend: inst.backend,
+            };
+          }
+          // 重连失败的 Tab 清空 wsUrl，TerminalView 会显示 error 状态
+          return { ...tab, wsUrl: undefined, backend: newBackend };
+        }),
       );
     } catch (err) {
-      console.error("Backend 切换失败:", err);
+      console.error("全局 backend 切换失败:", err);
+    } finally {
+      setBackendSwitching(false);
     }
-  }, []);
+  }, [globalBackend, backendSwitching]);
 
   const handleTabSelect = useCallback((tabId: string) => {
     setActiveTabId(tabId);
@@ -341,18 +373,42 @@ export default function App() {
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setIsAgentPanelOpen((prev) => !prev)}
-              className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/6 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-white"
-            >
-              <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
-              {unreadEventCount > 0 && (
-                <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
-                  {unreadEventCount}
-                </span>
+            <div className="ml-3 flex items-center gap-2 shrink-0">
+              {/* 全局 Backend 切换按钮 */}
+              {globalBackend && (
+                <button
+                  type="button"
+                  onClick={handleGlobalBackendSwitch}
+                  disabled={backendSwitching}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium transition-colors ${
+                    globalBackend === "tmux"
+                      ? "border-blue-500/30 bg-blue-500/10 text-blue-400 hover:border-blue-400/50 hover:bg-blue-500/20"
+                      : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:border-emerald-400/50 hover:bg-emerald-500/20"
+                  } ${backendSwitching ? "opacity-50 cursor-wait" : ""}`}
+                  title={`当前模式: ${globalBackend.toUpperCase()}，点击切换到 ${globalBackend === "tmux" ? "BROKER" : "TMUX"} 模式`}
+                >
+                  {backendSwitching ? (
+                    <span className="inline-block h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />
+                  ) : (
+                    <span className="text-[10px]">⇄</span>
+                  )}
+                  <span>{globalBackend.toUpperCase()}</span>
+                </button>
               )}
-            </button>
+
+              <button
+                type="button"
+                onClick={() => setIsAgentPanelOpen((prev) => !prev)}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/6 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-white"
+              >
+                <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
+                {unreadEventCount > 0 && (
+                  <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
+                    {unreadEventCount}
+                  </span>
+                )}
+              </button>
+            </div>
           </div>
         </header>
 
@@ -385,7 +441,6 @@ export default function App() {
                   initialWsUrl={tab.wsUrl}
                   backend={tab.backend}
                   onInstanceNameUpdate={(instanceName) => handleInstanceNameUpdate(tab.id, instanceName)}
-                  onBackendSwitch={(newBackend) => handleBackendSwitch(tab.id, newBackend)}
                 />
               </div>
             ))

@@ -64,9 +64,10 @@ class TerminalResponse(BaseModel):
 async def start_terminal(req: StartTerminalRequest) -> TerminalResponse:
     """启动终端会话。
 
-    新逻辑：
-    - root 节点：直接建立 PTY/tmux + SSH 会话
+    逻辑：
+    - root 节点：直接建立 PTY + SSH 会话
     - nested 节点：先找到 root，会话建立在 root 上，再按路径执行多跳编排
+    - backend 为 None 时使用全局 default_backend
     """
     mgr = _get_terminal_manager()
 
@@ -80,16 +81,16 @@ async def start_terminal(req: StartTerminalRequest) -> TerminalResponse:
         root = path[0]
         instance_name = HostManager.build_instance_name(path)
 
-    is_reusing = mgr.has_running_session(instance_name)
     password = _decrypt_password(root)
-    session = await mgr.create_session(
+    session, is_new = await mgr.create_session(
         instance_name=instance_name,
         host=root,
         decrypted_password=password,
         backend=req.backend,
     )
 
-    if not is_reusing and len(path) > 1:
+    # 仅在新建会话时触发多跳编排（is_new=False 表示复用了已有会话）
+    if is_new and len(path) > 1:
         asyncio.create_task(_run_path_orchestration(session, path))
 
     return TerminalResponse(
@@ -114,6 +115,37 @@ async def _run_path_orchestration(session: TerminalSession, path: list[Host]) ->
         logger.info("多跳编排成功: %s", " -> ".join(node.name for node in path))
     else:
         logger.error("多跳编排失败: %s (%s)", " -> ".join(node.name for node in path), result.message)
+
+
+class BackendResponse(BaseModel):
+    backend: TerminalBackend
+
+
+class SwitchBackendRequest(BaseModel):
+    backend: TerminalBackend
+
+
+class SwitchBackendResponse(BaseModel):
+    backend: TerminalBackend
+    stopped_sessions: list[str]
+
+
+@router.get("/api/terminal/backend", response_model=BackendResponse)
+async def get_backend() -> BackendResponse:
+    """查询当前全局 terminal backend。"""
+    mgr = _get_terminal_manager()
+    return BackendResponse(backend=mgr.default_backend)
+
+
+@router.put("/api/terminal/backend", response_model=SwitchBackendResponse)
+async def switch_backend(req: SwitchBackendRequest) -> SwitchBackendResponse:
+    """全局切换 terminal backend。
+
+    停止所有现有会话，前端收到响应后逐个 Tab 重新 startTerminal。
+    """
+    mgr = _get_terminal_manager()
+    stopped = await mgr.switch_backend(req.backend)
+    return SwitchBackendResponse(backend=req.backend, stopped_sessions=stopped)
 
 
 @router.post("/api/terminal/stop/{instance_name}", status_code=204)

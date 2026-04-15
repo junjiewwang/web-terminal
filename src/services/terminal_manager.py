@@ -595,11 +595,24 @@ class TerminalSession:
             # Alternate Screen（vim/top/less 等全屏程序）：
             #   pyte 差分渲染 → 全屏程序无需 scrollback
             #   多客户端共享时差分渲染能保证渲染一致性
-            is_alt = self._vterm.alternate_screen_active
-            if is_alt:
-                # Alternate Screen → 差分渲染
+            was_alt = self._vterm.alternate_screen_active
+            if was_alt:
+                # Alternate Screen → 先 feed 让 pyte 状态同步，再决定广播策略
                 rendered = self._vterm.feed_and_render(text)
-                if rendered:
+                now_alt = self._vterm.alternate_screen_active
+
+                if not now_alt:
+                    # ── Alternate → Normal 切换帧 ──
+                    # vim/less 退出时，原始 text 中包含完整的 mode reset 序列：
+                    #   \x1b[?1049l  — 退出 Alternate Screen，xterm.js 恢复 normal screen 内容
+                    #   \x1b[?1000l  — 关闭鼠标追踪
+                    #   + shell prompt 等后续输出
+                    #
+                    # 直通原始 text 给 xterm.js，让它自行处理所有 mode 切换和画面恢复。
+                    # 不能用 full_screen_dump()：它会 \x1b[2J 清屏，破坏 xterm.js 通过
+                    # \x1b[?1049l 恢复出来的正确 normal screen 画面和 scrollback。
+                    self._broadcast_output(text)
+                elif rendered:
                     self._broadcast_output(rendered)
             else:
                 # Normal Screen → 直通原始 ANSI + 旁路 feed pyte
@@ -946,21 +959,61 @@ class TerminalManager:
     def default_backend(self) -> TerminalBackend:
         return self._default_backend
 
+    @default_backend.setter
+    def default_backend(self, value: TerminalBackend) -> None:
+        self._default_backend = value
+
+    async def switch_backend(self, new_backend: TerminalBackend) -> list[str]:
+        """全局切换 backend：更新默认值 + 停止所有现有会话。
+
+        前端收到响应后会逐个 Tab 重新 startTerminal，
+        后端自动用新 default_backend 创建会话。
+
+        Returns:
+            被停止的 instance_name 列表（前端据此知道哪些 Tab 需要重连）。
+        """
+        old_backend = self._default_backend
+        self._default_backend = new_backend
+        logger.info("全局 backend 切换: %s -> %s", old_backend.value, new_backend.value)
+
+        # 停止所有现有会话
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            stopped_names = list(self._sessions.keys())
+            self._sessions.clear()
+
+        for s in sessions:
+            await s.stop()
+
+        if stopped_names:
+            logger.info(
+                "全局切换已停止 %d 个会话: %s",
+                len(stopped_names),
+                ", ".join(stopped_names),
+            )
+
+        return stopped_names
+
     async def create_session(
         self,
         instance_name: str,
         host: Host,
         decrypted_password: str | None = None,
         backend: str | TerminalBackend | None = None,
-    ) -> TerminalSession:
-        """创建并启动终端会话。"""
+    ) -> tuple[TerminalSession, bool]:
+        """创建并启动终端会话。
+
+        Returns:
+            (session, is_new) 元组。is_new=True 表示新创建了会话，
+            is_new=False 表示复用了已有会话（instance_name + backend 完全相同）。
+        """
         selected_backend = resolve_terminal_backend(backend, fallback=self._default_backend)
         previous_session: TerminalSession | None = None
 
         async with self._lock:
             existing = self._sessions.get(instance_name)
             if existing and existing.running and existing.backend == selected_backend:
-                return existing
+                return existing, False
             if existing is not None:
                 previous_session = self._sessions.pop(instance_name, None)
 
@@ -990,7 +1043,7 @@ class TerminalManager:
             instance_name,
             selected_backend.value,
         )
-        return session
+        return session, True
 
     def get_session(self, instance_name: str) -> TerminalSession | None:
         """根据实例名获取会话"""

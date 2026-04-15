@@ -315,6 +315,33 @@ export async function fetchTerminals(): Promise<TerminalInstance[]> {
   return res.json();
 }
 
+/** 查询当前全局 terminal backend */
+export async function fetchBackend(): Promise<TerminalBackend> {
+  const res = await fetchWithRetry(`${API_BASE}/terminal/backend`);
+  if (!res.ok) throw new Error(`获取 backend 失败: ${res.statusText}`);
+  const data = await res.json();
+  return data.backend;
+}
+
+/** 全局 backend 切换响应 */
+export interface SwitchBackendResult {
+  backend: TerminalBackend;
+  stopped_sessions: string[];
+}
+
+/** 全局切换 terminal backend（停止所有现有会话，前端需逐个重连） */
+export async function switchBackend(
+  backend: TerminalBackend,
+): Promise<SwitchBackendResult> {
+  const res = await fetch(`${API_BASE}/terminal/backend`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ backend }),
+  });
+  if (!res.ok) throw new Error(`切换 backend 失败: ${res.statusText}`);
+  return res.json();
+}
+
 // ── tmux 窗口管理 ──────────────────────────
 
 /** tmux 客户端信息 */

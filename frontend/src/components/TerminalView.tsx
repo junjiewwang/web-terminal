@@ -40,8 +40,6 @@ interface TerminalViewProps {
   initialWsUrl?: string | null;
   /** 当前使用的 backend 类型 */
   backend?: TerminalBackend | null;
-  /** backend 切换回调（切换时会断开重连） */
-  onBackendSwitch?: (newBackend: TerminalBackend) => void;
 }
 
 export default function TerminalView({
@@ -50,7 +48,6 @@ export default function TerminalView({
   onInstanceNameUpdate,
   initialWsUrl,
   backend,
-  onBackendSwitch,
 }: TerminalViewProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -263,7 +260,6 @@ export default function TerminalView({
         socketStatus={ws.status}
         backend={currentBackend}
         onReconnect={() => connectToHost(host)}
-        onBackendSwitch={onBackendSwitch}
       />
 
       {/* 终端容器 */}
@@ -338,18 +334,15 @@ function _StatusBar({
   socketStatus,
   backend,
   onReconnect,
-  onBackendSwitch,
 }: {
   host: Host;
   status: ConnectionStatus;
   socketStatus: SocketStatus;
   backend?: TerminalBackend | null;
   onReconnect?: () => void;
-  onBackendSwitch?: (newBackend: TerminalBackend) => void;
 }) {
   const cfg = STATUS_MAP[status];
   const backendCfg = backend ? BACKEND_CONFIG[backend] : null;
-  const altBackend: TerminalBackend = backend === "tmux" ? "broker" : "tmux";
 
   return (
     <div className="flex items-center justify-between border-b border-white/8 bg-gray-950/70 px-3 py-2 text-xs text-gray-500 backdrop-blur-sm">
@@ -367,16 +360,6 @@ function _StatusBar({
         )}
       </span>
       <div className="ml-3 flex items-center gap-2 shrink-0">
-        {/* Backend 切换按钮 */}
-        {onBackendSwitch && status === "connected" && (
-          <button
-            onClick={() => onBackendSwitch(altBackend)}
-            className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:border-emerald-400/30 hover:bg-emerald-400/10 hover:text-emerald-400"
-            title={`切换到 ${altBackend.toUpperCase()} 模式（需重连）`}
-          >
-            → {altBackend.toUpperCase()}
-          </button>
-        )}
         <span className={cfg.dot}>●</span>
         <span>{cfg.label}</span>
         {status === "error" && onReconnect && (
