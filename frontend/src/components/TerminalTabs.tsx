@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import type { Host } from "../services/api";
+import type { Host, TerminalBackend } from "../services/api";
 
 // ── 终端 Tab 数据模型 ──────────────────────────────
 
@@ -11,6 +11,8 @@ export interface TerminalTab {
   instanceName?: string;
   /** Agent 已创建会话时的 WebSocket URL（跳过 startTerminal） */
   wsUrl?: string;
+  /** 当前会话使用的 backend 类型 */
+  backend?: TerminalBackend;
 }
 
 export function tabIdForHost(host: Host): string {
@@ -84,6 +86,16 @@ export default function TerminalTabs({
               )}
               {tab.label}
             </span>
+
+            {tab.backend && (
+              <span className={`shrink-0 rounded px-1 py-0 text-[9px] font-medium leading-tight ${
+                tab.backend === "tmux"
+                  ? "bg-blue-500/10 text-blue-400"
+                  : "bg-emerald-500/10 text-emerald-400"
+              }`}>
+                {tab.backend === "tmux" ? "T" : "B"}
+              </span>
+            )}
 
             <span
               onClick={(e) => handleClose(e, tab.id)}

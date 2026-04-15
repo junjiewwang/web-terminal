@@ -5,6 +5,9 @@ uvicorn[standard]>=0.34.0
 # SSH
 asyncssh>=2.17.0
 
+# Terminal Emulation (Broker 模式虚拟终端)
+pyte>=0.8.0
+
 # MCP Server
 mcp[cli]>=1.3.0
 

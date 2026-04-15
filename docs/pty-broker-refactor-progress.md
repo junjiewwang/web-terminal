@@ -207,7 +207,7 @@
 
 ---
 
-## Sprint 4：替换决策与灰度推广
+## Sprint 5（原 Sprint 4）：替换决策与灰度推广
 
 ### 目标
 不是盲目替换，而是基于证据决定 `broker` 的角色。
@@ -231,33 +231,37 @@
 
 如果按上述 roadmap 来看，当前项目处于：
 
-- **Sprint 1 已完成**
-- **准备进入 Sprint 2**
+- **Sprint 1 已完成** — 后端抽象层打底
+- **Sprint 2 已完成** — Broker 会话生命周期与稳定性
+- **Sprint 3 已完成** — 多客户端 min-size + VirtualTerminal + 端点改造
+- **准备进入 Sprint 4** — 用户体验增强
 
 也就是说：
 
-- 已经具备 backend 抽象、切换能力、请求透传链路和定向测试。
-- 但还没有真正进入 `broker` 能力建设的核心阶段。
-- 当前最重要的事情不是继续堆文档或 UI，而是开始验证 `broker` 是否能稳定承载真实会话。
+- Broker 模式已具备完整的核心能力：原生 PTY 直连 SSH、统一退出处理、scrollback 缓冲区、min-size resize 策略、VirtualTerminal 差分渲染、全屏快照恢复。
+- TMUX 模式行为完全不受影响，双栈并行可切换。
+- 下一步重点是验证真实场景下的稳定性与用户体验，并评估是否需要进入体验增强阶段。
 
 ---
 
-## 6. 本轮已完成内容（Sprint 1 收口）
+## 6. 已完成内容
 
-### 6.1 后端抽象层
+### Sprint 1：后端抽象层打底
+
+#### 6.1 后端抽象层
 - 新增 `src/services/terminal_backend.py`：
   - `TerminalBackend`
   - 默认后端读取
   - `WETTY_SESSION_BACKEND` 环境变量解析
 
-### 6.2 会话管理改造
+#### 6.2 会话管理改造
 - 完成 `src/services/terminal_manager.py` 改造：
   - `TerminalSession` 支持 `tmux` / `broker`
   - `TerminalInfo` 增加 `backend`
   - `TerminalManager.create_session()` 支持 backend 复用与切换
   - `cleanup_zombie_sessions()` 在无 `tmux` 环境下安全跳过
 
-### 6.3 API 与 MCP 链路贯通
+#### 6.3 API 与 MCP 链路贯通
 - `src/api/terminal.py`
   - `StartTerminalRequest` 支持可选 `backend`
   - `TerminalResponse` / 终端列表返回实际 backend
@@ -266,59 +270,112 @@
   - `_connect_path()` 将 backend 透传到 `TerminalManager`
   - 会话创建事件、连接结果、状态查询返回 backend
 
-### 6.4 前端调试开关
+#### 6.4 前端调试开关
 - `frontend/src/services/api.ts`
   - 新增 `TerminalBackend` 类型
   - `TerminalInstance.backend`
   - `startTerminal(hostId, backend?)`
   - 支持通过 URL 参数 `terminalBackend` 或 `localStorage` 的 `wetty-terminal-backend` 做调试切换
 
-### 6.5 测试
-- 新增 `tests/test_terminal_backend.py`，覆盖：
-  - 同 backend 复用会话
-  - 切换 backend 时停止旧会话并重建
-  - 无 `tmux` 环境下的 zombie 清理容错
-  - API backend 透传
-  - MCP backend 透传
-  - 会话状态返回 backend
+### Sprint 2：Broker 会话生命周期与稳定性
+
+#### 6.5 会话退出处理
+- 新增 `SessionExitReason` 枚举（NORMAL / SSH_FAILED / PTY_CLOSED / CHILD_CRASHED / STOPPED / UNKNOWN）
+- 新增 `_classify_exit()` 静态方法：分析 `os.waitpid()` raw_status
+- 新增 `_handle_child_exit()` 统一退出处理入口
+- 新增 `_async_exit_cleanup()` 异步资源清理 + `session_exit` WebSocket 通知
+- 新增 `on_exit` 回调机制（`OnExitCallback` 类型、`add_on_exit()` / `_fire_on_exit()`）
+- `TerminalInfo` 增加 `exit_reason` / `exit_code` 字段
+
+#### 6.6 Scrollback 缓冲区
+- `_scrollback: bytearray`（可配置容量，默认 256KB）
+- `_append_scrollback(data)` 超出容量时裁剪头部
+- `get_scrollback() -> bytes` 用于新客户端历史回放
+
+#### 6.7 可观测性增强
+- `start()` 增加结构化日志（host/port/user/backend）
+- `stop()` 记录 reason
+- 子进程退出日志包含 session_id / pid / reason / exit_code
+
+### Sprint 3：多客户端 + VirtualTerminal + 端点改造
+
+#### 6.8 ClientInfo + min-size resize
+- 新增 `ClientInfo` dataclass：`ws` / `client_id` / `cols` / `rows` / `connected_at`
+- `_ws_clients` 从 `list[WebSocket]` 升级为 `dict[str, ClientInfo]`
+- `add_ws_client()` 返回 `client_id`，新客户端自动发送历史/快照
+- `remove_ws_client()` 按 client_id 移除 + 自动重算 min-size
+- `remove_ws_client_by_ws()` 兼容旧调用方式
+- `resize(cols, rows, client_id=None)` 双路径：Broker → min-size 策略；TMUX → 直写 PTY
+- `_compute_min_size()` 取 min(cols) × min(rows)，下限 10×3
+- `_broadcast_resize_hint()` 通知所有客户端有效尺寸
+
+#### 6.9 VirtualTerminal (pyte) 集成
+- `src/services/virtual_terminal.py` 从 DEPRECATED 恢复为活跃模块
+- 懒加载 `_get_virtual_terminal_class()` 避免 pyte 未安装影响 TMUX 模式
+- Broker 模式 `__init__` 自动创建 VirtualTerminal
+- 输出路径分支：Broker+vterm → `feed_and_render()` → 差分 ANSI；TMUX → 直通
+- 新客户端连接分支：Broker+vterm → `full_screen_dump()` 快照；TMUX → scrollback 回放
+- 依赖新增：`pyte>=0.8.0`（requirements.txt + pyproject.toml）
+
+#### 6.10 terminal.py WebSocket 端点改造
+- `client_id = session.add_ws_client(websocket)` → 捕获并透传
+- `session.resize(cols, rows, client_id=client_id)` → 支持 min-size 策略
+- `session.remove_ws_client(client_id)` → finally 中按 client_id 清理
+
+#### 6.11 前端 resize_hint / session_exit 消息处理
+- `useWebSocket.ts` 新增 `resize_hint` 和 `session_exit` 消息类型
+- `resize_hint` → 触发 `onResizeHint` 回调
+- `session_exit` → 触发 `onDisconnect(reason)` 回调
+
+### 6.12 测试总览
+- `tests/test_terminal_backend.py`：27 个测试全部通过
+  - Sprint 1 基础测试（6 个）：复用/切换/zombie 清理/API 透传/MCP 透传/状态查询
+  - Sprint 2 生命周期测试（8 个）：exit 分类×4 / TerminalInfo 退出字段 / on_exit 回调 / scrollback×2
+  - Sprint 3 ClientInfo/min-size 测试（8 个）：创建/单客户端/多客户端/下限/空/add/remove/compat
+  - Sprint 3 VirtualTerminal 测试（5 个）：feed_and_render / full_screen_dump / resize / broker 自动创建 / tmux 无 vterm
 
 ---
 
 ## 7. 验证结果
 
-### 已通过验证
-- `python3 -m compileall src tests`
-- `cd frontend && npm run build`
-- `cd . && . .venv/bin/activate && python -m pytest -q tests/test_terminal_backend.py`
-  - 结果：`6 passed`
+### Sprint 1 验证
+- `python3 -m compileall src tests` ✅
+- `cd frontend && npm run build` ✅
+- `python -m pytest -q tests/test_terminal_backend.py` — 6 passed ✅
+
+### Sprint 2 + Sprint 3 验证
+- `python -m pytest -q tests/test_terminal_backend.py` — **27 passed in 0.99s** ✅
+- `cd frontend && npm run build` ✅
+- 依赖验证：`pip install "pyte>=0.8.0"` ✅
 
 ### 当前验证结论
-本轮改动已经证明：
 - backend 抽象链路已经贯通。
-- `tmux` / `broker` 至少在结构、透传、切换与定向回归层面可用。
-- 可以进入 `broker` MVP 的下一步能力建设阶段。
+- Broker 模式具备完整的生命周期管理：启动 / 退出分类 / 资源清理 / 回调通知。
+- 多客户端 min-size resize 策略已实现并通过测试。
+- VirtualTerminal (pyte) 差分渲染和全屏快照已集成并通过测试。
+- TMUX 模式行为完全不受影响（双路径分支设计）。
+- 前端已支持 `resize_hint` 和 `session_exit` 新消息类型。
 
 ---
 
 ## 8. 下一步推进建议（按优先级）
 
-### P0：进入 Broker MVP 核心能力建设
-- 稳定 `broker` 路径下的 PTY 生命周期。
-- 确认浏览器 / MCP 可以共享 broker 会话。
-- 验证单跳直连下的真实运行稳定性。
+### P0：真实场景端到端验证
+- 部署到测试环境，验证 Broker 模式的单跳 SSH 真实连接稳定性。
+- 验证多浏览器客户端共享 Broker 会话时的 min-size 策略和 VirtualTerminal 渲染效果。
+- 验证 vim / top / less 等全屏程序在 VirtualTerminal 模式下的兼容性。
 
-### P1：增强可观测性
-- 会话状态中增加更明确的 backend / 错误原因 / 退出原因。
-- 为 broker 相关异常提供更清晰的日志与诊断信息。
+### P1：用户体验增强（Sprint 4）
+- 断线重连恢复（利用 VirtualTerminal 全屏快照）。
+- 复制粘贴增强（中文、特殊终端序列、bracketed paste）。
+- 前端 `resize_hint` StatusBar 展示（当前已有回调，需要 UI 消费）。
 
-### P1：准备体验能力建设
-- 评估服务端历史缓冲方案。
-- 梳理复制粘贴增强点（中文、特殊终端序列、bracketed paste）。
-
-### P2：是否补前端显式切换 UI
-- 当前底层链路已经贯通。
+### P2：前端显式切换 UI
+- 当前已支持 URL / `localStorage` / REST / MCP 四种切换方式。
 - 如果要让普通用户或测试人员更方便地切换，可补一个可视化 backend 切换控件。
-- 但这不是当前最优先事项，优先级低于 broker 承载稳定性本身。
+
+### P2：会话录制与回放
+- VirtualTerminal 的 Screen 状态可序列化，为后续会话录制 / 回放 / 审计提供基础。
 
 ---
 
@@ -333,6 +390,11 @@
 ### 9.2 前端还没有显式 backend 切换控件
 - 当前已经支持 URL / `localStorage` / REST / MCP 四种切换方式。
 - 是否继续做 UI，要看下一阶段是否需要对更多测试角色开放。
+
+### 9.3 VirtualTerminal 高速输出场景
+- `pyte` 是纯 Python 实现，`cat` 大文件等高速输出场景可能有延迟。
+- 当前已实现 `FULL_DUMP_THRESHOLD` 保护（dirty 行数 > 80% 时回退全屏 dump）。
+- 后续可评估是否需要更激进的降级策略（如输出速率检测 + 临时直通）。
 
 ---
 

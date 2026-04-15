@@ -43,6 +43,22 @@ export interface TerminalHandle {
   containerRef: (node: HTMLDivElement | null) => void;
   /** 写入数据到终端（server → terminal） */
   write: (data: string) => void;
+  /** 清屏（清空 scrollback + 当前屏幕） */
+  clear: () => void;
+  /**
+   * 重置终端状态（backend 切换专用）。
+   *
+   * 清空屏幕内容 + scrollback，同时重置 xterm.js 的 DEC Private Mode 状态：
+   * - 关闭鼠标追踪（?1000l/?1002l/?1003l/?1006l）
+   * - 关闭 Bracketed Paste（?2004l）
+   * - 关闭 Application Cursor（?1l）
+   * - 关闭 Alternate Screen（?1049l）
+   *
+   * 原因：TMUX 模式会向 xterm.js 发送 ?1000h/?1002h 等鼠标追踪序列，
+   * 切换到 Broker 后 xterm.js 实例被复用，这些 mode 状态会残留，
+   * 导致鼠标滚轮被编码为鼠标序列而非本地 scrollback 滚动。
+   */
+  reset: () => void;
   /** 手动触发 fit（容器尺寸变化时调用） */
   fit: () => void;
   /** 聚焦终端 */
@@ -192,6 +208,34 @@ export function useTerminal(
     termRef.current?.write(data);
   }, []);
 
+  const clear = useCallback(() => {
+    termRef.current?.clear();
+  }, []);
+
+  /**
+   * 重置终端状态序列（ANSI）：
+   * - \x1b[?1000l  关闭基本鼠标追踪
+   * - \x1b[?1002l  关闭按钮事件追踪
+   * - \x1b[?1003l  关闭任意事件追踪
+   * - \x1b[?1006l  关闭 SGR 鼠标扩展
+   * - \x1b[?2004l  关闭 Bracketed Paste
+   * - \x1b[?1l     关闭 Application Cursor (DECCKM)
+   * - \x1b[?1049l  退出 Alternate Screen
+   * - \x1b>        Normal Keypad (DECKPNM)
+   */
+  const RESET_MODES_SEQ =
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" +
+    "\x1b[?2004l\x1b[?1l\x1b[?1049l\x1b>";
+
+  const reset = useCallback(() => {
+    const term = termRef.current;
+    if (!term) return;
+    // 先写入重置序列让 xterm.js 清除残留的 DEC Private Mode 状态
+    term.write(RESET_MODES_SEQ);
+    // 再清空屏幕内容和 scrollback buffer
+    term.clear();
+  }, []);
+
   const fit = useCallback(() => {
     try {
       fitAddonRef.current?.fit();
@@ -209,5 +253,5 @@ export function useTerminal(
     return { cols: term?.cols ?? 80, rows: term?.rows ?? 24 };
   }, []);
 
-  return { containerRef, write, fit, focus, getSize };
+  return { containerRef, write, clear, reset, fit, focus, getSize };
 }

@@ -15,7 +15,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Host, TerminalInstance } from "../services/api";
+import type { Host, TerminalInstance, TerminalBackend } from "../services/api";
 import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
 import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
@@ -38,6 +38,10 @@ interface TerminalViewProps {
    * 跳过 startTerminal API 调用，直接建立 WebSocket 连接。
    */
   initialWsUrl?: string | null;
+  /** 当前使用的 backend 类型 */
+  backend?: TerminalBackend | null;
+  /** backend 切换回调（切换时会断开重连） */
+  onBackendSwitch?: (newBackend: TerminalBackend) => void;
 }
 
 export default function TerminalView({
@@ -45,15 +49,26 @@ export default function TerminalView({
   isActive,
   onInstanceNameUpdate,
   initialWsUrl,
+  backend,
+  onBackendSwitch,
 }: TerminalViewProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [wsUrl, setWsUrl] = useState<string | null>(null);
   const prevHostIdRef = useRef<number | null>(null);
+  /** 当前会话实际使用的 backend（从后端响应中获取） */
+  const [currentBackend, setCurrentBackend] = useState<TerminalBackend | null>(backend ?? null);
+
+  // ── scrollback 历史回放标志 ──
+  // 当正在回放 scrollback 时，屏蔽 xterm.js 的 onData 输出到 WebSocket，
+  // 防止 xterm.js 对回放中的终端查询序列生成响应（如 DA response）发送到 PTY 导致乱码。
+  const historyReplayRef = useRef(false);
 
   // ── xterm.js 终端 Hook ──
   const terminal = useTerminal({
     onData: (data) => {
+      // 回放历史期间屏蔽所有 onData（xterm.js 对查询序列的自动响应也走这里）
+      if (historyReplayRef.current) return;
       ws.sendInput(data);
     },
     onResize: (size) => {
@@ -101,6 +116,16 @@ export default function TerminalView({
     onData: (data) => {
       terminal.write(data);
     },
+    onHistory: (data) => {
+      // Scrollback 历史回放：写入 xterm.js 但屏蔽 onData 回调，
+      // 防止 xterm.js 对回放中的终端查询序列生成 DA/CPR 响应发送到 PTY
+      historyReplayRef.current = true;
+      terminal.write(data);
+      // 使用 requestAnimationFrame 确保 xterm.js 完成处理后再恢复
+      requestAnimationFrame(() => {
+        historyReplayRef.current = false;
+      });
+    },
     onClipboard: showCopyToast,
     onConnect: () => {
       setStatus("connected");
@@ -140,18 +165,21 @@ export default function TerminalView({
   }, [isActive, status, terminal]);
 
   // ── 启动终端会话 ──
-  const connectToHost = useCallback(async (targetHost: Host) => {
+  const connectToHost = useCallback(async (targetHost: Host, requestBackend?: TerminalBackend) => {
     setStatus("starting");
     setError(null);
     setWsUrl(null);
 
     try {
-      const instance: TerminalInstance = await startTerminal(targetHost.id);
+      const instance: TerminalInstance = await startTerminal(targetHost.id, requestBackend);
 
       // 更新 Tab 的 instanceName（用于关闭时 stop 正确的实例）
       if (onInstanceNameUpdate) {
         onInstanceNameUpdate(instance.instance_name);
       }
+
+      // 记录后端实际使用的 backend
+      setCurrentBackend(instance.backend);
 
       setWsUrl(instance.ws_url);
       setStatus("connecting");
@@ -162,7 +190,8 @@ export default function TerminalView({
     }
   }, [onInstanceNameUpdate]);
 
-  // ── 当 host 变化时自动连接 ──
+  // ── 当 host 变化或 initialWsUrl 变化（backend 切换）时自动连接 ──
+  const prevInitialWsUrlRef = useRef<string | null | undefined>(initialWsUrl);
   useEffect(() => {
     if (!host) {
       if (wsUrl) {
@@ -172,10 +201,22 @@ export default function TerminalView({
       setStatus("idle");
       setError(null);
       prevHostIdRef.current = null;
+      prevInitialWsUrlRef.current = initialWsUrl;
       return;
     }
 
-    if (host.id === prevHostIdRef.current) return;
+    const hostChanged = host.id !== prevHostIdRef.current;
+    const wsUrlChanged = initialWsUrl !== prevInitialWsUrlRef.current;
+
+    // 既没有 host 变化也没有 wsUrl 变化（backend 切换），跳过
+    if (!hostChanged && !wsUrlChanged) return;
+
+    // backend 切换时重置 xterm.js 状态：清屏 + 关闭残留的 DEC Private Mode
+    // （TMUX 会启用 ?1000h/?1002h 鼠标追踪，切到 Broker 后若不重置，
+    //  鼠标滚轮会被编码为鼠标序列而非本地 scrollback 滚动）
+    if (wsUrlChanged && !hostChanged) {
+      terminal.reset();
+    }
 
     if (wsUrl) {
       ws.disconnect();
@@ -183,15 +224,21 @@ export default function TerminalView({
     }
 
     prevHostIdRef.current = host.id;
+    prevInitialWsUrlRef.current = initialWsUrl;
 
-    // 如果外部传入了 wsUrl（Agent 已创建会话），直接连接 WebSocket
+    // 更新 backend 状态
+    if (backend) {
+      setCurrentBackend(backend);
+    }
+
+    // 如果外部传入了 wsUrl（Agent 已创建会话 或 backend 切换后），直接连接 WebSocket
     if (initialWsUrl) {
       setWsUrl(initialWsUrl);
       setStatus("connecting");
     } else {
       connectToHost(host);
     }
-  }, [host, connectToHost, wsUrl, ws, initialWsUrl]);
+  }, [host, connectToHost, wsUrl, ws, initialWsUrl, backend]);
 
   // ── 空状态 ──
   if (!host) {
@@ -214,7 +261,9 @@ export default function TerminalView({
         host={host}
         status={status}
         socketStatus={ws.status}
+        backend={currentBackend}
         onReconnect={() => connectToHost(host)}
+        onBackendSwitch={onBackendSwitch}
       />
 
       {/* 终端容器 */}
@@ -277,27 +326,57 @@ const STATUS_MAP: Record<ConnectionStatus, { dot: string; label: string }> = {
   error: { dot: "text-red-500", label: "连接失败" },
 };
 
+/** Backend badge 配置 */
+const BACKEND_CONFIG: Record<TerminalBackend, { label: string; color: string }> = {
+  tmux: { label: "TMUX", color: "border-blue-500/30 bg-blue-500/10 text-blue-400" },
+  broker: { label: "BROKER", color: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" },
+};
+
 function _StatusBar({
   host,
   status,
   socketStatus,
+  backend,
   onReconnect,
+  onBackendSwitch,
 }: {
   host: Host;
   status: ConnectionStatus;
   socketStatus: SocketStatus;
+  backend?: TerminalBackend | null;
   onReconnect?: () => void;
+  onBackendSwitch?: (newBackend: TerminalBackend) => void;
 }) {
   const cfg = STATUS_MAP[status];
+  const backendCfg = backend ? BACKEND_CONFIG[backend] : null;
+  const altBackend: TerminalBackend = backend === "tmux" ? "broker" : "tmux";
+
   return (
     <div className="flex items-center justify-between border-b border-white/8 bg-gray-950/70 px-3 py-2 text-xs text-gray-500 backdrop-blur-sm">
-      <span className="truncate">
-        WebTerminal · {host.name}
-        {status === "connected" && socketStatus === "connected" && (
-          <span className="ml-2 text-gray-700">(ws ✓)</span>
+      <span className="flex items-center gap-2 truncate">
+        <span className="truncate">
+          WebTerminal · {host.name}
+          {status === "connected" && socketStatus === "connected" && (
+            <span className="ml-2 text-gray-700">(ws ✓)</span>
+          )}
+        </span>
+        {backendCfg && (
+          <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${backendCfg.color}`}>
+            {backendCfg.label}
+          </span>
         )}
       </span>
       <div className="ml-3 flex items-center gap-2 shrink-0">
+        {/* Backend 切换按钮 */}
+        {onBackendSwitch && status === "connected" && (
+          <button
+            onClick={() => onBackendSwitch(altBackend)}
+            className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:border-emerald-400/30 hover:bg-emerald-400/10 hover:text-emerald-400"
+            title={`切换到 ${altBackend.toUpperCase()} 模式（需重连）`}
+          >
+            → {altBackend.toUpperCase()}
+          </button>
+        )}
         <span className={cfg.dot}>●</span>
         <span>{cfg.label}</span>
         {status === "error" && onReconnect && (

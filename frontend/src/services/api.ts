@@ -126,6 +126,7 @@ export interface WeTTYInstance {
 export interface TerminalInstance {
   session_id: string;
   instance_name: string;
+  backend: TerminalBackend;
   running: boolean;
   ws_url: string;
 }
@@ -264,16 +265,24 @@ export async function listWeTTYInstances(): Promise<WeTTYInstance[]> {
 
 // ── 新架构：终端会话管理（Python PTY 直连）──
 
-export async function startTerminal(hostId: number): Promise<TerminalInstance> {
+export async function startTerminal(
+  hostId: number,
+  backend?: TerminalBackend,
+): Promise<TerminalInstance> {
   _globalSSE?.pause();
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
+    const body: Record<string, unknown> = { host_id: hostId };
+    if (backend) {
+      body.backend = backend;
+    }
+
     const res = await fetch(`${API_BASE}/terminal/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ host_id: hostId }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     clearTimeout(timeoutId);

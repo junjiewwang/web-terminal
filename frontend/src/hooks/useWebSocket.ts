@@ -10,6 +10,9 @@
  *  Server → Client:
  *    {"type": "output", "data": "..."}
  *    {"type": "closed", "reason": "..."}
+ *    {"type": "session_exit", "reason": "normal|ssh_failed|...", "exit_code": 0}
+ *    {"type": "resize_hint", "effective_cols": 80, "effective_rows": 24}
+ *    {"type": "clipboard", "text": "..."}
  *
  * 设计原则：
  *  - 接口与 useWettySocket 保持一致（SocketStatus / sendInput / sendResize / disconnect）
@@ -23,18 +26,28 @@ import type { TermSize } from "./useTerminal";
 /** 连接状态 */
 export type SocketStatus = "disconnected" | "connecting" | "connected" | "error";
 
+/** resize_hint 消息载荷 */
+export interface ResizeHint {
+  effective_cols: number;
+  effective_rows: number;
+}
+
 /** Hook 配置 */
 export interface UseWebSocketOptions {
   /** WebSocket URL（如 /ws/terminal/{session_id}），null 时不连接 */
   wsUrl: string | null;
   /** 收到终端输出数据的回调 */
   onData?: (data: string) => void;
+  /** 收到 scrollback 历史回放数据的回调（前端应临时屏蔽用户输入发送，防止 xterm.js 查询响应乱码） */
+  onHistory?: (data: string) => void;
   /** 连接成功回调 */
   onConnect?: () => void;
   /** 连接断开回调 */
   onDisconnect?: (reason?: string) => void;
   /** 收到 tmux clipboard 推送的回调 */
   onClipboard?: (text: string) => void;
+  /** 收到 resize_hint 消息的回调（Broker 模式 min-size 策略通知有效尺寸） */
+  onResizeHint?: (hint: ResizeHint) => void;
 }
 
 /** Hook 返回值（与 useWettySocket 兼容） */
@@ -67,7 +80,7 @@ function _decodeBase64Utf8(base64Text: string): string {
  * 原生 WebSocket 终端连接 Hook
  */
 export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
-  const { wsUrl, onData, onConnect, onDisconnect, onClipboard } = options;
+  const { wsUrl, onData, onHistory, onConnect, onDisconnect, onClipboard, onResizeHint } = options;
   const [status, setStatus] = useState<SocketStatus>("disconnected");
   const wsRef = useRef<WebSocket | null>(null);
   const attemptsRef = useRef(0);
@@ -76,13 +89,17 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
 
   // 用 ref 存储回调避免 effect 依赖变化导致重连
   const onDataRef = useRef(onData);
+  const onHistoryRef = useRef(onHistory);
   const onConnectRef = useRef(onConnect);
   const onDisconnectRef = useRef(onDisconnect);
   const onClipboardRef = useRef(onClipboard);
+  const onResizeHintRef = useRef(onResizeHint);
   onDataRef.current = onData;
+  onHistoryRef.current = onHistory;
   onConnectRef.current = onConnect;
   onDisconnectRef.current = onDisconnect;
   onClipboardRef.current = onClipboard;
+  onResizeHintRef.current = onResizeHint;
 
   // ── 连接生命周期 ──────────────────────────────
   useEffect(() => {
@@ -145,9 +162,25 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
             if (processedData) {
               onDataRef.current?.(processedData);
             }
+          } else if (msg.type === "history" && msg.data) {
+            // Scrollback 历史回放：使用专用回调，前端在回放期间屏蔽用户输入发送
+            // 防止 xterm.js 对回放中的终端查询序列生成响应并发送到 PTY 导致乱码
+            onHistoryRef.current?.(msg.data);
           } else if (msg.type === "closed") {
             setStatus("disconnected");
             onDisconnectRef.current?.(msg.reason || "closed");
+          } else if (msg.type === "session_exit") {
+            // Broker 模式会话退出通知
+            const reason = msg.reason || "session_exit";
+            console.log(`[WebSocket] 会话退出: reason=${reason}, exit_code=${msg.exit_code}`);
+            setStatus("disconnected");
+            onDisconnectRef.current?.(reason);
+          } else if (msg.type === "resize_hint") {
+            // Broker 模式 min-size 策略有效尺寸通知
+            onResizeHintRef.current?.({
+              effective_cols: msg.effective_cols,
+              effective_rows: msg.effective_rows,
+            });
           } else if (msg.type === "clipboard" && msg.text) {
             // 兼容后端 API 推送的 clipboard 消息
             onClipboardRef.current?.(msg.text);

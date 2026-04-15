@@ -7,13 +7,14 @@ import TerminalTabs, {
   createTabForHost,
   type TerminalTab,
 } from "./components/TerminalTabs";
-import type { Host, AgentEvent } from "./services/api";
+import type { Host, AgentEvent, TerminalBackend } from "./services/api";
 import {
   fetchHosts,
   fetchEventHistory,
   subscribeEvents,
   stopTerminal,
   fetchTerminals,
+  startTerminal,
 } from "./services/api";
 
 const EVENT_LABELS: Record<string, string> = {
@@ -148,6 +149,7 @@ export default function App() {
     const currentTabs = tabsRef.current;
     const sessionId = event.session_id;
     const instanceName = (event.data.instance_name as string) || event.host_name;
+    const eventBackend = (event.data.backend as TerminalBackend) || undefined;
     const matchedHost = findHostByName(allHosts, event.host_name)
       ?? findHostByName(allHosts, targetNameFromInstance(instanceName));
 
@@ -160,6 +162,7 @@ export default function App() {
       ...createTabForHost(matchedHost),
       instanceName,
       wsUrl: sessionId ? `/ws/terminal/${sessionId}` : undefined,
+      backend: eventBackend,
     };
 
     setTabs((prev) => [...prev, newTab]);
@@ -206,6 +209,7 @@ export default function App() {
             ...createTabForHost(matchedHost),
             instanceName: session.instance_name,
             wsUrl: session.ws_url,
+            backend: session.backend,
           });
         }
 
@@ -218,6 +222,34 @@ export default function App() {
 
   const handleInstanceNameUpdate = useCallback((tabId: string, instanceName: string) => {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, instanceName } : t)));
+  }, []);
+
+  /** backend 切换：直接用新 backend 重新启动（后端 create_session 自动处理旧会话清理）
+   *
+   * 优化：跳过前端 stopTerminal 调用，因为后端 create_session 检测到 backend 不同时
+   * 会自动 pop + stop 旧 session，避免多余的一次 RTT。
+   */
+  const handleBackendSwitch = useCallback(async (tabId: string, newBackend: TerminalBackend) => {
+    const tab = tabsRef.current.find((t) => t.id === tabId);
+    if (!tab) return;
+
+    try {
+      const instance = await startTerminal(tab.host.id, newBackend);
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId
+            ? {
+                ...t,
+                instanceName: instance.instance_name,
+                wsUrl: instance.ws_url,
+                backend: instance.backend,
+              }
+            : t,
+        ),
+      );
+    } catch (err) {
+      console.error("Backend 切换失败:", err);
+    }
   }, []);
 
   const handleTabSelect = useCallback((tabId: string) => {
@@ -351,7 +383,9 @@ export default function App() {
                   host={tab.host}
                   isActive={tab.id === activeTabId}
                   initialWsUrl={tab.wsUrl}
+                  backend={tab.backend}
                   onInstanceNameUpdate={(instanceName) => handleInstanceNameUpdate(tab.id, instanceName)}
+                  onBackendSwitch={(newBackend) => handleBackendSwitch(tab.id, newBackend)}
                 />
               </div>
             ))

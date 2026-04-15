@@ -192,7 +192,13 @@ async def terminal_websocket(websocket: WebSocket, session_id: str) -> None:
         return
 
     await websocket.accept()
-    session.add_ws_client(websocket)
+
+    # 获取初始终端尺寸（前端可能在首条消息中发送）
+    client_id = session.add_ws_client(websocket)
+    logger.debug(
+        "WebSocket 已建立: session=%s, client=%s, backend=%s, instance=%s",
+        session_id[:8], client_id[:8], session.backend.value, session.instance_name,
+    )
 
     try:
         while True:
@@ -210,13 +216,13 @@ async def terminal_websocket(websocket: WebSocket, session_id: str) -> None:
             elif msg_type == "resize":
                 cols = msg.get("cols", 80)
                 rows = msg.get("rows", 24)
-                session.resize(cols, rows)
+                session.resize(cols, rows, client_id=client_id)
     except WebSocketDisconnect:
         pass
     except Exception as e:
         logger.debug("WebSocket 异常: %s - %s", session_id[:8], e)
     finally:
-        session.remove_ws_client(websocket)
+        session.remove_ws_client(client_id)
 
 
 @router.post("/api/wetty/start", response_model=TerminalResponse)
