@@ -19,6 +19,7 @@ import type { Host, TerminalInstance, TerminalBackend } from "../services/api";
 import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
 import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
+import SnippetPanel from "./SnippetPanel";
 
 // xterm.js 样式（必须导入，否则终端无法正确渲染）
 import "@xterm/xterm/css/xterm.css";
@@ -55,6 +56,8 @@ export default function TerminalView({
   const prevHostIdRef = useRef<number | null>(null);
   /** 当前会话实际使用的 backend（从后端响应中获取） */
   const [currentBackend, setCurrentBackend] = useState<TerminalBackend | null>(backend ?? null);
+  /** SnippetPanel 展开状态 */
+  const [snippetPanelOpen, setSnippetPanelOpen] = useState(false);
 
   // ── scrollback 历史回放标志 ──
   // 当正在回放 scrollback 时，屏蔽 xterm.js 的 onData 输出到 WebSocket，
@@ -260,6 +263,8 @@ export default function TerminalView({
         socketStatus={ws.status}
         backend={currentBackend}
         onReconnect={() => connectToHost(host)}
+        snippetPanelOpen={snippetPanelOpen}
+        onToggleSnippet={() => setSnippetPanelOpen((prev) => !prev)}
       />
 
       {/* 终端容器 */}
@@ -308,6 +313,18 @@ export default function TerminalView({
           </div>
         )}
       </div>
+
+      {/* SnippetPanel — 底部展开面板 */}
+      {snippetPanelOpen && isActive && (
+        <div className="h-[280px] shrink-0 relative">
+          <SnippetPanel
+            visible={snippetPanelOpen}
+            onClose={() => setSnippetPanelOpen(false)}
+            sendInput={ws.sendInput}
+            isConnected={status === "connected"}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -334,12 +351,16 @@ function _StatusBar({
   socketStatus,
   backend,
   onReconnect,
+  snippetPanelOpen,
+  onToggleSnippet,
 }: {
   host: Host;
   status: ConnectionStatus;
   socketStatus: SocketStatus;
   backend?: TerminalBackend | null;
   onReconnect?: () => void;
+  snippetPanelOpen: boolean;
+  onToggleSnippet: () => void;
 }) {
   const cfg = STATUS_MAP[status];
   const backendCfg = backend ? BACKEND_CONFIG[backend] : null;
@@ -360,6 +381,20 @@ function _StatusBar({
         )}
       </span>
       <div className="ml-3 flex items-center gap-2 shrink-0">
+        {/* Snippet 面板切换按钮 */}
+        <button
+          type="button"
+          onClick={onToggleSnippet}
+          className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
+            snippetPanelOpen
+              ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+              : "text-gray-500 hover:text-emerald-400 hover:bg-white/5"
+          }`}
+          title={snippetPanelOpen ? "收起排障脚本" : "打开排障脚本"}
+        >
+          🔧 Snippets
+        </button>
+
         <span className={cfg.dot}>●</span>
         <span>{cfg.label}</span>
         {status === "error" && onReconnect && (

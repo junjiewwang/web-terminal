@@ -19,9 +19,11 @@ from fastapi.staticfiles import StaticFiles
 
 from src.api import events, hosts, sessions, tmux
 from src.api import terminal as terminal_api
+from src.api import snippets as snippets_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
 from src.models.database import async_session_factory, init_db
 from src.services.host_manager import HostManager
+from src.services.snippet_registry import SnippetRegistry
 from src.services.ssh_session import SSHSessionManager
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
@@ -33,9 +35,12 @@ logger = logging.getLogger(__name__)
 ssh_manager = SSHSessionManager()
 terminal_manager = TerminalManager()
 tmux_manager_instance = TmuxWindowManager()
+snippet_registry = SnippetRegistry()
 
 # hosts.yaml 路径
 _HOSTS_YAML = Path(__file__).resolve().parent.parent / "config" / "hosts.yaml"
+# snippets.yaml 路径
+_SNIPPETS_YAML = Path(__file__).resolve().parent.parent / "config" / "snippets.yaml"
 
 # 文件监听防抖间隔（秒）
 _WATCH_DEBOUNCE_SECONDS = 2.0
@@ -58,14 +63,21 @@ async def lifespan(app: FastAPI):
     # 从 hosts.yaml 同步主机配置（启动时首次同步）
     await _sync_hosts_from_yaml()
 
+    # 加载 Snippet Registry（启动时首次加载，允许文件不存在时降级）
+    try:
+        snippet_registry.load_from_yaml(_SNIPPETS_YAML)
+    except Exception:
+        logger.exception("Snippet Registry 初始加载失败，Snippet 功能不可用")
+
     # 注入全局服务实例到 API 模块
     sessions.ssh_manager = ssh_manager
     tmux.tmux_manager = tmux_manager_instance
     terminal_api.terminal_manager = terminal_manager
     terminal_api.tmux_manager = tmux_manager_instance
+    snippets_api.snippet_registry = snippet_registry
 
     # 初始化 MCP Server 依赖
-    init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance)
+    init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance, snippet_registry=snippet_registry)
 
     # 生成 API Token（设置了 WETTY_API_TOKEN 环境变量时启用认证）
     env_token = os.environ.get("WETTY_API_TOKEN")
@@ -77,6 +89,9 @@ async def lifespan(app: FastAPI):
 
     # 启动 hosts.yaml 文件监听后台任务
     watch_task = asyncio.create_task(_watch_hosts_yaml())
+
+    # 启动 snippets.yaml 文件监听后台任务
+    watch_snippets_task = asyncio.create_task(_watch_snippets_yaml())
 
     # 启动 zombie tmux session 定期清理后台任务
     zombie_cleanup_task = asyncio.create_task(_cleanup_zombie_sessions_loop())
@@ -91,9 +106,14 @@ async def lifespan(app: FastAPI):
         # ── 关闭 ──
         logger.info("服务关闭中...")
         watch_task.cancel()
+        watch_snippets_task.cancel()
         zombie_cleanup_task.cancel()
         try:
             await watch_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await watch_snippets_task
         except asyncio.CancelledError:
             pass
         try:
@@ -161,6 +181,45 @@ async def _watch_hosts_yaml() -> None:
         raise
 
 
+async def _watch_snippets_yaml() -> None:
+    """后台任务：监听 snippets.yaml 及 snippets/ 目录变更，自动触发热加载
+
+    监听 config/ 目录，关注 snippets.yaml 和 snippets/ 子目录的变更。
+    如果 watchfiles 不可用，静默退出。
+    """
+    try:
+        from watchfiles import awatch
+    except ImportError:
+        logger.warning("watchfiles 未安装，snippets.yaml 热加载已禁用")
+        return
+
+    watch_dir = _SNIPPETS_YAML.parent
+    yaml_name = _SNIPPETS_YAML.name
+    snippets_subdir = "snippets"
+
+    logger.info("启动 snippets.yaml 文件监听: %s", _SNIPPETS_YAML)
+
+    try:
+        async for changes in awatch(watch_dir, debounce=int(_WATCH_DEBOUNCE_SECONDS * 1000)):
+            # 关注 snippets.yaml 或 snippets/ 子目录下 .sh 文件的变更
+            relevant = any(
+                Path(path).name == yaml_name
+                or (snippets_subdir in Path(path).parts and Path(path).suffix == ".sh")
+                for _, path in changes
+            )
+            if not relevant:
+                continue
+
+            logger.info("检测到 snippets 配置/脚本变更，触发热加载...")
+            try:
+                snippet_registry.reload()
+            except Exception:
+                logger.exception("snippets.yaml 热加载失败")
+    except asyncio.CancelledError:
+        logger.info("snippets.yaml 文件监听已停止")
+        raise
+
+
 # zombie tmux session 清理间隔（秒）
 _ZOMBIE_CLEANUP_INTERVAL = 60
 
@@ -220,13 +279,17 @@ async def auth_middleware(request: Request, call_next):
     """Bearer Token 认证中间件
 
     - /health、/docs 等路径免认证
-    - /mcp/ 路径免认证（MCP 协议自身管理认证）
-    - 其他 /api/ 路径需要 Bearer Token
+    - /api/ 和 /mcp/ 路径需要 Bearer Token
+    - 其他路径（静态文件等）免认证
     """
     path = request.url.path
 
-    # 白名单路径、MCP 路径、非 API 路径免认证
-    if path in _AUTH_WHITELIST or path.startswith("/mcp/") or not path.startswith("/api/"):
+    # 白名单路径免认证
+    if path in _AUTH_WHITELIST:
+        return await call_next(request)
+
+    # /api/ 和 /mcp/ 路径需要认证，其他路径（静态文件等）免认证
+    if not path.startswith("/api/") and not path.startswith("/mcp/"):
         return await call_next(request)
 
     # 检查 Bearer Token
@@ -265,6 +328,7 @@ app.include_router(sessions.router)
 app.include_router(events.router)
 app.include_router(terminal_api.router)
 app.include_router(tmux.router)
+app.include_router(snippets_api.router)
 
 # ── 挂载 MCP Server（SSE 模式）──────────────
 # FastMCP 通过 streamable_http 模式挂载到 /mcp 路径

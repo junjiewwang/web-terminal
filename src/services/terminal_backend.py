@@ -17,7 +17,7 @@ class TerminalBackend(str, enum.Enum):
     BROKER = "broker"
 
 
-DEFAULT_TERMINAL_BACKEND: Final[TerminalBackend] = TerminalBackend.TMUX
+DEFAULT_TERMINAL_BACKEND: Final[TerminalBackend] = TerminalBackend.BROKER
 TERMINAL_BACKEND_ENV_VAR: Final[str] = "WETTY_SESSION_BACKEND"
 
 

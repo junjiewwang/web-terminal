@@ -21,12 +21,14 @@ import logging
 import re
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from src.models.database import async_session_factory
 from src.models.host import Host, HostResponse
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
+from src.services.snippet_registry import SnippetRegistry
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
 
@@ -37,12 +39,18 @@ JsonDict = dict[str, object]
 # ── 全局引用（通过 init_mcp_server 注入）──
 _terminal_manager: TerminalManager | None = None
 _tmux_manager: TmuxWindowManager | None = None
+_snippet_registry: SnippetRegistry | None = None
 
 # 创建 MCP Server 实例
+# DNS rebinding 保护已关闭：MCP 端点需要公开给外部 Agent 访问，
+# 安全性由调用方 Header 鉴权保障（如 Bearer Token），无需限制 Host。
 mcp = FastMCP(
     name="wetty-mcp-terminal",
     # streamable_http_path="/" 避免与 FastAPI app.mount("/mcp", ...) 路径双重前缀
     streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
     instructions=(
         "你是一个 SSH 终端管理助手。你可以连接到预配置的远程主机，"
         "通过交互式终端执行命令。你的所有操作会在用户的浏览器终端中实时显示。\n\n"
@@ -51,16 +59,25 @@ mcp = FastMCP(
         "2. connect_host 建立连接（自动启动终端）\n"
         "3. 等待终端就绪后，使用 run_command 执行命令\n"
         "4. 如果是堡垒机场景，先用 send_input 输入主机IP + wait_for_output 等待跳转\n"
-        "5. 完成后用 disconnect 断开"
+        "5. 完成后用 disconnect 断开\n\n"
+        "排障脚本工具：\n"
+        "1. list_snippet_domains 查看可用排障领域（ES/K8s/MySQL/Redis 等）\n"
+        "2. load_snippet_domain 将排障脚本加载到远端终端（自动检测是否已加载）\n"
+        "3. run_snippet_command 执行排障命令（自动填参数、配置超时）"
     ),
 )
 
 
-def init_mcp_server(terminal_manager: TerminalManager, tmux_manager: TmuxWindowManager | None = None) -> None:
+def init_mcp_server(
+    terminal_manager: TerminalManager,
+    tmux_manager: TmuxWindowManager | None = None,
+    snippet_registry: SnippetRegistry | None = None,
+) -> None:
     """初始化 MCP Server 的依赖（由 main.py 在启动时调用）"""
-    global _terminal_manager, _tmux_manager
+    global _terminal_manager, _tmux_manager, _snippet_registry
     _terminal_manager = terminal_manager
     _tmux_manager = tmux_manager or TmuxWindowManager()
+    _snippet_registry = snippet_registry
     logger.info("MCP Server 依赖注入完成（Python PTY 直连模式）")
 
 
@@ -108,6 +125,13 @@ def _get_tmux_manager() -> TmuxWindowManager:
     if _tmux_manager is None:
         raise RuntimeError("MCP Server 尚未初始化，请先调用 init_mcp_server()")
     return _tmux_manager
+
+
+def _get_snippet_registry() -> SnippetRegistry:
+    """获取 Snippet 注册表实例"""
+    if _snippet_registry is None:
+        raise RuntimeError("Snippet Registry 未初始化，请检查 snippets.yaml 配置")
+    return _snippet_registry
 
 
 async def _publish_event(event_type: str, session_id: str, host_name: str, data: JsonDict | None = None) -> None:
@@ -545,3 +569,192 @@ async def switch_window(bastion_name: str, window_name: str) -> str:
     })
 
     return f"已切换到窗口 '{window_name}'（{tmux_session}:{window_name}）"
+
+
+# ── Snippet 排障脚本工具 ──────────────────────────
+
+
+@mcp.tool()
+async def list_snippet_domains() -> str:
+    """列出所有可用的排障脚本领域
+
+    返回支持的领域列表（如 ES、K8s、MySQL、Redis），
+    每个领域包含名称、描述、标签和可用命令数量。
+
+    使用流程：
+    1. 先调用此工具查看有哪些排障领域可用
+    2. 调用 load_snippet_domain 将领域脚本加载到目标终端
+    3. 调用 run_snippet_command 执行具体排障命令
+
+    Returns:
+        领域列表（JSON 格式）
+    """
+    registry = _get_snippet_registry()
+    summaries = registry.list_domain_summaries()
+
+    if not summaries:
+        return "没有可用的排障脚本领域。请检查 snippets.yaml 配置。"
+
+    result = [s.model_dump() for s in summaries]
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def load_snippet_domain(session_id: str, domain_id: str) -> str:
+    """将排障脚本加载到远端终端
+
+    自动检测脚本是否已在远端加载（通过 `type` 命令探测），
+    如果已加载则跳过，否则通过 heredoc 注入脚本并 source。
+
+    脚本加载后，该领域的所有命令函数即可在终端中直接使用。
+
+    Args:
+        session_id: 终端会话 ID（由 connect_host 返回）
+        domain_id: 领域 ID（如 es、k8s、mysql、redis，由 list_snippet_domains 返回）
+
+    Returns:
+        加载结果（已加载/新加载/失败）
+    """
+    registry = _get_snippet_registry()
+    mgr = _get_terminal_manager()
+
+    session = mgr.get_session_by_id(session_id)
+    if not session:
+        return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
+    if not session.running:
+        return f"错误：会话 {session_id} 已断开。请重新连接。"
+
+    domain = registry.get_domain(domain_id)
+    if not domain:
+        available = ", ".join(d.id for d in registry.list_domains())
+        return f"错误：领域 '{domain_id}' 不存在。可用领域: {available or '无'}"
+
+    # 步骤 1：探测脚本是否已加载
+    probe = registry.get_probe_command(domain_id)
+    if probe:
+        try:
+            probe_output = await session.send_command(
+                command=probe,
+                wait_pattern=r"__SNIPPET_(?:LOADED|NOT_LOADED)__",
+                timeout=10.0,
+            )
+            if "__SNIPPET_LOADED__" in probe_output:
+                logger.info("领域 %s 脚本已在远端加载，跳过注入", domain_id)
+                return (
+                    f"领域 '{domain.name}' 脚本已在远端加载，无需重复加载。\n"
+                    f"可用命令: {', '.join(c.id for c in domain.commands)}"
+                )
+        except (TimeoutError, ConnectionError):
+            logger.debug("探测命令执行异常，继续加载脚本")
+
+    # 步骤 2：通过 heredoc 注入脚本
+    loader = registry.build_heredoc_loader(domain_id)
+    if not loader:
+        return f"错误：领域 '{domain_id}' 无可用脚本文件。"
+
+    try:
+        await session.send_input(loader + "\n")
+        # 等待 source 完成（检测 shell 提示符返回）
+        await session.wait_for(
+            pattern=r"(?:[\$#>%])\s*$",
+            timeout=15.0,
+        )
+    except TimeoutError:
+        return f"警告：脚本注入可能超时，但命令可能已经可用。请尝试执行命令验证。"
+    except ConnectionError as e:
+        return f"错误：脚本注入失败 - {e}"
+
+    logger.info("领域 %s 脚本已注入远端", domain_id)
+    return (
+        f"领域 '{domain.name}' 脚本已成功加载到远端终端。\n"
+        f"可用命令: {', '.join(c.id for c in domain.commands)}\n\n"
+        f"提示：使用 run_snippet_command 执行具体命令，"
+        f"或直接用 run_command 执行命令名（如 `es 9200`）。"
+    )
+
+
+@mcp.tool()
+async def run_snippet_command(
+    session_id: str,
+    domain_id: str,
+    command_id: str,
+    params: str | None = None,
+) -> str:
+    """执行排障脚本命令
+
+    解析命令模板，填入参数后在终端中执行。
+    自动使用配置中的超时时间（命令级 > 领域级 > 全局 30s）。
+
+    Args:
+        session_id: 终端会话 ID
+        domain_id: 领域 ID（如 es、k8s、mysql、redis）
+        command_id: 命令 ID（如 es、esl、ki、my、rd 等）
+        params: 命令参数（JSON 格式），如 '{"port": "9200", "index": "my-index"}'
+
+    Returns:
+        命令执行输出
+    """
+    registry = _get_snippet_registry()
+    mgr = _get_terminal_manager()
+
+    session = mgr.get_session_by_id(session_id)
+    if not session:
+        return f"错误：会话 {session_id} 不存在。"
+    if not session.running:
+        return f"错误：会话 {session_id} 已断开。"
+
+    # 解析参数 JSON
+    param_dict: dict[str, str] = {}
+    if params:
+        try:
+            param_dict = json.loads(params)
+        except json.JSONDecodeError:
+            return f"错误：参数格式无效，请使用 JSON 格式。示例: '{{\"port\": \"9200\"}}'"
+
+    # 参数校验
+    errors = registry.validate_params(domain_id, command_id, param_dict)
+    if errors:
+        return f"参数校验失败:\n" + "\n".join(f"  - {e}" for e in errors)
+
+    # 解析命令模板
+    resolved = registry.resolve_command(domain_id, command_id, param_dict)
+    if not resolved:
+        cmd = registry.get_command(domain_id, command_id)
+        if not cmd:
+            return f"错误：命令 '{domain_id}/{command_id}' 不存在。"
+        return f"错误：必填参数缺失。命令语法: {cmd.syntax}"
+
+    # 获取超时配置
+    timeout = registry.get_timeout(domain_id, command_id)
+
+    # 执行命令
+    await _publish_event("command_start", session_id, session.instance_name, {
+        "command": resolved,
+        "snippet": f"{domain_id}/{command_id}",
+    })
+
+    try:
+        output = await session.send_command(
+            command=resolved,
+            wait_pattern=r"(?:[\$#>%])\s*$",
+            timeout=float(timeout),
+        )
+    except TimeoutError:
+        await _publish_event("command_error", session_id, session.instance_name, {
+            "error": f"命令超时（{timeout}s）",
+            "snippet": f"{domain_id}/{command_id}",
+        })
+        return f"错误：命令执行超时（{timeout}s）。命令: {resolved}"
+    except ConnectionError as e:
+        await _publish_event("command_error", session_id, session.instance_name, {
+            "error": str(e),
+            "snippet": f"{domain_id}/{command_id}",
+        })
+        return f"错误：连接异常 - {e}"
+
+    await _publish_event("command_complete", session_id, session.instance_name, {
+        "command": resolved,
+        "snippet": f"{domain_id}/{command_id}",
+    })
+
+    return output

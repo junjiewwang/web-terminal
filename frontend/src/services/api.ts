@@ -535,6 +535,118 @@ export function subscribeEvents(
   };
 }
 
+// ── Snippet（排障脚本）类型定义 ──────────────
+
+/** Snippet 参数定义 */
+export interface SnippetParam {
+  name: string;
+  description: string;
+  default: string;
+  required: boolean;
+}
+
+/** Snippet 命令定义 */
+export interface SnippetCommand {
+  id: string;
+  name: string;
+  description: string;
+  syntax: string;
+  template: string;
+  timeout: number | null;
+  params: SnippetParam[];
+}
+
+/** Snippet 领域概要（列表接口） */
+export interface SnippetDomainSummary {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  tags: string[];
+  command_count: number;
+}
+
+/** Snippet 领域详情（含命令列表） */
+export interface SnippetDomainDetail {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  tags: string[];
+  script_file: string;
+  default_timeout: number | null;
+  commands: SnippetCommand[];
+}
+
+/** 脚本加载器响应 */
+export interface ScriptLoaderResponse {
+  domain_id: string;
+  probe_command: string;
+  heredoc_loader: string;
+}
+
+// ── Snippet API ──────────────────────────────
+
+/** 获取所有 Snippet 领域概要列表 */
+export async function fetchSnippetDomains(): Promise<SnippetDomainSummary[]> {
+  const res = await fetchWithRetry(`${API_BASE}/snippets`);
+  if (!res.ok) throw new Error(`获取 Snippet 领域列表失败: ${res.statusText}`);
+  return res.json();
+}
+
+/** 获取指定 Snippet 领域详情（含命令列表和参数） */
+export async function fetchSnippetDomain(domainId: string): Promise<SnippetDomainDetail> {
+  const res = await fetchWithRetry(`${API_BASE}/snippets/${encodeURIComponent(domainId)}`);
+  if (!res.ok) throw new Error(`获取 Snippet 领域详情失败: ${res.statusText}`);
+  return res.json();
+}
+
+/** 获取脚本加载器（探测命令 + heredoc 注入命令） */
+export async function fetchSnippetScript(domainId: string): Promise<ScriptLoaderResponse> {
+  const res = await fetchWithRetry(`${API_BASE}/snippets/${encodeURIComponent(domainId)}/script`);
+  if (!res.ok) throw new Error(`获取脚本加载器失败: ${res.statusText}`);
+  return res.json();
+}
+
+// ── Snippet 模板工具函数 ──────────────────────
+
+/**
+ * 解析命令模板，将 {{param}} 占位符替换为实际值
+ *
+ * @param template - 命令模板，如 "esv {{index}} {{doc_id}}"
+ * @param params   - 参数定义列表
+ * @param values   - 参数值映射，如 { index: "my_index", doc_id: "123" }
+ * @returns 解析后的命令字符串
+ */
+export function resolveSnippetTemplate(
+  template: string,
+  params: SnippetParam[],
+  values: Record<string, string>,
+): string {
+  let resolved = template;
+  for (const param of params) {
+    const value = values[param.name] || param.default;
+    resolved = resolved.replaceAll(`{{${param.name}}}`, value);
+  }
+  return resolved;
+}
+
+/**
+ * 校验必填参数是否已提供
+ *
+ * @returns 缺失的必填参数名列表（空数组表示全部通过）
+ */
+export function validateSnippetParams(
+  params: SnippetParam[],
+  values: Record<string, string>,
+): string[] {
+  return params
+    .filter((p) => p.required && !values[p.name]?.trim() && !p.default)
+    .map((p) => p.name);
+}
+
+// ── SSE 事件订阅（模块级单例 · fetch + ReadableStream 实现）──
+
 /**
  * 使用 fetch + ReadableStream 读取 SSE 流
  *
