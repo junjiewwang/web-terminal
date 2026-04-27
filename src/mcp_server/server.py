@@ -635,10 +635,17 @@ async def load_snippet_domain(session_id: str, domain_id: str) -> str:
         try:
             probe_output = await session.send_command(
                 command=probe,
-                wait_pattern=r"__SNIPPET_(?:LOADED|NOT_LOADED)__",
+                wait_pattern=r"__PROBE_(?:YES|NO)__",
                 timeout=10.0,
             )
-            if "__SNIPPET_LOADED__" in probe_output:
+            # 只检查输出的最后非空行，排除命令回显行的干扰
+            last_line = ""
+            for line in reversed(probe_output.splitlines()):
+                stripped = line.strip()
+                if stripped:
+                    last_line = stripped
+                    break
+            if SnippetRegistry.PROBE_YES in last_line:
                 logger.info("领域 %s 脚本已在远端加载，跳过注入", domain_id)
                 return (
                     f"领域 '{domain.name}' 脚本已在远端加载，无需重复加载。\n"
@@ -654,9 +661,9 @@ async def load_snippet_domain(session_id: str, domain_id: str) -> str:
 
     try:
         await session.send_input(loader + "\n")
-        # 等待 source 完成（检测 shell 提示符返回）
+        # 等待注入确认标记（比通用提示符更精确，避免脚本内容中的 $ # 提前触发）
         await session.wait_for(
-            pattern=r"(?:[\$#>%])\s*$",
+            pattern=re.escape(SnippetRegistry.INJECT_DONE),
             timeout=15.0,
         )
     except TimeoutError:
@@ -678,7 +685,7 @@ async def run_snippet_command(
     session_id: str,
     domain_id: str,
     command_id: str,
-    params: str | None = None,
+    params: dict[str, str] | None = None,
 ) -> str:
     """执行排障脚本命令
 
@@ -689,7 +696,7 @@ async def run_snippet_command(
         session_id: 终端会话 ID
         domain_id: 领域 ID（如 es、k8s、mysql、redis）
         command_id: 命令 ID（如 es、esl、ki、my、rd 等）
-        params: 命令参数（JSON 格式），如 '{"port": "9200", "index": "my-index"}'
+        params: 命令参数（键值对），如 {"port": "9200", "index": "my-index"}
 
     Returns:
         命令执行输出
@@ -703,13 +710,8 @@ async def run_snippet_command(
     if not session.running:
         return f"错误：会话 {session_id} 已断开。"
 
-    # 解析参数 JSON
-    param_dict: dict[str, str] = {}
-    if params:
-        try:
-            param_dict = json.loads(params)
-        except json.JSONDecodeError:
-            return f"错误：参数格式无效，请使用 JSON 格式。示例: '{{\"port\": \"9200\"}}'"
+    # 参数标准化：确保所有值为字符串
+    param_dict: dict[str, str] = {k: str(v) for k, v in params.items()} if params else {}
 
     # 参数校验
     errors = registry.validate_params(domain_id, command_id, param_dict)

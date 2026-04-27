@@ -196,7 +196,8 @@ class SnippetRegistry:
                 return None  # required 参数缺失
             resolved = resolved.replace(f"{{{{{p.name}}}}}", value)
 
-        return resolved.strip()
+        # 压缩连续空格（可选参数为空时模板中会出现多余空格）
+        return re.sub(r"\s+", " ", resolved).strip()
 
     def validate_params(
         self,
@@ -238,10 +239,17 @@ class SnippetRegistry:
 
     # ── 探测 ──────────────────────────────────────
 
+    # 探测标记：使用不对称标记避免回显污染。
+    # 回显行中同时包含两个标记字面量，所以判定时需要
+    # 只检查输出的最后一行（实际执行结果），而非全文匹配。
+    PROBE_YES = "__PROBE_YES__"
+    PROBE_NO = "__PROBE_NO__"
+
     def get_probe_command(self, domain_id: str) -> str | None:
         """获取检测脚本是否已在远端加载的探测命令。
 
         通过 `type <first_command>` 判断函数是否已定义。
+        使用不对称标记 + 最后行匹配，避免命令回显污染导致假阳性。
 
         Returns:
             探测命令字符串，或 None（领域不存在或无命令）。
@@ -251,17 +259,21 @@ class SnippetRegistry:
             return None
         first_cmd = domain.commands[0].id
         return (
-            f"type {first_cmd} 2>/dev/null "
-            f"&& echo '__SNIPPET_LOADED__' "
-            f"|| echo '__SNIPPET_NOT_LOADED__'"
+            f"type {first_cmd} >/dev/null 2>&1 "
+            f"&& echo '{self.PROBE_YES}' "
+            f"|| echo '{self.PROBE_NO}'"
         )
 
     # ── Heredoc 注入 ──────────────────────────────
+
+    # heredoc 注入完成后的确认标记（公共常量，server.py 需引用）
+    INJECT_DONE = "__SNIPPET_INJECTED__"
 
     def build_heredoc_loader(self, domain_id: str) -> str | None:
         """生成 heredoc 注入命令，将脚本加载到远端 /tmp/。
 
         命令会将脚本内容写入 /tmp/ts-{domain_id}.sh 并 source。
+        末尾追加确认标记 echo，供 wait_for 精确等待注入完成。
 
         Returns:
             heredoc 加载命令字符串，或 None（领域/脚本不存在）。
@@ -274,7 +286,7 @@ class SnippetRegistry:
             f"cat << 'SNIPPET_EOF' > /tmp/{script_name}\n"
             f"{content}\n"
             f"SNIPPET_EOF\n"
-            f"source /tmp/{script_name}"
+            f"source /tmp/{script_name} && echo '{self.INJECT_DONE}'"
         )
 
     # ── 安全审计 ──────────────────────────────────
