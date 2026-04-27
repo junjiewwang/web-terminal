@@ -1,0 +1,368 @@
+# Troubleshoot Snippets 配置
+#
+# 本文件是 Snippet 元数据的 Single Source of Truth（唯一真相）
+# 新增排障领域只需在 domains 下添加一项 + 放入脚本文件，零代码改动
+#
+# 同步机制：
+# 1. 启动时自动加载到内存 (SnippetRegistry)
+# 2. 运行中修改本文件会自动热加载（watchfiles 监听 + 2s 防抖）
+# 3. REST API: GET /api/snippets 查看所有领域
+# 4. MCP Tool: list_snippet_domains 查看所有领域
+
+domains:
+  # ── Elasticsearch ───────────────────────────
+  - id: es
+    name: Elasticsearch
+    icon: "🔍"
+    description: ES 集群排障工具集（查集群、索引、分片、节点、管理操作）
+    script_file: snippets/es-snippet.sh
+    default_timeout: 15
+    tags:
+      - search
+      - database
+    commands:
+      - id: es
+        name: ES 请求
+        description: 向 ES 集群发送 API 请求（自动从 K8s Secret 获取认证）
+        syntax: "es <path> [curl参数...]"
+        template: "es {{path}}"
+        params:
+          - name: path
+            description: "ES API 路径，如 /_cluster/health、/_cat/indices?v"
+            required: true
+
+      - id: esl
+        name: 查询索引
+        description: 按时间倒序查询索引的最近 N 条文档
+        syntax: "esl <index> [N=10] [field...]"
+        template: "esl {{index}} {{size}}"
+        params:
+          - name: index
+            description: 索引名称
+            required: true
+          - name: size
+            description: 返回文档数
+            default: "10"
+            required: false
+
+      - id: esr
+        name: 时间范围查询
+        description: 按时间范围查询索引（支持 5m/1h/2d 或 from,to 时间戳）
+        syntax: "esr <index> <5m|1h|2d|from,to> [N=10] [-f 'filter'] [field...]"
+        template: "esr {{index}} {{time_range}} {{size}}"
+        timeout: 60
+        params:
+          - name: index
+            description: 索引名称
+            required: true
+          - name: time_range
+            description: "时间范围：5m/1h/2d 或 from,to 毫秒时间戳"
+            required: true
+          - name: size
+            description: 返回文档数
+            default: "10"
+            required: false
+
+      - id: esq
+        name: 精确查询
+        description: 按字段精确匹配查询
+        syntax: "esq <index> <field> <value> [N=10]"
+        template: "esq {{index}} {{field}} {{value}} {{size}}"
+        params:
+          - name: index
+            description: 索引名称
+            required: true
+          - name: field
+            description: 查询字段名
+            required: true
+          - name: value
+            description: 查询值
+            required: true
+          - name: size
+            description: 返回文档数
+            default: "10"
+            required: false
+
+      - id: esm
+        name: 查看 Mapping
+        description: 查看索引的字段映射定义
+        syntax: "esm <index> [field...]"
+        template: "esm {{index}}"
+        params:
+          - name: index
+            description: 索引名称
+            required: true
+
+      - id: esn
+        name: 节点信息
+        description: 查看集群节点（概览/-r角色/-s资源/-t线程池）
+        syntax: "esn [-r|-s|-t] [node]"
+        template: "esn {{option}}"
+        params:
+          - name: option
+            description: "选项：-r 角色、-s 资源、-t 线程池，留空为概览"
+            default: ""
+            required: false
+
+      - id: ess
+        name: 分片信息
+        description: 查看分片（总览/-u未分配/-e分配失败原因/-r分布）
+        syntax: "ess [-u|-e|-r] [index]"
+        template: "ess {{option}}"
+        params:
+          - name: option
+            description: "选项：-u 未分配、-e 分配原因、-r 分布，留空为总览"
+            default: ""
+            required: false
+
+      - id: esa
+        name: 集群管理
+        description: ES 集群管理操作（副本、路由、均衡、重试）
+        syntax: "esa replica <idx> <n> | route <enable|disable> | rebalance <enable|disable> | retry"
+        template: "esa {{action}}"
+        timeout: 30
+        params:
+          - name: action
+            description: "管理操作和参数，如 replica my-index 2"
+            required: true
+
+  # ── Kubernetes ──────────────────────────────
+  - id: k8s
+    name: Kubernetes
+    icon: "☸️"
+    description: K8s 镜像版本排查工具（列出镜像、对比命名空间版本差异）
+    script_file: snippets/k8s-image-snippet.sh
+    default_timeout: 30
+    tags:
+      - container
+      - orchestration
+    commands:
+      - id: ki
+        name: 镜像列表
+        description: 列出命名空间内的容器镜像（按 owner 或 pod 分组）
+        syntax: "ki [-p] [namespace] [name-filter]"
+        template: "ki {{options}} {{namespace}} {{filter}}"
+        params:
+          - name: options
+            description: "-p 按 Pod 分组（默认按 owner 分组），留空为默认"
+            default: ""
+            required: false
+          - name: namespace
+            description: K8s 命名空间（留空则查所有命名空间）
+            default: ""
+            required: false
+          - name: filter
+            description: 名称过滤关键词（模糊匹配）
+            default: ""
+            required: false
+
+      - id: kic
+        name: 镜像版本对比
+        description: 对比两个命名空间的部署镜像版本差异
+        syntax: "kic <ns1> <ns2> [name-filter]"
+        template: "kic {{ns1}} {{ns2}} {{filter}}"
+        timeout: 60
+        params:
+          - name: ns1
+            description: 第一个命名空间
+            required: true
+          - name: ns2
+            description: 第二个命名空间
+            required: true
+          - name: filter
+            description: 名称过滤关键词（模糊匹配）
+            default: ""
+            required: false
+
+  # ── MySQL ───────────────────────────────────
+  - id: mysql
+    name: MySQL
+    icon: "🐬"
+    description: MySQL 数据库排障工具集（连接、查询、进程、表分析、实例切换）
+    script_file: snippets/mysql-snippet.sh
+    default_timeout: 15
+    tags:
+      - database
+      - rdbms
+    commands:
+      - id: my
+        name: MySQL Shell
+        description: 连接进入交互式 MySQL shell（自动从 K8s Secret 获取认证）
+        syntax: "my [db]"
+        template: "my {{db}}"
+        params:
+          - name: db
+            description: 数据库名（可选）
+            default: ""
+            required: false
+
+      - id: myq
+        name: 执行 SQL
+        description: 执行单条 SQL 并格式化输出
+        syntax: "myq <sql> [db]"
+        template: "myq '{{sql}}' {{db}}"
+        timeout: 60
+        params:
+          - name: sql
+            description: SQL 语句
+            required: true
+          - name: db
+            description: 数据库名（可选）
+            default: ""
+            required: false
+
+      - id: myl
+        name: 列出库表
+        description: 列出所有数据库，或指定库的所有表
+        syntax: "myl [db]"
+        template: "myl {{db}}"
+        params:
+          - name: db
+            description: 数据库名（留空列出所有库）
+            default: ""
+            required: false
+
+      - id: myps
+        name: 进程列表
+        description: 查看 MySQL 进程列表、慢查询、锁等待
+        syntax: "myps [-l|-w|-k <id>]"
+        template: "myps {{option}}"
+        params:
+          - name: option
+            description: "-l 慢查询、-w 锁等待、-k <id> 杀进程，留空为全部进程"
+            default: ""
+            required: false
+
+      - id: myt
+        name: 表状态
+        description: 查看表大小、行数、引擎等信息
+        syntax: "myt <db> [table-filter]"
+        template: "myt {{db}} {{filter}}"
+        params:
+          - name: db
+            description: 数据库名
+            required: true
+          - name: filter
+            description: 表名过滤（模糊匹配）
+            default: ""
+            required: false
+
+      - id: mys
+        name: 切换实例
+        description: 切换 MySQL K8s Secret（方便同会话操作多个实例）
+        syntax: "mys <secret> [ns]"
+        template: "mys {{secret}} {{ns}}"
+        params:
+          - name: secret
+            description: K8s Secret 名称
+            required: true
+          - name: ns
+            description: K8s 命名空间
+            default: ""
+            required: false
+
+  # ── Redis ───────────────────────────────────
+  - id: redis
+    name: Redis
+    icon: "🔴"
+    description: Redis 排障工具集（连接、命令执行、信息查看、Key 扫描分析）
+    script_file: snippets/redis-snippet.sh
+    default_timeout: 15
+    tags:
+      - database
+      - cache
+    commands:
+      - id: rd
+        name: 执行命令
+        description: 执行 Redis 命令（自动从 K8s Secret 获取认证）
+        syntax: "rd <cmd...>"
+        template: "rd {{command}}"
+        params:
+          - name: command
+            description: "Redis 命令，如 GET key1、INFO"
+            required: true
+
+      - id: rds
+        name: Redis Shell
+        description: 进入交互式 redis-cli shell
+        syntax: "rds"
+        template: "rds"
+        params: []
+
+      - id: rdi
+        name: 实例信息
+        description: 查看 Redis 实例信息（全量/-s服务器/-r复制/-c客户端/-m内存）
+        syntax: "rdi [-s|-r|-c|-m]"
+        template: "rdi {{option}}"
+        params:
+          - name: option
+            description: "-s 服务器、-r 复制、-c 客户端、-m 内存，留空为全量"
+            default: ""
+            required: false
+
+      - id: rdk
+        name: 扫描 Key
+        description: 使用 SCAN 扫描 Key（不阻塞，替代 KEYS 命令）
+        syntax: "rdk [pattern=*] [count=100]"
+        template: "rdk {{pattern}} {{count}}"
+        params:
+          - name: pattern
+            description: Key 匹配模式
+            default: "*"
+            required: false
+          - name: count
+            description: 每次扫描数量
+            default: "100"
+            required: false
+
+      - id: rdg
+        name: Key 详情
+        description: 查看 Key 的类型、TTL 和值
+        syntax: "rdg <key>"
+        template: "rdg {{key}}"
+        params:
+          - name: key
+            description: Redis Key 名称
+            required: true
+
+      - id: rdm
+        name: 大 Key 分析
+        description: 找出内存占用最大的 Key
+        syntax: "rdm [pattern=*] [N=20]"
+        template: "rdm {{pattern}} {{count}}"
+        timeout: 60
+        params:
+          - name: pattern
+            description: Key 匹配模式
+            default: "*"
+            required: false
+          - name: count
+            description: 显示前 N 个
+            default: "20"
+            required: false
+
+      - id: rdx
+        name: 切换实例
+        description: 切换 Redis K8s Secret/Pod（支持 secret 与 pod 分属不同 namespace）
+        syntax: "rdx <secret> [secret-ns] [pod] [container] [pod-ns]"
+        template: "rdx {{secret}} {{secret_ns}} {{pod}} {{container}} {{pod_ns}}"
+        params:
+          - name: secret
+            description: K8s Secret 名称
+            required: true
+          - name: secret_ns
+            description: Secret 所在命名空间
+            default: ""
+            required: false
+          - name: pod
+            description: Redis Pod 名称（不填则直连）
+            default: ""
+            required: false
+          - name: container
+            description: Pod 中的容器名
+            default: ""
+            required: false
+          - name: pod_ns
+            description: Pod 所在命名空间（默认同 secret-ns，跨 ns 时单独指定）
+            default: ""
+            required: false
