@@ -87,6 +87,10 @@ export default function App() {
   const latestEvent = events.length > 0 ? events[events.length - 1] : null;
   const latestEventText = eventSummary(latestEvent);
 
+  // Toast 通知：新事件到来时短暂显示，5 秒后自动消失
+  const [showEventToast, setShowEventToast] = useState(false);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const loadHosts = useCallback(() => {
     setHostsLoading(true);
     setHostsError(null);
@@ -146,6 +150,10 @@ export default function App() {
       setEvents((prev) => [...prev.slice(-99), event]);
       if (!isAgentPanelOpenRef.current) {
         setUnreadEventCount((prev) => Math.min(prev + 1, MAX_UNREAD_EVENTS));
+        // 新事件到来时显示 toast
+        setShowEventToast(true);
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(() => setShowEventToast(false), 5000);
       }
       if (event.event_type === "session_created") {
         _handleSessionCreated(event);
@@ -446,11 +454,19 @@ export default function App() {
             ))
           )}
 
-          {latestEventText && !isAgentPanelOpen && (
-            <div className="pointer-events-none absolute right-4 top-4 z-20 hidden max-w-sm rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur md:block">
+          {latestEventText && !isAgentPanelOpen && showEventToast && (
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => setShowEventToast(false)}
+              onKeyDown={(e) => e.key === "Escape" && setShowEventToast(false)}
+              className="absolute right-4 top-4 z-20 hidden max-w-sm cursor-pointer rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur transition-opacity duration-500 hover:border-emerald-400/30 md:block"
+              title="点击关闭"
+            >
               <div className="flex items-center gap-2 text-[11px] text-gray-500">
                 <span className="inline-flex h-2 w-2 rounded-full bg-emerald-400" />
                 最近轨迹
+                <span className="ml-auto text-[10px] text-gray-600">点击关闭</span>
               </div>
               <p className="mt-1 truncate text-xs text-gray-300">{latestEventText}</p>
             </div>
