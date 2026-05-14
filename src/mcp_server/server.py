@@ -642,47 +642,12 @@ async def load_snippet_domain(session_id: str, domain_id: str) -> str:
         available = ", ".join(d.id for d in registry.list_domains())
         return f"错误：领域 '{domain_id}' 不存在。可用领域: {available or '无'}"
 
-    # 步骤 1：探测脚本是否已加载
-    probe = registry.get_probe_command(domain_id)
-    if probe:
-        try:
-            probe_output = await session.send_command(
-                command=probe,
-                wait_pattern=r"__PROBE_(?:YES|NO)__",
-                timeout=10.0,
-            )
-            # 只检查输出的最后非空行，排除命令回显行的干扰
-            last_line = ""
-            for line in reversed(probe_output.splitlines()):
-                stripped = line.strip()
-                if stripped:
-                    last_line = stripped
-                    break
-            if SnippetRegistry.PROBE_YES in last_line:
-                logger.info("领域 %s 脚本已在远端加载，跳过注入", domain_id)
-                return (
-                    f"领域 '{domain.name}' 脚本已在远端加载，无需重复加载。\n"
-                    f"可用命令: {', '.join(c.id for c in domain.commands)}"
-                )
-        except (TimeoutError, ConnectionError):
-            logger.debug("探测命令执行异常，继续加载脚本")
+    # 使用公共注入方法（含探测 + 版本检查 + echo 抑制）
+    from src.services.snippet_registry import ensure_snippet_loaded
 
-    # 步骤 2：通过 heredoc 注入脚本
-    loader = registry.build_heredoc_loader(domain_id)
-    if not loader:
-        return f"错误：领域 '{domain_id}' 无可用脚本文件。"
-
-    try:
-        await session.send_input(loader + "\n")
-        # 等待注入确认标记（比通用提示符更精确，避免脚本内容中的 $ # 提前触发）
-        await session.wait_for(
-            pattern=re.escape(SnippetRegistry.INJECT_DONE),
-            timeout=15.0,
-        )
-    except TimeoutError:
-        return f"警告：脚本注入可能超时，但命令可能已经可用。请尝试执行命令验证。"
-    except ConnectionError as e:
-        return f"错误：脚本注入失败 - {e}"
+    error = await ensure_snippet_loaded(session, registry, domain_id)
+    if error:
+        return f"错误：{error}"
 
     logger.info("领域 %s 脚本已注入远端", domain_id)
     return (
@@ -781,52 +746,17 @@ async def run_snippet_command(
 async def _ensure_ft_snippet_loaded(session: "TerminalSession") -> str | None:
     """确保文件传输 snippet 已加载到远端终端。
 
+    委托给公共方法 ensure_snippet_loaded()，仅做薄封装。
+
+    ★ Bugfix #22: 注入前抑制 PTY 回显，避免 base64 刷屏终端（逻辑在公共方法中）。
+
     Returns:
         None 表示已加载成功，字符串表示错误信息。
     """
+    from src.services.snippet_registry import ensure_snippet_loaded
+
     registry = _get_snippet_registry()
-
-    domain = registry.get_domain("ft")
-    if not domain:
-        return "错误：文件传输领域 'ft' 未在 snippets.yaml 中配置。"
-
-    # 探测是否已加载
-    probe = registry.get_probe_command("ft")
-    if probe:
-        try:
-            probe_output = await session.send_command(
-                command=probe,
-                wait_pattern=r"__PROBE_(?:YES|NO)__",
-                timeout=10.0,
-            )
-            last_line = ""
-            for line in reversed(probe_output.splitlines()):
-                stripped = line.strip()
-                if stripped:
-                    last_line = stripped
-                    break
-            if SnippetRegistry.PROBE_YES in last_line:
-                return None  # 已加载
-        except (TimeoutError, ConnectionError):
-            pass
-
-    # 注入脚本
-    loader = registry.build_heredoc_loader("ft")
-    if not loader:
-        return "错误：文件传输脚本文件不存在。"
-
-    try:
-        await session.send_input(loader + "\n")
-        await session.wait_for(
-            pattern=re.escape(SnippetRegistry.INJECT_DONE),
-            timeout=15.0,
-        )
-    except TimeoutError:
-        return "警告：文件传输脚本注入可能超时。"
-    except ConnectionError as e:
-        return f"错误：脚本注入失败 - {e}"
-
-    return None
+    return await ensure_snippet_loaded(session, registry, "ft")
 
 
 @mcp.tool()
