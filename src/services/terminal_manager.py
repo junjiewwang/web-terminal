@@ -20,14 +20,17 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import errno
 import fcntl
 import logging
 import os
 import pty
 import re
+import select
 import signal
 import struct
 import termios
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -464,6 +467,14 @@ class TerminalSession:
         Broker 模式下智能过滤鼠标事件序列：
         - 远端启用了鼠标追踪（如 vim/less/htop）→ 放行鼠标事件，远端处理
         - 远端未启用鼠标追踪（普通 shell）→ 过滤鼠标事件，由 xterm.js 本地处理（如滚动 scrollback）
+
+        ★ 短写保护：os.write() 可能只写入部分数据（尤其是大数据块），
+        此处循环写入确保数据完整到达 PTY。
+
+        ★ EAGAIN 重试保护（Bugfix #18）：
+        PTY 内核缓冲区满时 os.write() 抛出 EAGAIN (errno 11)。
+        之前只 warning 后丢弃数据，导致文件传输 chunk 丢失 → ACK 永远超时。
+        现在使用 select.select() 等待 fd 可写后重试，确保数据完整写入。
         """
         if self._fd is not None and self._running:
             # Broker 模式：根据远端鼠标追踪状态决定是否过滤鼠标事件
@@ -472,9 +483,42 @@ class TerminalSession:
                 if not data:
                     return
             try:
-                os.write(self._fd, data.encode())
-            except OSError as e:
-                logger.warning("PTY 写入失败: %s - %s", self.session_id[:8], e)
+                raw = data.encode()
+                offset = 0
+                deadline = time.monotonic() + 10.0  # 总超时 10 秒
+                while offset < len(raw):
+                    try:
+                        written = os.write(self._fd, raw[offset:])
+                        if written <= 0:
+                            logger.warning("PTY 写入返回 0: %s", self.session_id[:8])
+                            break
+                        offset += written
+                    except OSError as e:
+                        if e.errno == errno.EAGAIN:
+                            # PTY 缓冲区满，等待 fd 可写后重试
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                logger.error(
+                                    "PTY 写入超时 (EAGAIN): %s - 已写 %d/%d 字节",
+                                    self.session_id[:8], offset, len(raw),
+                                )
+                                break
+                            # select 等待 fd 变为可写（最多等剩余超时时间）
+                            _, wlist, _ = select.select(
+                                [], [self._fd], [], min(remaining, 1.0),
+                            )
+                            if not wlist:
+                                logger.debug(
+                                    "PTY select 等待可写超时，继续重试: %s",
+                                    self.session_id[:8],
+                                )
+                            # 无论 select 结果如何，循环顶部会再尝试 os.write
+                        else:
+                            # 非 EAGAIN 的 OSError，无法恢复
+                            logger.warning("PTY 写入失败: %s - %s", self.session_id[:8], e)
+                            break
+            except Exception as e:
+                logger.warning("PTY 写入异常: %s - %s", self.session_id[:8], e)
 
     def resize(self, cols: int, rows: int, client_id: str | None = None) -> None:
         """调整 PTY 终端尺寸。

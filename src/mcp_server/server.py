@@ -12,6 +12,10 @@ PTY 模式工具：
   - disconnect: 断开连接
 
   - list_hosts: 列出可用主机
+
+文件传输工具（基于 PTY 通道，支持多跳 SSH）：
+  - upload_file: 上传本地文件到远端节点
+  - download_file: 从远端节点下载文件到本地
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -28,9 +33,13 @@ from src.models.host import Host, HostResponse
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
+from src.services.pty_file_transfer import PtyFileTransfer, TransferResult
 from src.services.snippet_registry import SnippetRegistry
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
+
+if TYPE_CHECKING:
+    from src.services.terminal_manager import TerminalSession
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +72,11 @@ mcp = FastMCP(
         "排障脚本工具：\n"
         "1. list_snippet_domains 查看可用排障领域（ES/K8s/MySQL/Redis 等）\n"
         "2. load_snippet_domain 将排障脚本加载到远端终端（自动检测是否已加载）\n"
-        "3. run_snippet_command 执行排障命令（自动填参数、配置超时）"
+        "3. run_snippet_command 执行排障命令（自动填参数、配置超时）\n\n"
+        "文件传输工具（多跳节点，无需 SCP 直连）：\n"
+        "1. 先 load_snippet_domain 加载 'ft' 域到目标终端\n"
+        "2. upload_file 上传本地文件到远端节点\n"
+        "3. download_file 从远端节点下载文件到本地"
     ),
 )
 
@@ -760,3 +773,187 @@ async def run_snippet_command(
     })
 
     return output
+
+
+# ── 文件传输工具 ──────────────────────────────
+
+
+async def _ensure_ft_snippet_loaded(session: "TerminalSession") -> str | None:
+    """确保文件传输 snippet 已加载到远端终端。
+
+    Returns:
+        None 表示已加载成功，字符串表示错误信息。
+    """
+    registry = _get_snippet_registry()
+
+    domain = registry.get_domain("ft")
+    if not domain:
+        return "错误：文件传输领域 'ft' 未在 snippets.yaml 中配置。"
+
+    # 探测是否已加载
+    probe = registry.get_probe_command("ft")
+    if probe:
+        try:
+            probe_output = await session.send_command(
+                command=probe,
+                wait_pattern=r"__PROBE_(?:YES|NO)__",
+                timeout=10.0,
+            )
+            last_line = ""
+            for line in reversed(probe_output.splitlines()):
+                stripped = line.strip()
+                if stripped:
+                    last_line = stripped
+                    break
+            if SnippetRegistry.PROBE_YES in last_line:
+                return None  # 已加载
+        except (TimeoutError, ConnectionError):
+            pass
+
+    # 注入脚本
+    loader = registry.build_heredoc_loader("ft")
+    if not loader:
+        return "错误：文件传输脚本文件不存在。"
+
+    try:
+        await session.send_input(loader + "\n")
+        await session.wait_for(
+            pattern=re.escape(SnippetRegistry.INJECT_DONE),
+            timeout=15.0,
+        )
+    except TimeoutError:
+        return "警告：文件传输脚本注入可能超时。"
+    except ConnectionError as e:
+        return f"错误：脚本注入失败 - {e}"
+
+    return None
+
+
+@mcp.tool()
+async def upload_file(
+    session_id: str,
+    local_path: str,
+    remote_path: str,
+    timeout: int | None = None,
+    verify: bool = True,
+) -> str:
+    """上传本地文件到远端节点
+
+    通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
+    文件通过 base64 编码分块传输，自动进行 MD5 完整性校验。
+
+    前提条件：终端会话已连接到目标节点。
+
+    性能参考：
+    - 传输速率约 50-200 KB/s
+    - 推荐文件大小 ≤ 10MB，超过 10MB 建议使用其他方式传输
+
+    Args:
+        session_id: 终端会话 ID（由 connect_host 返回）
+        local_path: 本地文件路径
+        remote_path: 远端目标路径（如 /tmp/app.tar.gz）
+        timeout: 超时秒数（不传则根据文件大小自动计算）
+        verify: 传输后是否 MD5 校验（默认 True）
+
+    Returns:
+        传输结果（包含文件大小、MD5 等信息）
+    """
+    mgr = _get_terminal_manager()
+
+    session = mgr.get_session_by_id(session_id)
+    if not session:
+        return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
+    if not session.running:
+        return f"错误：会话 {session_id} 已断开。请重新连接。"
+
+    # 自动加载 ft snippet
+    load_err = await _ensure_ft_snippet_loaded(session)
+    if load_err:
+        return load_err
+
+    await _publish_event("command_start", session_id, session.instance_name, {
+        "command": f"[upload] {local_path} → {remote_path}",
+    })
+
+    transfer = PtyFileTransfer(session)
+    result: TransferResult = await transfer.upload(
+        local_path=local_path,
+        remote_path=remote_path,
+        timeout=timeout,
+        verify=verify,
+    )
+
+    event_type = "command_complete" if result.success else "command_error"
+    await _publish_event(event_type, session_id, session.instance_name, {
+        "command": f"[upload] {local_path} → {remote_path}",
+        "file_size": result.file_size,
+        "md5": result.md5,
+        "success": result.success,
+    })
+
+    return result.message
+
+
+@mcp.tool()
+async def download_file(
+    session_id: str,
+    remote_path: str,
+    local_path: str,
+    timeout: int | None = None,
+    verify: bool = True,
+) -> str:
+    """从远端节点下载文件到本地
+
+    通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
+    文件通过 base64 编码分块接收，自动进行 MD5 完整性校验。
+
+    前提条件：终端会话已连接到目标节点。
+
+    性能参考：
+    - 传输速率约 50-200 KB/s
+    - 推荐文件大小 ≤ 10MB，超过 10MB 建议使用其他方式传输
+
+    Args:
+        session_id: 终端会话 ID（由 connect_host 返回）
+        remote_path: 远端文件路径（如 /var/log/app.log）
+        local_path: 本地保存路径
+        timeout: 超时秒数（不传则根据文件大小自动计算）
+        verify: 是否 MD5 校验（默认 True）
+
+    Returns:
+        传输结果（包含文件大小、MD5 等信息）
+    """
+    mgr = _get_terminal_manager()
+
+    session = mgr.get_session_by_id(session_id)
+    if not session:
+        return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
+    if not session.running:
+        return f"错误：会话 {session_id} 已断开。请重新连接。"
+
+    # 自动加载 ft snippet
+    load_err = await _ensure_ft_snippet_loaded(session)
+    if load_err:
+        return load_err
+
+    await _publish_event("command_start", session_id, session.instance_name, {
+        "command": f"[download] {remote_path} → {local_path}",
+    })
+
+    transfer = PtyFileTransfer(session)
+    result: TransferResult = await transfer.download(
+        remote_path=remote_path,
+        local_path=local_path,
+        timeout=timeout,
+        verify=verify,
+    )
+
+    event_type = "command_complete" if result.success else "command_error"
+    await _publish_event(event_type, session_id, session.instance_name, {
+        "command": f"[download] {remote_path} → {local_path}",
+        "file_size": result.file_size,
+        "md5": result.md5,
+        "success": result.success,
+    })
+
+    return result.message
