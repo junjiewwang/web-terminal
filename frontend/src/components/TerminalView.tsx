@@ -20,6 +20,7 @@ import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
 import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
 import SnippetPanel from "./SnippetPanel";
+import FileTransferPanel from "./FileTransferPanel";
 
 // xterm.js 样式（必须导入，否则终端无法正确渲染）
 import "@xterm/xterm/css/xterm.css";
@@ -53,11 +54,15 @@ export default function TerminalView({
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [wsUrl, setWsUrl] = useState<string | null>(null);
+  /** 当前终端会话 ID（从 wsUrl 或 startTerminal 响应中获取） */
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const prevHostIdRef = useRef<number | null>(null);
   /** 当前会话实际使用的 backend（从后端响应中获取） */
   const [currentBackend, setCurrentBackend] = useState<TerminalBackend | null>(backend ?? null);
   /** SnippetPanel 展开状态 */
   const [snippetPanelOpen, setSnippetPanelOpen] = useState(false);
+  /** FileTransferPanel 展开状态 */
+  const [fileTransferPanelOpen, setFileTransferPanelOpen] = useState(false);
 
   // ── scrollback 历史回放标志 ──
   // 当正在回放 scrollback 时，屏蔽 xterm.js 的 onData 输出到 WebSocket，
@@ -169,6 +174,7 @@ export default function TerminalView({
     setStatus("starting");
     setError(null);
     setWsUrl(null);
+    setSessionId(null);
 
     try {
       const instance: TerminalInstance = await startTerminal(targetHost.id, requestBackend);
@@ -181,6 +187,7 @@ export default function TerminalView({
       // 记录后端实际使用的 backend
       setCurrentBackend(instance.backend);
 
+      setSessionId(instance.session_id);
       setWsUrl(instance.ws_url);
       setStatus("connecting");
     } catch (err) {
@@ -233,6 +240,9 @@ export default function TerminalView({
 
     // 如果外部传入了 wsUrl（Agent 已创建会话 或 backend 切换后），直接连接 WebSocket
     if (initialWsUrl) {
+      // 从 wsUrl 中提取 sessionId（格式: /ws/terminal/{session_id}）
+      const parts = initialWsUrl.split("/");
+      setSessionId(parts[parts.length - 1] || null);
       setWsUrl(initialWsUrl);
       setStatus("connecting");
     } else {
@@ -265,6 +275,8 @@ export default function TerminalView({
         onReconnect={() => connectToHost(host)}
         snippetPanelOpen={snippetPanelOpen}
         onToggleSnippet={() => setSnippetPanelOpen((prev) => !prev)}
+        fileTransferPanelOpen={fileTransferPanelOpen}
+        onToggleFileTransfer={() => setFileTransferPanelOpen((prev) => !prev)}
       />
 
       {/* 终端容器 */}
@@ -325,6 +337,18 @@ export default function TerminalView({
           />
         </div>
       )}
+
+      {/* FileTransferPanel — 底部展开面板 */}
+      {fileTransferPanelOpen && isActive && sessionId && (
+        <div className="h-[280px] shrink-0 relative">
+          <FileTransferPanel
+            sessionId={sessionId}
+            visible={fileTransferPanelOpen}
+            onClose={() => setFileTransferPanelOpen(false)}
+            isConnected={status === "connected"}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -353,6 +377,8 @@ function _StatusBar({
   onReconnect,
   snippetPanelOpen,
   onToggleSnippet,
+  fileTransferPanelOpen,
+  onToggleFileTransfer,
 }: {
   host: Host;
   status: ConnectionStatus;
@@ -361,6 +387,8 @@ function _StatusBar({
   onReconnect?: () => void;
   snippetPanelOpen: boolean;
   onToggleSnippet: () => void;
+  fileTransferPanelOpen: boolean;
+  onToggleFileTransfer: () => void;
 }) {
   const cfg = STATUS_MAP[status];
   const backendCfg = backend ? BACKEND_CONFIG[backend] : null;
@@ -381,6 +409,20 @@ function _StatusBar({
         )}
       </span>
       <div className="ml-3 flex items-center gap-2 shrink-0">
+        {/* 文件传输面板切换按钮 */}
+        <button
+          type="button"
+          onClick={onToggleFileTransfer}
+          className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
+            fileTransferPanelOpen
+              ? "bg-blue-500/15 text-blue-400 border border-blue-500/30"
+              : "text-gray-500 hover:text-blue-400 hover:bg-white/5"
+          }`}
+          title={fileTransferPanelOpen ? "收起文件传输" : "打开文件传输"}
+        >
+          📁 Files
+        </button>
+
         {/* Snippet 面板切换按钮 */}
         <button
           type="button"

@@ -366,3 +366,50 @@ domains:
             description: Pod 所在命名空间（默认同 secret-ns，跨 ns 时单独指定）
             default: ""
             required: false
+
+  # ── File Transfer ──────────────────────────
+  - id: ft
+    name: File Transfer
+    icon: "📁"
+    description: 基于 PTY 通道的文件传输工具（多跳节点文件上传/下载，无需 SCP 直连）
+    script_file: snippets/file-transfer-snippet.sh
+    default_timeout: 120
+    tags:
+      - transfer
+      - utility
+    commands:
+      - id: ft_recv
+        name: 接收文件
+        description: 进入接收模式，等待 base64 数据块写入本地文件（由 upload_file MCP 工具自动调用）
+        syntax: "ft_recv <path>"
+        template: "ft_recv '{{path}}'"
+        timeout: 300
+        params:
+          - name: path
+            description: 远端目标文件路径
+            required: true
+
+      - id: ft_send
+        name: 发送文件
+        description: 将本地文件按块 base64 编码输出到 PTY（由 download_file MCP 工具自动调用）
+        syntax: "ft_send <path> [chunk_kb]"
+        template: "ft_send '{{path}}' {{chunk_kb}}"
+        timeout: 300
+        params:
+          - name: path
+            description: 远端源文件路径
+            required: true
+          - name: chunk_kb
+            description: 每块大小（KB），默认 48
+            default: "48"
+            required: false
+
+      - id: ft_checksum
+        name: 校验文件
+        description: 计算文件 MD5/SHA256 校验和
+        syntax: "ft_checksum <path>"
+        template: "ft_checksum '{{path}}'"
+        params:
+          - name: path
+            description: 文件路径
+            required: true

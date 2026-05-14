@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from src.api import events, hosts, sessions, tmux
 from src.api import terminal as terminal_api
 from src.api import snippets as snippets_api
+from src.api import file_transfer as file_transfer_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
 from src.models.database import async_session_factory, init_db
 from src.services.host_manager import HostManager
@@ -75,6 +76,7 @@ async def lifespan(app: FastAPI):
     terminal_api.terminal_manager = terminal_manager
     terminal_api.tmux_manager = tmux_manager_instance
     snippets_api.snippet_registry = snippet_registry
+    file_transfer_api.terminal_manager = terminal_manager
 
     # 初始化 MCP Server 依赖
     init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance, snippet_registry=snippet_registry)
@@ -329,6 +331,7 @@ app.include_router(events.router)
 app.include_router(terminal_api.router)
 app.include_router(tmux.router)
 app.include_router(snippets_api.router)
+app.include_router(file_transfer_api.router)
 
 # ── 挂载 MCP Server（SSE 模式）──────────────
 # FastMCP 通过 streamable_http 模式挂载到 /mcp 路径

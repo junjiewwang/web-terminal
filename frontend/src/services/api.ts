@@ -645,6 +645,208 @@ export function validateSnippetParams(
     .map((p) => p.name);
 }
 
+// ── 文件传输 API ──────────────────────────────
+
+/** 文件上传最终结果 */
+export interface FileUploadResponse {
+  success: boolean;
+  remote_path: string;
+  file_size: number;
+  md5: string;
+  message: string;
+}
+
+/** PTY 传输进度事件（SSE 推送） */
+export interface PtyTransferProgress {
+  state: string;          // "transferring" | "verifying"
+  transferred: number;    // 已传输字节数
+  total: number;          // 总字节数
+  chunks_sent: number;
+  chunks_total: number;
+  percentage: number;     // 0-100
+  sub_step: string;       // 校验子步骤: "decoding" | "checksumming" | ""
+  // ★ O2 压缩信息
+  compressed: boolean;    // 是否启用了 gzip 压缩传输
+  original_bytes: number; // 原始文件大小（未压缩）
+  compressed_bytes: number; // 压缩后大小（0 表示未压缩）
+  compression_ratio: number; // 压缩率百分比（如 62.5 = 节省 62.5%）
+}
+
+/** PTY 传输进度回调 */
+export type PtyProgressCallback = (progress: PtyTransferProgress) => void;
+
+/**
+ * 上传文件到远端节点（SSE 流式进度）
+ *
+ * 使用 fetch 发送 multipart POST，后端返回 SSE 事件流：
+ * - event: progress → PTY 传输进度（chunks, percentage, speed）
+ * - event: complete → 传输成功
+ * - event: error    → 传输失败
+ *
+ * @param sessionId - 终端会话 ID
+ * @param file - 要上传的 File 对象
+ * @param remotePath - 远端目标路径
+ * @param onPtyProgress - PTY 传输进度回调（阶段2）
+ * @param signal - AbortSignal（用于取消）
+ */
+export async function uploadFile(
+  sessionId: string,
+  file: File,
+  remotePath?: string,
+  onPtyProgress?: PtyProgressCallback,
+  signal?: AbortSignal,
+): Promise<FileUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  if (remotePath?.trim()) {
+    formData.append("remote_path", remotePath.trim());
+  }
+
+  const res = await fetch(`${API_BASE}/terminal/${sessionId}/upload`, {
+    method: "POST",
+    body: formData,
+    signal,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `上传失败: ${res.statusText}`);
+  }
+
+  // 读取 SSE 事件流
+  if (!res.body) {
+    throw new Error("服务器未返回事件流");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: FileUploadResponse | null = null;
+  let errorMsg = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // 按空行分割 SSE 事件
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+
+      for (const part of parts) {
+        if (!part.trim()) continue;
+
+        let eventType = "";
+        let eventData = "";
+
+        for (const line of part.split("\n")) {
+          if (line.startsWith("event:")) {
+            eventType = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            eventData = line.slice(5).trim();
+          }
+        }
+
+        if (!eventData) continue;
+
+        try {
+          const parsed = JSON.parse(eventData);
+
+          switch (eventType) {
+            case "progress":
+              onPtyProgress?.(parsed as PtyTransferProgress);
+              break;
+            case "complete":
+              result = parsed as FileUploadResponse;
+              break;
+            case "error":
+              errorMsg = parsed.message || "传输失败";
+              result = parsed as FileUploadResponse;
+              break;
+          }
+        } catch {
+          console.warn("SSE 事件解析失败:", eventData);
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (errorMsg && !result?.success) {
+    throw new Error(errorMsg);
+  }
+
+  if (!result) {
+    throw new Error("未收到传输结果");
+  }
+
+  return result;
+}
+
+/**
+ * 取消正在进行的文件上传
+ *
+ * 通知后端取消 PTY 传输并向远端发送 Ctrl+C 中断 ft_recv。
+ * 三层取消：abort SSE 流 + cancel asyncio task + Ctrl+C PTY。
+ *
+ * @param sessionId - 终端会话 ID
+ */
+export async function cancelUpload(sessionId: string): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/terminal/${sessionId}/upload/cancel`, {
+      method: "POST",
+    });
+  } catch {
+    // 取消请求本身失败不需要阻塞用户（SSE abort 已经触发了后端清理）
+    console.warn("取消上传请求发送失败");
+  }
+}
+
+/**
+ * 从远端节点下载文件
+ *
+ * 触发浏览器文件下载（通过创建隐藏 <a> 标签）。
+ *
+ * @param sessionId - 终端会话 ID
+ * @param remotePath - 远端文件路径
+ */
+export async function downloadFile(
+  sessionId: string,
+  remotePath: string,
+): Promise<void> {
+  const url = `${API_BASE}/terminal/${sessionId}/download?remote_path=${encodeURIComponent(remotePath)}`;
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `下载失败: ${res.statusText}`);
+  }
+
+  // 从响应头获取文件名
+  const disposition = res.headers.get("content-disposition") || "";
+  const filenameMatch = disposition.match(/filename="?([^";\n]+)"?/);
+  const filename = filenameMatch?.[1] || remotePath.split("/").pop() || "download";
+
+  // 创建 Blob URL 触发浏览器下载
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = filename;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+
+  // 清理
+  requestAnimationFrame(() => {
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(blobUrl);
+  });
+}
+
 // ── SSE 事件订阅（模块级单例 · fetch + ReadableStream 实现）──
 
 /**
