@@ -294,8 +294,11 @@ class SnippetRegistry:
     def get_version_probe_command(self, domain_id: str) -> str | None:
         """获取检测远端脚本版本号的探测命令。
 
-        在远端 echo 版本变量的值，格式：__PROBE_VER__:<version>
-        如果变量未定义（脚本未加载或旧版本无版本号），输出 __PROBE_VER__:none
+        在远端 echo 版本变量的值，格式：__PROBE_VER_RESULT__:<version>
+        如果变量未定义（脚本未加载或旧版本无版本号），输出 __PROBE_VER_RESULT__:none
+
+        ★ Bugfix #21: 使用 __PROBE_VER_RESULT__ 而非 __PROBE_VER__ 作为输出标记，
+        避免 wait_pattern 匹配到命令回显行（回显行含未展开的 ${...}，不含 _RESULT__）。
 
         Returns:
             版本探测命令字符串，或 None（领域不存在）。
@@ -304,8 +307,11 @@ class SnippetRegistry:
         if not domain:
             return None
         var_name = f"__{domain_id.upper()}_SNIPPET_VERSION__"
-        # 使用 ${VAR:-none} 语法：变量未定义时输出 "none"
-        return f'echo "__PROBE_VER__:${{{var_name}:-none}}"'
+        # 使用 _RESULT__ 后缀区分输出行与回显行：
+        #   回显行：echo "__PROBE_VER_RESULT__:${__FT_SNIPPET_VERSION__:-none}"
+        #   输出行：__PROBE_VER_RESULT__:2026.05.14.3
+        # wait_pattern 匹配 _RESULT__:\w 只会命中输出行（版本号以字母/数字开头）
+        return f'echo "__PROBE_VER_RESULT__:${{{var_name}:-none}}"'
 
     # ── Heredoc 注入 ──────────────────────────────
 
@@ -410,3 +416,186 @@ class SnippetRegistry:
                 )
 
         logger.debug("脚本审计通过: %s (%s)", domain.id, domain.script_file)
+
+
+# ── 公共注入逻辑（消除 REST API / MCP server 重复代码）──────
+
+
+async def ensure_snippet_loaded(
+    session,
+    registry: SnippetRegistry,
+    domain_id: str,
+) -> str | None:
+    """确保指定域的 snippet 已加载到远端会话且版本最新。
+
+    三步探测逻辑（避免不必要的重注入）：
+    1. 探测函数是否存在（type <first_command>）
+    2. 如果存在，探测版本号是否与本地一致
+    3. 仅在函数不存在或版本过期时才注入
+
+    ★ Bugfix #21: 修复探测回显/注入超时/日志等问题
+    ★ Bugfix #22c: 注入期间静默 WebSocket 广播，避免 base64 刷屏浏览器终端
+
+    公共方法——REST API 和 MCP server 共同调用，消除重复代码。
+
+    Args:
+        session: TerminalSession 实例（需要 send_input / wait_for / send_command /
+                 _buffer_write_seq / set_ws_muted 方法）
+        registry: SnippetRegistry 实例
+        domain_id: snippet 域 ID（如 "ft"）
+
+    Returns:
+        None 表示加载成功，字符串表示错误信息。
+    """
+    import asyncio
+    import re as _re
+
+    domain = registry.get_domain(domain_id)
+    if not domain:
+        return f"snippet 域 '{domain_id}' 未在 snippets.yaml 中配置"
+
+    need_inject = True
+    inject_reason = "首次注入"
+
+    # ── 步骤 1: 探测函数是否已加载 ──
+    probe = registry.get_probe_command(domain_id)
+    if probe:
+        try:
+            probe_output = await session.send_command(
+                command=probe,
+                wait_pattern=r"__PROBE_(?:YES|NO)__",
+                timeout=10.0,
+            )
+            last_line = _extract_last_nonempty_line(probe_output)
+            if SnippetRegistry.PROBE_YES in last_line:
+                # 函数存在 → 步骤 2: 检查版本号
+                need_inject = False
+                local_version = registry.get_script_version(domain_id)
+                if local_version:
+                    ver_probe = registry.get_version_probe_command(domain_id)
+                    if ver_probe:
+                        try:
+                            ver_output = await session.send_command(
+                                command=ver_probe,
+                                wait_pattern=r"__PROBE_VER_RESULT__:\w",
+                                timeout=5.0,
+                            )
+                            remote_version = _extract_version_from_output(ver_output)
+                            if (
+                                remote_version
+                                and remote_version != "none"
+                                and remote_version == local_version
+                            ):
+                                logger.debug(
+                                    "%s snippet 已是最新版本: %s",
+                                    domain_id, local_version,
+                                )
+                                return None  # 版本一致，无需注入
+                            else:
+                                logger.info(
+                                    "%s snippet 版本过期: 远端=%s, 本地=%s, 将重新注入",
+                                    domain_id,
+                                    remote_version or "unknown",
+                                    local_version,
+                                )
+                                need_inject = True
+                                inject_reason = "版本更新"
+                        except (TimeoutError, ConnectionError):
+                            logger.debug("版本探测超时，将重新注入")
+                            need_inject = True
+                            inject_reason = "版本探测超时"
+                else:
+                    # 本地脚本没有版本号，已加载就够了
+                    return None
+        except (TimeoutError, ConnectionError):
+            pass  # 探测失败，继续注入
+
+    if not need_inject:
+        return None
+
+    # ── 步骤 3: 注入脚本 ──
+    loader = registry.build_heredoc_loader(domain_id)
+    if not loader:
+        return f"{domain_id} 域脚本文件不存在"
+
+    logger.info("注入 %s snippet（%s）", domain_id, inject_reason)
+
+    inject_confirmed = False
+    try:
+        # ★ Bugfix #22c: 静默 WebSocket 广播 ★
+        # 注入期间的 PTY 输出（loader base64 回显、source 输出等）不发送到浏览器。
+        # Agent 缓冲区不受影响，wait_for 仍能检测到 __SNIPPET_INJECTED__ 标记。
+        session.set_ws_muted(True)
+
+        # ★ Bugfix #21d: 使用 _buffer_write_seq 替代 len(_raw_buffer)
+        pre_inject_pos = session._buffer_write_seq
+        await session.send_input(loader + "\n")
+        await session.wait_for(
+            pattern=_re.escape(SnippetRegistry.INJECT_DONE),
+            timeout=15.0,
+            _start_pos=pre_inject_pos,
+        )
+        logger.info("%s snippet 注入完成", domain_id)
+        inject_confirmed = True
+    except TimeoutError:
+        logger.warning(
+            "%s snippet 注入等待确认超时，进行 post-inject 探测验证", domain_id
+        )
+    except ConnectionError as e:
+        return f"脚本注入失败: {e}"
+    finally:
+        # ★ Bugfix #22c: 恢复 WebSocket 广播（无论注入成功/失败/超时）★
+        try:
+            session.set_ws_muted(False)
+        except Exception:
+            logger.debug("恢复 WebSocket 广播失败（会话可能已断开）")
+
+    # ★ Bugfix #21b: 注入超时时，做一次快速 probe 验证
+    if not inject_confirmed and probe:
+        try:
+            verify_output = await session.send_command(
+                command=probe,
+                wait_pattern=r"__PROBE_(?:YES|NO)__",
+                timeout=5.0,
+            )
+            last_line = _extract_last_nonempty_line(verify_output)
+            if SnippetRegistry.PROBE_YES in last_line:
+                logger.info("post-inject 探测确认: %s 函数可用", domain_id)
+                inject_confirmed = True
+            else:
+                logger.error("post-inject 探测确认: %s 函数不可用", domain_id)
+        except (TimeoutError, ConnectionError):
+            logger.error(
+                "post-inject 探测超时，%s snippet 可能未成功加载", domain_id
+            )
+
+    if not inject_confirmed:
+        return (
+            f"{domain_id} 脚本注入失败：注入超时且 post-inject 探测确认函数不可用，"
+            "请检查远端终端状态后重试"
+        )
+
+    return None
+
+
+def _extract_last_nonempty_line(text: str) -> str:
+    """从文本中提取最后一个非空行（避免回显行干扰）。"""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _extract_version_from_output(output: str) -> str | None:
+    """从版本探测输出中提取远端版本号。
+
+    从最后一行向上扫描，过滤回显行残留（含 $ { } 等未展开变量引用）。
+    """
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if "__PROBE_VER_RESULT__:" in stripped:
+            val = stripped.split("__PROBE_VER_RESULT__:", 1)[1].strip()
+            if val and "$" not in val and "{" not in val:
+                return val
+    return None
