@@ -217,6 +217,16 @@ class TerminalSession:
         # Agent 共享缓冲区（与旧 PTYSession 兼容）
         self._raw_buffer: deque[str] = deque(maxlen=self.MAX_BUFFER_LINES)
         self._output_event = asyncio.Event()
+        # ★ Bugfix #21d: 单调递增写入序号，用于 wait_for 增量扫描位置追踪 ★
+        # deque(maxlen=500) 满后 len() 不再增长，wait_for 依赖 len() 做
+        # 增量位置追踪会完全失效（current_len == start_pos → 永远扫描不到新数据）。
+        # _buffer_write_seq 每 append 一行递增 1，确保新数据总能被检测到。
+        self._buffer_write_seq: int = 0
+
+        # ★ Bugfix #22c: WebSocket 输出静默标志 ★
+        # 文件传输/snippet 注入期间，跳过 WebSocket 广播（不让传输协议数据到达浏览器），
+        # 但 Agent 缓冲区（_raw_buffer）和 scrollback 仍正常写入。
+        self._ws_muted: bool = False
 
         # 输出回调（可选，用于 SSE 事件等）
         self._on_output_callbacks: list[Callable[[str], None]] = []
@@ -617,16 +627,26 @@ class TerminalSession:
             self._handle_child_exit(SessionExitReason.PTY_CLOSED)
             return
 
-        # 追加到 scrollback 缓冲区
-        self._append_scrollback(data)
-
         text = data.decode(errors="replace")
 
-        # 追加到 Agent 缓冲区
+        # 追加到 Agent 缓冲区（无论是否静默，wait_for 必须能扫描到所有数据）
         for line in text.split("\n"):
             if line:
                 self._raw_buffer.append(line)
+                self._buffer_write_seq += 1
         self._output_event.set()
+
+        # ★ Bugfix #22c + #23a: WebSocket 静默模式 ★
+        # 文件传输/snippet 注入期间：
+        # - 跳过 scrollback 写入（★ #23a: 防止刷新后回放 base64 乱码到终端）
+        # - 跳过 vterm feed（避免传输数据污染虚拟终端状态）
+        # - 跳过 WebSocket 广播
+        # Agent 缓冲区（_raw_buffer）已在上方正常写入，wait_for 不受影响。
+        if self._ws_muted:
+            return
+
+        # 追加到 scrollback 缓冲区（仅非静默时）
+        self._append_scrollback(data)
 
         # 广播给所有 WebSocket 客户端
         if self._vterm:
@@ -808,6 +828,44 @@ class TerminalSession:
         for cid in dead_client_ids:
             self._ws_clients.pop(cid, None)
 
+    # ── WebSocket 输出静默控制 ─────────────────────
+
+    def set_ws_muted(self, muted: bool) -> None:
+        """控制 WebSocket 广播是否静默（文件传输/snippet 注入时使用）。
+
+        ★ Bugfix #22c + #23a: 应用层输出静默 ★
+
+        PTY 回显的来源分析：
+        - 本地 PTY：SSH 客户端已将本地 PTY 设为 raw mode（-echo），
+          os.write(master_fd) 的数据不会被本地 PTY 回显。
+        - 远端 PTY：SSH 将数据转发到远端 Shell，远端 Shell 的 PTY
+          有 ECHO 开启（交互式 Shell 的默认行为），回显数据通过
+          SSH 传回本地，被 _on_pty_readable() 读取后广播给浏览器。
+        - 远端 `stty -echo` 无法可靠抑制回显：交互式 Shell（Zsh/Oh-My-Zsh）
+          在每次命令执行后会重置 termios 设置，覆盖 `stty -echo` 的效果。
+
+        因此，唯一可靠的方案是在应用层控制：
+        - 静默时（muted=True）：_on_pty_readable() 跳过 WebSocket 广播，
+          浏览器不会看到传输协议数据（base64 chunks、标记等）。
+        - Agent 缓冲区（_raw_buffer）不受影响：wait_for 仍能检测标记和 ACK。
+        - ★ #23a: scrollback 和 vterm 也跳过写入，防止浏览器刷新后
+          回放 base64 乱码数据到终端（之前 scrollback 始终写入）。
+
+        使用场景：
+        - 文件传输 upload：发送 ft_recv 命令和 chunk 数据期间静默
+        - 文件传输 download：发送 ft_send 命令和接收 chunk 数据期间静默
+        - snippet 注入：发送 loader base64 期间静默
+
+        Args:
+            muted: True 静默（跳过 WebSocket 广播），False 恢复正常广播
+        """
+        self._ws_muted = muted
+        logger.debug(
+            "WebSocket 输出 %s: session=%s",
+            "MUTED" if muted else "UNMUTED",
+            self.session_id[:8],
+        )
+
     # ── Agent 共享接口（兼容旧 PTYSession 的 send_input/wait_for/read_screen）──
 
     async def send_input(self, text: str) -> None:
@@ -822,7 +880,16 @@ class TerminalSession:
         timeout: float = 30.0,
         _start_pos: int | None = None,
     ) -> str:
-        """等待 PTY 输出中出现指定模式（Agent 使用，expect 风格）"""
+        """等待 PTY 输出中出现指定模式（Agent 使用，expect 风格）
+
+        ★ Bugfix #21d: _start_pos 语义变更 ★
+        _start_pos 现在接收 _buffer_write_seq 值（单调递增写入序号），
+        而非 len(_raw_buffer)。deque(maxlen=500) 满后 len() 不再增长，
+        旧方案的 len() 比较永远为 False，导致所有 wait_for 超时。
+
+        新方案：用 _buffer_write_seq 追踪已扫描位置，通过偏移公式
+        将 seq 映射到 deque 索引，确保 deque 满后仍能正确扫描新数据。
+        """
         import re
         from src.services.pty_session import is_tmux_status_line, strip_ansi
 
@@ -836,7 +903,8 @@ class TerminalSession:
 
         start_time = asyncio.get_event_loop().time()
         collected_lines: list[str] = []
-        start_pos = _start_pos if _start_pos is not None else len(self._raw_buffer)
+        # ★ Bugfix #21d: 使用 _buffer_write_seq 作为扫描起始位置
+        scan_seq = _start_pos if _start_pos is not None else self._buffer_write_seq
 
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
@@ -847,21 +915,36 @@ class TerminalSession:
                     f"最近输出:\n{collected[-500:]}"
                 )
 
-            current_len = len(self._raw_buffer)
-            if current_len > start_pos:
-                new_lines = list(self._raw_buffer)[start_pos:current_len]
-                start_pos = current_len
+            current_seq = self._buffer_write_seq
+            if current_seq > scan_seq:
+                # 计算 deque 中的可用范围：
+                # deque 保留最近 len(_raw_buffer) 行，对应 seq 范围为
+                #   [current_seq - len(_raw_buffer), current_seq)
+                buf_len = len(self._raw_buffer)
+                oldest_seq = current_seq - buf_len  # deque 中最旧行的 seq
 
-                for line in new_lines:
-                    clean_line = strip_ansi(line)
-                    # 过滤 tmux 状态栏行，避免干扰提示符匹配
-                    if is_tmux_status_line(clean_line):
-                        continue
-                    collected_lines.append(clean_line)
+                # 如果 scan_seq 已被 deque 淘汰（缓冲区溢出），从最旧可用行开始
+                effective_start = max(scan_seq, oldest_seq)
 
-                full_text = "\n".join(collected_lines)
-                if regex.search(full_text):
-                    return full_text
+                # 将 seq 映射到 deque 索引
+                start_idx = effective_start - oldest_seq
+                end_idx = buf_len  # 扫描到 deque 末尾
+
+                if start_idx < end_idx:
+                    new_lines = list(self._raw_buffer)[start_idx:end_idx]
+
+                    for line in new_lines:
+                        clean_line = strip_ansi(line)
+                        # 过滤 tmux 状态栏行，避免干扰提示符匹配
+                        if is_tmux_status_line(clean_line):
+                            continue
+                        collected_lines.append(clean_line)
+
+                    full_text = "\n".join(collected_lines)
+                    if regex.search(full_text):
+                        return full_text
+
+                scan_seq = current_seq
 
             self._output_event.clear()
             remaining = timeout - elapsed
@@ -880,7 +963,8 @@ class TerminalSession:
         timeout: float = 30.0,
     ) -> str:
         """发送命令并等待完成（Agent 使用）"""
-        pre_pos = len(self._raw_buffer)
+        # ★ Bugfix #21d: 使用 _buffer_write_seq 替代 len(_raw_buffer)
+        pre_pos = self._buffer_write_seq
 
         if not command.endswith("\n") and not command.endswith("\r"):
             command += "\r"
