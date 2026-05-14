@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # File Transfer Snippet — PTY 通道文件传输（精简版）
 # 兼容 bash / zsh
-__FT_SNIPPET_VERSION__="2026.05.14.2"
+__FT_SNIPPET_VERSION__="2026.05.14.3"
 
 # ── ft_recv [--compressed] <path> ─────────────
 ft_recv() {

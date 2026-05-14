@@ -35,7 +35,7 @@
 
 ### 性能参数
 
-- 传输模式：**ACK 确认协议**（stop-and-wait） + **-icanon 大 chunk**
+- 传输模式：**ACK 确认协议**（batch-ACK, 每批 5 个 chunk） + **-icanon 大 chunk**
 - 块大小：36KB 原始 → 48KB base64（-icanon 解除 MAX_CANON 限制，且不超过 64KB PTY 内核缓冲区）
 - ACK 超时：10 秒/块（超时自动重传）
 - 最大重传次数：5 次/块
@@ -90,19 +90,19 @@
 ### 架构图
 
 ```
-Agent 上传流程 (ACK 确认协议):
+Agent 上传流程 (batch-ACK 确认协议):
   Agent → PtyFileTransfer.upload()
     1. _ensure_ft_snippet_loaded() — 自动加载 ft snippet
     2. send_input("ft_recv '/path'")
     3. wait_for(__FT_RECV_READY__)
-    4. 循环（stop-and-wait ACK）:
-       a. send_input("__FT_CHUNK__:<seq>:<base64>")
-       b. wait_for(__FT_ACK__:<seq>:OK)
-       c. 如果 CORRUPT/SEQ_ERR → 重传（最多 3 次）
-       d. 如果超时 → 重传
+    4. 批量 ACK 循环（每批 5 个 chunk）:
+       a. 批量发送: send_input("__FT_CHUNK__:<seq>:<base64>") × N
+       b. 批量收集: _collect_batch_acks() 等待 N 个 ACK
+       c. 如果 CORRUPT/SEQ_ERR → 逐个重传失败的 chunk（最多 5 次）
+       d. 如果批量 ACK 超时 → 全批逐个重传
     5. send_input("__FT_EOF__")
     6. wait_for(__FT_RECV_OK__)
-    7. ft_checksum → MD5 校验
+    7. inline md5sum/md5 → MD5 校验
 
 Agent 下载流程:
   Agent ← PtyFileTransfer.download()
@@ -433,6 +433,33 @@ Agent 下载流程:
   - 注入传输量：10.7KB → 2.1KB（节省 80.5%）
   - 注入速度提升约 5 倍（多跳 SSH 场景效果更显著）
 
+### O9: 批量 ACK 传输（pipeline overlap）
+- **问题**：O7 的 stop-and-wait ACK 协议每发一个 chunk 都要等 ACK 回复后才发下一个，
+  Python 端在等 ACK 期间空闲（idle），PTY 通道利用率低。
+  5.8MB 文件 166 chunks × (发送 + RTT) ≈ 166 × (~10ms + ~20ms) ≈ 5s，
+  其中 ~3.3s 是纯等待 ACK 的空闲时间。
+- **方案**：批量发送 + 批量收集 ACK
+  1. **Python 端**每批发送 `_BATCH_SIZE = 5` 个 chunk（chunk 间保留 adaptive delay）
+  2. 批量发送后调用 `_collect_batch_acks()` 一次性收集 5 个 ACK
+  3. **Shell 端不变**：仍逐 chunk 回复 ACK（保留精确错误定位能力）
+  4. 批内失败的 chunk 降级为逐个 stop-and-wait 重传（最多 5 次）
+  5. 自适应延迟策略不变（初始 30ms，行合并翻倍，连续成功减半）
+- **PTY 缓冲区安全分析**：
+  - 5 个 chunk × 49KB base64 = 245KB 文本数据
+  - PTY 内核缓冲区 64KB，但 Shell `read -r` 是串行处理的（读一行 → ACK → 读下一行）
+  - 数据在 PTY 管道中排队，不需要全部同时驻留在 64KB 缓冲区中
+  - Python `os.write()` 在缓冲区满时会阻塞（EAGAIN → select 等待），天然限流
+- **改动文件**：
+  - `pty_file_transfer.py`：
+    - 新增 `_BATCH_SIZE = 5`、`_ACK_TIMEOUT = 15.0` 常量
+    - 新增 `_collect_batch_acks()` 方法（扫描 `_raw_buffer` 收集多个 ACK）
+    - 重写上传循环：外层 while 按批推进，内层处理 ACK 结果 + 失败重传
+  - `file-transfer-snippet.sh`：版本升至 2026.05.14.3（Shell 端逻辑不变）
+- **预估收益**（5.8MB 文件，166 chunks，batch=5）：
+  - 批次数：166/5 = 34 批
+  - 每批 overhead：1 次 ACK 等待（~20ms）vs 原 5 次（~100ms）
+  - 理论加速：~2-3x（主要节省 ACK idle 时间，实际取决于网络 RTT）
+
 ### UX 改进: 校验阶段子步骤进度
 - **需求**：校验阶段（verifying）只显示笼统的"🔍 校验中..."，用户不知道具体在做什么。
   远端校验实际分两步：① base64 解码并写入文件 ② 计算 MD5 校验和。
@@ -488,3 +515,4 @@ Agent 下载流程:
 - 2026-05-14: O3 — 版本化脚本注入：脚本嵌入 `__FT_SNIPPET_VERSION__="2026.05.14.1"` 版本号，探测时三步检查（函数存在 → 版本匹配 → 跳过注入），仅在首次或版本过期时才重新注入，减少不必要的 heredoc 传输
 - 2026-05-14: Bugfix #20 — wait_for 缓冲区扫描竞态条件：`send_input()` 后 Shell 可能在 `wait_for()` 记录 `start_pos` 之前就输出了标记（如 `__FT_RECV_READY__`），导致扫描起始位置跳过目标标记、永远超时。修复：在 `send_input()` 前记录 `pre_pos = len(_raw_buffer)` 并传入 `wait_for(_start_pos=pre_pos)`，与 ACK 循环已有的正确模式保持一致。涉及三处：① upload() 的 RECV_READY ② download() 的 SEND_BEGIN ③ _ensure_ft_snippet_loaded() 的 INJECT_DONE
 - 2026-05-14: O8 — Snippet 精简 + 压缩注入：① 精简 file-transfer-snippet.sh（324行/10.8KB → 104行/3.7KB），删除大段注释、合并 base64 解码重复逻辑、精简变量名；② 移除 `ft_checksum` 函数，改用 Python 端 inline `md5sum/md5` 命令；③ `build_heredoc_loader()` 支持 gzip+base64 压缩注入模式（`echo '<b64>' | base64 -d | gunzip > /tmp/ts-ft.sh`），最终注入传输量 10.7KB → 2.1KB（节省 80.5%）
+- 2026-05-14: O9 — 批量 ACK 传输（pipeline overlap）：从 stop-and-wait 改为每批 5 个 chunk 发送 + 批量收集 ACK，Shell 端逻辑不变（仍逐 chunk 回复 ACK），Python 端新增 `_collect_batch_acks()` 方法 + 重写上传循环，失败 chunk 降级为逐个重传。预估加速 2-3x（主要节省 ACK idle 时间）

@@ -174,10 +174,12 @@ def _compute_timeout(file_size: int, custom_timeout: int | None = None) -> float
 _DEFAULT_CHUNK_SIZE = 36 * 1024  # 36KB raw → 48KB base64
 
 # ── ACK 确认参数 ─────────────────────────────
-# ACK 协议：每发一个 chunk，等 Shell 端回复 __FT_ACK__:<seq>:<status> 后才发下一个。
-# 配合 -icanon 大 chunk：ACK 检测行合并 + 自动重传 = 可靠传输。
-_ACK_TIMEOUT = 10.0    # 单个 ACK 等待超时（秒），超时则重传
-_MAX_RETRIES = 5       # 每个 chunk 最大重传次数
+# O9 批量 ACK：一次发送 _BATCH_SIZE 个 chunk，然后批量收集 ACK。
+# Shell 端仍逐 chunk 回复 ACK（保留精确错误定位），Python 端批量发+批量收。
+# 节省的是 Python 端 ACK 等待间的空闲时间（pipeline overlap）。
+_BATCH_SIZE = 5            # 每批发送 chunk 数（PTY 缓冲区安全范围内：5×49KB=245KB 文本数据）
+_ACK_TIMEOUT = 15.0        # 批量 ACK 总超时（秒），需覆盖 Shell 处理整批的时间
+_MAX_RETRIES = 5           # 每个 chunk 最大重传次数
 
 # ── 动态自适应延迟参数 ─────────────────────────
 # 核心思路：ACK 后需要一个延迟让 PTY 内核缓冲区清空，但最佳延迟值因环境而异。
@@ -354,12 +356,14 @@ class PtyFileTransfer:
                     state=TransferState.FAILED,
                 )
 
-            # 4. 逐块发送 base64 数据（ACK 确认协议 + 自适应延迟）
+            # 4. 批量 ACK 传输（O9 优化）
             chunks = self._split_into_chunks(transfer_data)
             total_chunks = len(chunks)
+            # 预计算所有 chunk 的 base64 编码行
+            chunks_b64: list[tuple[int, bytes, str]] = []  # (seq, raw_chunk, encoded_line)
             logger.info(
-                "分块发送: %d 个块, 块大小=%d (ACK 模式, %s)",
-                total_chunks, self._chunk_size,
+                "分块发送: %d 个块, 块大小=%d, 批大小=%d (batch-ACK, %s)",
+                total_chunks, self._chunk_size, _BATCH_SIZE,
                 "compressed" if use_compression else "raw",
             )
 
@@ -390,56 +394,52 @@ class PtyFileTransfer:
 
             for seq, chunk in enumerate(chunks):
                 b64_data = base64.b64encode(chunk).decode("ascii")
-                chunk_line = f"{Marker.CHUNK}:{seq}:{b64_data}\n"
+                chunks_b64.append((seq, chunk, f"{Marker.CHUNK}:{seq}:{b64_data}\n"))
 
-                # ACK 确认循环：发送 → 等 ACK → 重传（最多 _MAX_RETRIES 次）
-                ack_received = False
-                for retry in range(_MAX_RETRIES + 1):
-                    if retry > 0:
-                        # 重传前：延迟翻倍（指数回退）
-                        current_delay = min(current_delay * 2, _POST_ACK_DELAY_MAX)
-                        consecutive_ok = 0
-                        total_retries += 1
-                        logger.warning(
-                            "chunk %d/%d 第 %d 次重传 (adaptive_delay=%.0fms)",
-                            seq, total_chunks, retry, current_delay * 1000,
-                        )
-                        await asyncio.sleep(current_delay)
+            # ★ O9 批量 ACK 传输循环 ★
+            # 每批发送 _BATCH_SIZE 个 chunk，然后批量收集 ACK。
+            # 失败的 chunk 在批内重传（最多 _MAX_RETRIES 次）。
+            batch_start = 0
+            while batch_start < total_chunks:
+                batch_end = min(batch_start + _BATCH_SIZE, total_chunks)
+                batch = chunks_b64[batch_start:batch_end]
 
-                    # 记录发送前缓冲区位置，ACK 扫描从此处开始
-                    pre_pos = len(self._session._raw_buffer)
-                    await self._session.send_input(chunk_line)
+                # 4a. 批量发送
+                pre_pos = len(self._session._raw_buffer)
+                for _seq, _chunk, _line in batch:
+                    await self._session.send_input(_line)
+                    # chunk 间微延迟，让 PTY 内核缓冲区有时间处理
+                    await asyncio.sleep(current_delay)
 
-                    # 等待 ACK 响应
-                    try:
-                        ack_output = await self._session.wait_for(
-                            pattern=re.escape(Marker.ACK) + r"|" + re.escape(Marker.RECV_ERR),
-                            timeout=_ACK_TIMEOUT,
-                            _start_pos=pre_pos,
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "chunk %d/%d ACK 超时 (%.1fs)，准备重传",
-                            seq, total_chunks, _ACK_TIMEOUT,
-                        )
-                        continue  # 重传
+                # 4b. 批量收集 ACK
+                ack_results: dict[int, str] = {}  # seq → status
+                try:
+                    ack_results = await self._collect_batch_acks(
+                        expected_seqs=[s for s, _, _ in batch],
+                        timeout=_ACK_TIMEOUT,
+                        start_pos=pre_pos,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "批量 ACK 超时 (batch %d-%d, %.1fs)，逐个重传",
+                        batch[0][0], batch[-1][0], _ACK_TIMEOUT,
+                    )
 
-                    # 远端报错（如信号中断）→ 直接失败
-                    if Marker.RECV_ERR in ack_output:
-                        err_msg = self._extract_marker_value(ack_output, Marker.RECV_ERR)
+                # 检查是否有 RECV_ERR（远端致命错误）
+                for _seq, status in ack_results.items():
+                    if status == "_RECV_ERR":
                         return TransferResult(
                             success=False, remote_path=remote_path,
                             local_path=local_path, file_size=file_size,
-                            message=f"远端接收失败 (chunk {seq}): {err_msg}",
+                            message=f"远端接收失败 (chunk {_seq}): {status}",
                             state=TransferState.FAILED,
                         )
 
-                    # 解析 ACK 状态
-                    ack_status = self._parse_ack(ack_output, seq)
-                    if ack_status == Marker.ACK_OK:
-                        ack_received = True
+                # 4c. 处理失败的 chunk：逐个重传
+                for _seq, _chunk, _line in batch:
+                    status = ack_results.get(_seq, "")
+                    if status == Marker.ACK_OK:
                         consecutive_ok += 1
-                        # 连续成功超过阈值 → 尝试减半延迟（加速）
                         if consecutive_ok >= _SPEEDUP_THRESHOLD:
                             old_delay = current_delay
                             current_delay = max(current_delay / 2, _POST_ACK_DELAY_MIN)
@@ -449,48 +449,79 @@ class PtyFileTransfer:
                                     "连续成功 %d 个，延迟减半: %.0fms → %.0fms",
                                     _SPEEDUP_THRESHOLD, old_delay * 1000, current_delay * 1000,
                                 )
-                        # ACK 后自适应延迟
+                        transferred += len(_chunk)
+                        continue
+
+                    # 失败（CORRUPT/SEQ_ERR/超时未收到）：逐个重传
+                    consecutive_ok = 0
+                    retry_ok = False
+                    for retry in range(1, _MAX_RETRIES + 1):
+                        current_delay = min(current_delay * 2, _POST_ACK_DELAY_MAX)
+                        total_retries += 1
+                        logger.warning(
+                            "chunk %d/%d 第 %d 次重传 (status=%s, delay=%.0fms)",
+                            _seq, total_chunks, retry, status, current_delay * 1000,
+                        )
                         await asyncio.sleep(current_delay)
-                        break  # 成功，发下一个 chunk
-                    elif ack_status == Marker.ACK_CORRUPT:
-                        logger.warning("chunk %d/%d 数据损坏，重传", seq, total_chunks)
-                        continue  # 重传
-                    elif ack_status == Marker.ACK_SEQ_ERR:
-                        logger.warning("chunk %d/%d 序列号错误，重传", seq, total_chunks)
-                        continue  # 重传
-                    else:
-                        logger.warning("chunk %d/%d 未知 ACK 状态: %s，重传", seq, total_chunks, ack_status)
-                        continue  # 重传
 
-                if not ack_received:
-                    return TransferResult(
-                        success=False, remote_path=remote_path,
-                        local_path=local_path, file_size=file_size,
-                        message=f"chunk {seq}/{total_chunks} 重传 {_MAX_RETRIES} 次后仍失败 (delay={current_delay*1000:.0f}ms)",
-                        state=TransferState.FAILED,
-                    )
+                        retry_pre = len(self._session._raw_buffer)
+                        await self._session.send_input(_line)
+                        try:
+                            ack_output = await self._session.wait_for(
+                                pattern=re.escape(Marker.ACK) + r"|" + re.escape(Marker.RECV_ERR),
+                                timeout=_ACK_TIMEOUT,
+                                _start_pos=retry_pre,
+                            )
+                        except TimeoutError:
+                            status = "TIMEOUT"
+                            continue
 
-                transferred += len(chunk)
+                        if Marker.RECV_ERR in ack_output:
+                            err_msg = self._extract_marker_value(ack_output, Marker.RECV_ERR)
+                            return TransferResult(
+                                success=False, remote_path=remote_path,
+                                local_path=local_path, file_size=file_size,
+                                message=f"远端接收失败 (chunk {_seq} 重传): {err_msg}",
+                                state=TransferState.FAILED,
+                            )
 
-                # 进度回调
+                        retry_status = self._parse_ack(ack_output, _seq)
+                        if retry_status == Marker.ACK_OK:
+                            retry_ok = True
+                            transferred += len(_chunk)
+                            break
+                        status = retry_status
+
+                    if not retry_ok:
+                        return TransferResult(
+                            success=False, remote_path=remote_path,
+                            local_path=local_path, file_size=file_size,
+                            message=f"chunk {_seq}/{total_chunks} 重传 {_MAX_RETRIES} 次后仍失败 (status={status})",
+                            state=TransferState.FAILED,
+                        )
+
+                # 4d. 批量进度回调
                 if on_progress:
                     on_progress(TransferProgress(
                         state=TransferState.TRANSFERRING,
                         total_bytes=transfer_size,
                         transferred_bytes=transferred,
-                        chunks_sent=seq + 1,
+                        chunks_sent=batch_end,
                         chunks_total=total_chunks,
                         compressed=_is_compressed,
                         original_bytes=_original_bytes,
                         compressed_bytes=_compressed_bytes,
                     ))
 
+                batch_start = batch_end
+
             # 发完所有块后短暂等待
             await asyncio.sleep(0.3)
 
             logger.info(
-                "ACK 传输完成: %d chunks, %d retries, final_delay=%.0fms",
-                total_chunks, total_retries, current_delay * 1000,
+                "batch-ACK 传输完成: %d chunks, %d batches, %d retries, final_delay=%.0fms",
+                total_chunks, (total_chunks + _BATCH_SIZE - 1) // _BATCH_SIZE,
+                total_retries, current_delay * 1000,
             )
 
             # 5. 发送 EOF 标记
@@ -737,6 +768,89 @@ class PtyFileTransfer:
             )
 
     # ── 内部方法 ──────────────────────────────────
+
+    async def _collect_batch_acks(
+        self,
+        expected_seqs: list[int],
+        timeout: float,
+        start_pos: int,
+    ) -> dict[int, str]:
+        """批量收集 ACK 响应（O9 优化）
+
+        从 _raw_buffer 的 start_pos 开始扫描，收集所有期望序列号的 ACK。
+        Shell 端仍逐 chunk 回复 ACK，这里只是批量等待而非逐个等待。
+
+        Args:
+            expected_seqs: 期望收到 ACK 的序列号列表
+            timeout: 总超时（秒）
+            start_pos: 缓冲区扫描起始位置
+
+        Returns:
+            dict[seq, status]：已收到的 ACK 映射（seq → OK/CORRUPT/SEQ_ERR）
+
+        Raises:
+            TimeoutError: 超时前未收齐所有 ACK
+        """
+        from src.services.pty_session import strip_ansi
+
+        results: dict[int, str] = {}
+        pending = set(expected_seqs)
+        prefix = f"{Marker.ACK}:"
+        scan_pos = start_pos
+        deadline = asyncio.get_event_loop().time() + timeout
+
+        while pending:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"批量 ACK 超时 ({timeout}s)，已收到 {len(results)}/{len(expected_seqs)} 个"
+                )
+
+            # 扫描缓冲区中新到达的行
+            current_len = len(self._session._raw_buffer)
+            if current_len > scan_pos:
+                new_lines = list(self._session._raw_buffer)[scan_pos:current_len]
+                scan_pos = current_len
+
+                for line in new_lines:
+                    clean = strip_ansi(line).strip()
+
+                    # 检查 RECV_ERR（致命错误）
+                    if Marker.RECV_ERR in clean:
+                        for seq in pending:
+                            results[seq] = "_RECV_ERR"
+                        return results
+
+                    # 解析 ACK
+                    idx = clean.find(prefix)
+                    if idx < 0:
+                        continue
+                    payload = clean[idx + len(prefix):]
+                    parts = payload.split(":", 2)
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        seq = int(parts[0])
+                    except ValueError:
+                        continue
+                    status = parts[1]
+                    results[seq] = status
+                    pending.discard(seq)
+
+                    if not pending:
+                        return results
+
+            # 等待新输出
+            self._session._output_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._session._output_event.wait(),
+                    timeout=min(remaining, 0.5),
+                )
+            except asyncio.TimeoutError:
+                continue
+
+        return results
 
     def _parse_ack(self, output: str, expected_seq: int) -> str:
         """从 PTY 输出中解析 ACK 状态码
