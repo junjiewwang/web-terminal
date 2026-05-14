@@ -347,23 +347,48 @@ async def _interrupt_pty(session) -> None:
         logger.warning("发送中断命令失败: %s", e)
 
 
-# ── 下载端点 ──────────────────────────────────
+# ── 下载端点（两步式：SSE 进度 + token 取文件）──
 
-@router.get(
+# 已完成下载的临时文件注册表：token → (file_path, filename, expires_at)
+import time
+import secrets
+
+_download_tokens: dict[str, tuple[Path, str, float]] = {}
+_DOWNLOAD_TOKEN_TTL = 120  # token 有效期 120 秒
+
+
+def _register_download_token(file_path: Path, filename: str) -> str:
+    """注册已下载的临时文件，返回一次性 token"""
+    token = secrets.token_urlsafe(16)
+    _download_tokens[token] = (file_path, filename, time.time() + _DOWNLOAD_TOKEN_TTL)
+    # 清理过期 token
+    now = time.time()
+    expired = [k for k, (_, _, exp) in _download_tokens.items() if exp < now]
+    for k in expired:
+        p, _, _ = _download_tokens.pop(k)
+        if p.exists():
+            p.unlink()
+    return token
+
+
+@router.post(
     "/api/terminal/{session_id}/download",
-    summary="从远端节点下载文件",
+    summary="从远端节点下载文件（SSE 流式进度）",
 )
 async def download_file(
     session_id: str,
     remote_path: str = Query(..., description="远端文件路径"),
 ):
-    """从远端节点下载文件到浏览器。
+    """从远端节点下载文件，返回 SSE 事件流实时推送下载进度。
 
-    流程：
-    1. 查找对应终端会话
-    2. 确保 ft snippet 已加载
-    3. 使用 PtyFileTransfer 执行下载到本地临时目录
-    4. 返回文件流给浏览器
+    SSE 事件：
+    - event: progress  — 下载进度（含 state/transferred/total/percentage）
+    - event: complete  — 下载完成（含 token，前端用 token 发 GET 请求取文件）
+    - event: error     — 下载失败
+
+    前端流程：
+    1. POST /download?remote_path=... → 读取 SSE 流显示进度
+    2. 收到 complete 事件 → GET /download/{token} 触发浏览器下载
     """
     mgr = _get_terminal_manager()
 
@@ -386,45 +411,166 @@ async def download_file(
     # 临时保存路径
     temp_file = _TEMP_DIR / f"{session_id}_dl_{filename}"
 
-    try:
-        # 确保 ft snippet 已加载到远端
-        await _ensure_ft_snippet_loaded(session)
+    async def _sse_download_generator():
+        """SSE 事件生成器：执行下载并实时推送进度"""
+        progress_queue: asyncio.Queue[TransferProgress | None] = asyncio.Queue()
 
-        # 执行下载
-        transfer = PtyFileTransfer(session)
-        result: TransferResult = await transfer.download(
-            remote_path=remote_path,
-            local_path=str(temp_file),
-            verify=True,
-        )
+        def _on_progress(p: TransferProgress) -> None:
+            progress_queue.put_nowait(p)
 
-        if not result.success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.message,
-            )
+        async def _do_download() -> TransferResult:
+            try:
+                await _ensure_ft_snippet_loaded(session)
+                transfer = PtyFileTransfer(session)
+                return await transfer.download(
+                    remote_path=remote_path,
+                    local_path=str(temp_file),
+                    verify=True,
+                    on_progress=_on_progress,
+                )
+            except asyncio.CancelledError:
+                return TransferResult(
+                    success=False, remote_path=remote_path,
+                    local_path=str(temp_file),
+                    message="下载已取消",
+                    state=TransferState.FAILED,
+                )
+            except Exception as e:
+                return TransferResult(
+                    success=False, remote_path=remote_path,
+                    local_path=str(temp_file),
+                    message=f"下载异常: {e}",
+                    state=TransferState.FAILED,
+                )
+            finally:
+                progress_queue.put_nowait(None)
 
-        # 返回文件流
-        return FileResponse(
-            path=str(temp_file),
-            filename=filename,
-            media_type="application/octet-stream",
-            background=_cleanup_temp_file(temp_file),
-        )
+        download_task = asyncio.create_task(_do_download())
 
-    except HTTPException:
-        # 清理临时文件
-        if temp_file.exists():
-            temp_file.unlink()
-        raise
-    except Exception as e:
-        # 清理临时文件
-        if temp_file.exists():
-            temp_file.unlink()
+        def _format_progress(p: TransferProgress) -> str:
+            event_data = {
+                "state": p.state.value,
+                "transferred": p.transferred_bytes,
+                "total": p.total_bytes,
+                "chunks_sent": p.chunks_sent,
+                "chunks_total": p.chunks_total,
+                "percentage": round(p.percentage, 1),
+                "sub_step": p.sub_step,
+                # ★ O12 压缩信息（与上传 SSE 一致）
+                "compressed": p.compressed,
+                "original_bytes": p.original_bytes,
+                "compressed_bytes": p.compressed_bytes,
+                "compression_ratio": round(p.compression_ratio, 1),
+            }
+            return f"event: progress\ndata: {json.dumps(event_data)}\n\n"
+
+        try:
+            while True:
+                try:
+                    progress = await asyncio.wait_for(
+                        progress_queue.get(),
+                        timeout=_SSE_HEARTBEAT_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    # 心跳
+                    yield f"event: heartbeat\ndata: {{}}\n\n"
+                    continue
+
+                if progress is None:
+                    break
+
+                yield _format_progress(progress)
+
+            # 获取最终结果
+            result = await download_task
+
+            if result.success:
+                # 注册临时文件 token
+                token = _register_download_token(temp_file, filename)
+                result_data = {
+                    "success": True,
+                    "token": token,
+                    "filename": filename,
+                    "file_size": result.file_size,
+                    "md5": result.md5,
+                    "message": result.message,
+                }
+                yield f"event: complete\ndata: {json.dumps(result_data)}\n\n"
+            else:
+                # 下载失败，清理临时文件
+                if temp_file.exists():
+                    temp_file.unlink()
+                error_data = {
+                    "success": False,
+                    "message": result.message,
+                }
+                yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+
+        except (asyncio.CancelledError, GeneratorExit):
+            download_task.cancel()
+            try:
+                await download_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            if temp_file.exists():
+                temp_file.unlink()
+        except Exception as e:
+            error_data = {"success": False, "message": f"SSE 流异常: {e}"}
+            yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+            if temp_file.exists():
+                temp_file.unlink()
+
+    return StreamingResponse(
+        _sse_download_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get(
+    "/api/terminal/{session_id}/download/{token}",
+    summary="通过 token 获取已下载的文件",
+)
+async def download_file_by_token(
+    session_id: str,
+    token: str,
+):
+    """用下载完成后返回的 token 获取文件。
+
+    token 一次性有效，使用后自动清理。
+    """
+    entry = _download_tokens.pop(token, None)
+    if not entry:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"下载失败: {e}",
-        ) from e
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="下载 token 无效或已过期",
+        )
+
+    file_path, filename, expires_at = entry
+    if time.time() > expires_at:
+        if file_path.exists():
+            file_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="下载 token 已过期",
+        )
+
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="临时文件不存在",
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/octet-stream",
+        background=_cleanup_temp_file(file_path),
+    )
 
 
 # ── 内部工具函数 ──────────────────────────────
@@ -432,16 +578,11 @@ async def download_file(
 async def _ensure_ft_snippet_loaded(session) -> None:
     """确保 ft (file-transfer) snippet 已加载到远端会话且版本最新。
 
-    三步探测逻辑（避免不必要的重注入）：
-    1. 探测函数是否存在（type ft_recv）
-    2. 如果存在，探测版本号是否与本地一致
-    3. 仅在函数不存在或版本过期时才注入
+    委托给公共方法 ensure_snippet_loaded()，仅负责错误格式转换（→ HTTPException）。
 
-    使用与 MCP server 完全一致的 SnippetRegistry 接口。
+    ★ Bugfix #22: 注入前抑制 PTY 回显，避免 base64 刷屏终端（逻辑在公共方法中）。
     """
-    import re as _re
-
-    from src.services.snippet_registry import SnippetRegistry
+    from src.services.snippet_registry import ensure_snippet_loaded
 
     # 获取全局 snippet_registry 实例
     from src.main import snippet_registry
@@ -452,98 +593,12 @@ async def _ensure_ft_snippet_loaded(session) -> None:
             detail="Snippet Registry 未初始化，无法执行文件传输",
         )
 
-    need_inject = True  # 默认需要注入
-
-    # 步骤 1：探测 ft snippet 函数是否已加载
-    probe = snippet_registry.get_probe_command("ft")
-    if probe:
-        try:
-            probe_output = await session.send_command(
-                command=probe,
-                wait_pattern=r"__PROBE_(?:YES|NO)__",
-                timeout=10.0,
-            )
-            # 只检查最后一行（避免回显行干扰）
-            last_line = ""
-            for line in reversed(probe_output.splitlines()):
-                stripped = line.strip()
-                if stripped:
-                    last_line = stripped
-                    break
-            if SnippetRegistry.PROBE_YES in last_line:
-                # 函数存在 → 步骤 2：检查版本号
-                need_inject = False  # 暂时标记为不需要
-                local_version = snippet_registry.get_script_version("ft")
-                if local_version:
-                    ver_probe = snippet_registry.get_version_probe_command("ft")
-                    if ver_probe:
-                        try:
-                            ver_output = await session.send_command(
-                                command=ver_probe,
-                                wait_pattern=r"__PROBE_VER__:",
-                                timeout=5.0,
-                            )
-                            # 从输出中提取版本号
-                            remote_version = None
-                            for line in reversed(ver_output.splitlines()):
-                                stripped = line.strip()
-                                if "__PROBE_VER__:" in stripped:
-                                    remote_version = stripped.split("__PROBE_VER__:", 1)[1].strip()
-                                    break
-                            if remote_version and remote_version != "none" and remote_version == local_version:
-                                logger.debug(
-                                    "ft snippet 已是最新版本: %s", local_version,
-                                )
-                                return  # 版本一致，无需注入
-                            else:
-                                logger.info(
-                                    "ft snippet 版本过期: 远端=%s, 本地=%s, 将重新注入",
-                                    remote_version or "unknown", local_version,
-                                )
-                                need_inject = True
-                        except (TimeoutError, ConnectionError):
-                            logger.debug("版本探测超时，将重新注入")
-                            need_inject = True
-                else:
-                    # 本地脚本没有版本号（不应发生），已加载就够了
-                    return
-        except (TimeoutError, ConnectionError):
-            pass  # 探测失败，继续注入
-
-    if not need_inject:
-        return
-
-    # 步骤 3：注入脚本（使用 heredoc 写入 /tmp/ 并 source）
-    loader = snippet_registry.build_heredoc_loader("ft")
-    if not loader:
+    error = await ensure_snippet_loaded(session, snippet_registry, "ft")
+    if error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ft 域脚本文件不存在，无法执行文件传输",
+            detail=error,
         )
-
-    logger.info("注入 ft snippet（%s）",
-                "版本更新" if not need_inject else "首次注入")
-
-    try:
-        # ★ Bugfix #20: 记录发送前的缓冲区位置，避免 wait_for 竞态 ★
-        # heredoc 注入后 Shell 可能快速输出 __SNIPPET_INJECTED__，
-        # 在 wait_for 记录 start_pos 之前就已到达 buffer。
-        pre_inject_pos = len(session._raw_buffer)
-        await session.send_input(loader + "\n")
-        await session.wait_for(
-            pattern=_re.escape(SnippetRegistry.INJECT_DONE),
-            timeout=15.0,
-            _start_pos=pre_inject_pos,
-        )
-        logger.info("ft snippet 注入完成")
-    except TimeoutError:
-        # 注入超时，可能网络慢或 shell 处理慢，记录日志但不阻塞
-        logger.warning("ft snippet 注入可能超时，继续尝试执行")
-    except ConnectionError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"ft 脚本注入失败: {e}",
-        ) from e
 
 
 class _BackgroundCleanup:
