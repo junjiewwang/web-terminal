@@ -47,7 +47,7 @@ class SnippetRegistry:
     _DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
         re.compile(r"\brm\s+-rf\s+/"),          # rm -rf /
         re.compile(r"\bmkfs\b"),                 # 格式化磁盘
-        re.compile(r"\bdd\s+if="),               # dd 覆写
+        re.compile(r"\bdd\b.*\bof=/dev/"),       # dd 覆写磁盘设备（dd if=读取是安全的）
         re.compile(r">\s*/dev/sd"),              # 直写磁盘设备
         re.compile(r"\bcurl\b.*\|\s*bash"),      # curl | bash（远程代码执行）
         re.compile(r"\bwget\b.*\|\s*bash"),      # wget | bash
@@ -96,12 +96,18 @@ class SnippetRegistry:
 
         config = SnippetsConfig.model_validate(raw or {})
 
-        # 安全审计：校验每个脚本文件
+        # 安全审计：逐域校验脚本文件，失败的域跳过（不影响其他域）
+        valid_domains: list[SnippetDomain] = []
         for domain in config.domains:
             if domain.script_file:
-                self._audit_script(domain)
+                try:
+                    self._audit_script(domain)
+                except ScriptAuditError as e:
+                    logger.error("域 '%s' 脚本审计失败，已跳过: %s", domain.id, e)
+                    continue
+            valid_domains.append(domain)
 
-        self._domains = {d.id: d for d in config.domains}
+        self._domains = {d.id: d for d in valid_domains}
         logger.info(
             "Snippet Registry 加载完成: %d 个领域 (%s)",
             len(self._domains),
@@ -245,6 +251,27 @@ class SnippetRegistry:
     PROBE_YES = "__PROBE_YES__"
     PROBE_NO = "__PROBE_NO__"
 
+    # ── 版本号常量（脚本中嵌入 __<DOMAIN_ID>_SNIPPET_VERSION__="..." ）
+    _VERSION_PATTERN = re.compile(r'__(\w+)_SNIPPET_VERSION__="([^"]+)"')
+
+    def get_script_version(self, domain_id: str) -> str | None:
+        """从脚本内容中提取版本号。
+
+        脚本中需要包含如下格式的版本声明（大小写不敏感的 domain_id）：
+            __FT_SNIPPET_VERSION__="2026.05.14.1"
+
+        Returns:
+            版本号字符串，或 None（脚本无版本声明）。
+        """
+        content = self.get_script_content(domain_id)
+        if not content:
+            return None
+        for match in self._VERSION_PATTERN.finditer(content):
+            # 匹配 domain_id（大小写不敏感）
+            if match.group(1).upper() == domain_id.upper():
+                return match.group(2)
+        return None
+
     def get_probe_command(self, domain_id: str) -> str | None:
         """获取检测脚本是否已在远端加载的探测命令。
 
@@ -264,24 +291,79 @@ class SnippetRegistry:
             f"|| echo '{self.PROBE_NO}'"
         )
 
+    def get_version_probe_command(self, domain_id: str) -> str | None:
+        """获取检测远端脚本版本号的探测命令。
+
+        在远端 echo 版本变量的值，格式：__PROBE_VER__:<version>
+        如果变量未定义（脚本未加载或旧版本无版本号），输出 __PROBE_VER__:none
+
+        Returns:
+            版本探测命令字符串，或 None（领域不存在）。
+        """
+        domain = self._domains.get(domain_id)
+        if not domain:
+            return None
+        var_name = f"__{domain_id.upper()}_SNIPPET_VERSION__"
+        # 使用 ${VAR:-none} 语法：变量未定义时输出 "none"
+        return f'echo "__PROBE_VER__:${{{var_name}:-none}}"'
+
     # ── Heredoc 注入 ──────────────────────────────
 
     # heredoc 注入完成后的确认标记（公共常量，server.py 需引用）
     INJECT_DONE = "__SNIPPET_INJECTED__"
 
-    def build_heredoc_loader(self, domain_id: str) -> str | None:
-        """生成 heredoc 注入命令，将脚本加载到远端 /tmp/。
+    def build_heredoc_loader(
+        self, domain_id: str, *, compressed: bool = True
+    ) -> str | None:
+        """生成脚本注入命令，将脚本加载到远端 /tmp/。
 
-        命令会将脚本内容写入 /tmp/ts-{domain_id}.sh 并 source。
+        支持两种注入模式：
+        - compressed=True（默认）：gzip+base64 压缩注入，传输量减少 60-80%
+          远端通过 base64 -d | gunzip 解压还原脚本文件
+        - compressed=False：传统 heredoc 注入（作为 fallback）
+
         末尾追加确认标记 echo，供 wait_for 精确等待注入完成。
 
         Returns:
-            heredoc 加载命令字符串，或 None（领域/脚本不存在）。
+            注入命令字符串，或 None（领域/脚本不存在）。
         """
         content = self.get_script_content(domain_id)
         if not content:
             return None
         script_name = f"ts-{domain_id}.sh"
+
+        if compressed:
+            return self._build_compressed_loader(content, script_name)
+        return self._build_heredoc_loader(content, script_name)
+
+    def _build_compressed_loader(
+        self, content: str, script_name: str
+    ) -> str:
+        """gzip+base64 压缩注入：传输量最小化。
+
+        生成命令：echo '<base64>' | base64 -d | gunzip > /tmp/ts-xxx.sh && source ...
+        远端只需 base64 + gunzip，这两个在几乎所有 Linux/macOS 上都可用。
+        """
+        import base64
+        import gzip
+
+        compressed = gzip.compress(content.encode("utf-8"), compresslevel=9)
+        b64_data = base64.b64encode(compressed).decode("ascii")
+
+        logger.debug(
+            "压缩注入 %s: %d → %d → %d (原始 → gzip → base64)",
+            script_name, len(content), len(compressed), len(b64_data),
+        )
+
+        # 单行 echo + pipeline 命令，避免 heredoc 的多行传输开销
+        return (
+            f"echo '{b64_data}' | base64 -d 2>/dev/null | "
+            f"gunzip -c > /tmp/{script_name} 2>/dev/null && "
+            f"source /tmp/{script_name} && echo '{self.INJECT_DONE}'"
+        )
+
+    def _build_heredoc_loader(self, content: str, script_name: str) -> str:
+        """传统 heredoc 注入（fallback 模式）。"""
         return (
             f"cat << 'SNIPPET_EOF' > /tmp/{script_name}\n"
             f"{content}\n"
