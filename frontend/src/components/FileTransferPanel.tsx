@@ -17,7 +17,7 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 import { uploadFile, downloadFile, cancelUpload } from "../services/api";
-import type { FileUploadResponse, PtyTransferProgress } from "../services/api";
+import type { FileUploadResponse, PtyTransferProgress, DownloadCompleteResult } from "../services/api";
 
 // ── 类型定义 ──────────────────────────────────
 
@@ -72,6 +72,32 @@ interface TransferRecord {
   status: "success" | "error";
   message: string;
   timestamp: number;
+}
+
+/** 下载进度详情 */
+interface DownloadProgressInfo {
+  /** 远端文件总字节数 */
+  totalBytes: number;
+  /** 已接收字节数 */
+  transferredBytes: number;
+  /** 进度百分比 0-100 */
+  percentage: number;
+  /** PTY 传输状态 */
+  state: string;
+  /** 校验子步骤 */
+  subStep: string;
+  /** 开始时间 */
+  startedAt: number;
+  /** 实时速度 */
+  speed: number;
+  /** ★ O12 压缩信息 */
+  compressed: boolean;
+  /** 原始文件大小（未压缩） */
+  originalBytes: number;
+  /** 压缩后大小（0 表示未压缩） */
+  compressedBytes: number;
+  /** 压缩率百分比 */
+  compressionRatio: number;
 }
 
 interface FileTransferPanelProps {
@@ -146,8 +172,13 @@ export default function FileTransferPanel({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const downloadAbortRef = useRef<AbortController | null>(null);
   /** 速度计算：上次采样点 */
   const speedSampleRef = useRef<{ time: number; loaded: number }>({ time: 0, loaded: 0 });
+  /** 下载速度计算采样点 */
+  const dlSpeedSampleRef = useRef<{ time: number; loaded: number }>({ time: 0, loaded: 0 });
+  /** 下载进度 */
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgressInfo | null>(null);
 
   // ── 添加历史记录 ──
   const addHistory = useCallback((record: Omit<TransferRecord, "id" | "timestamp">) => {
@@ -303,7 +334,7 @@ export default function FileTransferPanel({
     }
   }, [sessionId, remotePath, isConnected, addHistory]);
 
-  // ── 下载逻辑 ──
+  // ── 下载逻辑（SSE 流式进度）──
   const handleDownload = useCallback(async () => {
     if (!isConnected) {
       setErrorMsg("终端未连接，无法传输文件");
@@ -317,24 +348,82 @@ export default function FileTransferPanel({
       return;
     }
 
+    const now = Date.now();
     setStatus("downloading");
     setErrorMsg("");
     setSuccessMsg("");
+    dlSpeedSampleRef.current = { time: now, loaded: 0 };
+    setDownloadProgress({
+      totalBytes: 0,
+      transferredBytes: 0,
+      percentage: 0,
+      state: "transferring",
+      subStep: "",
+      startedAt: now,
+      speed: 0,
+      compressed: false,
+      originalBytes: 0,
+      compressedBytes: 0,
+      compressionRatio: 0,
+    });
+
+    downloadAbortRef.current = new AbortController();
 
     try {
-      await downloadFile(sessionId, downloadPath.trim());
+      const result: DownloadCompleteResult = await downloadFile(
+        sessionId,
+        downloadPath.trim(),
+        (progress: PtyTransferProgress) => {
+          const nowMs = Date.now();
+          const sample = dlSpeedSampleRef.current;
+          let speed = 0;
+          if (nowMs - sample.time >= 500 && progress.transferred > sample.loaded) {
+            speed = ((progress.transferred - sample.loaded) / (nowMs - sample.time)) * 1000;
+            dlSpeedSampleRef.current = { time: nowMs, loaded: progress.transferred };
+          }
 
-      const filename = downloadPath.split("/").pop() || "download";
-      setStatus("success");
-      setSuccessMsg(`下载完成: ${filename}`);
-      addHistory({
-        type: "download",
-        filename,
-        remotePath: downloadPath.trim(),
-        size: 0,
-        status: "success",
-        message: "下载成功",
-      });
+          setDownloadProgress((prev) => ({
+            totalBytes: progress.total || prev?.totalBytes || 0,
+            transferredBytes: progress.transferred,
+            percentage: progress.percentage,
+            state: progress.state,
+            subStep: progress.sub_step || "",
+            startedAt: prev?.startedAt || now,
+            speed: speed > 0 ? speed : prev?.speed || 0,
+            compressed: progress.compressed ?? prev?.compressed ?? false,
+            originalBytes: progress.original_bytes ?? prev?.originalBytes ?? 0,
+            compressedBytes: progress.compressed_bytes ?? prev?.compressedBytes ?? 0,
+            compressionRatio: progress.compression_ratio ?? prev?.compressionRatio ?? 0,
+          }));
+        },
+        downloadAbortRef.current.signal,
+      );
+
+      if (result.success) {
+        const filename = result.filename || downloadPath.split("/").pop() || "download";
+        const elapsed = formatElapsed(Date.now() - now);
+        setStatus("success");
+        setSuccessMsg(`下载完成: ${filename}（${formatSize(result.file_size || 0)}，耗时 ${elapsed}）`);
+        addHistory({
+          type: "download",
+          filename,
+          remotePath: downloadPath.trim(),
+          size: result.file_size || 0,
+          status: "success",
+          message: result.message,
+        });
+      } else {
+        setStatus("error");
+        setErrorMsg(truncateError(result.message || "下载失败"));
+        addHistory({
+          type: "download",
+          filename: downloadPath.split("/").pop() || "file",
+          remotePath: downloadPath.trim(),
+          size: 0,
+          status: "error",
+          message: result.message,
+        });
+      }
     } catch (err) {
       const msg = truncateError(err instanceof Error ? err.message : "下载失败");
       setStatus("error");
@@ -347,6 +436,9 @@ export default function FileTransferPanel({
         status: "error",
         message: msg,
       });
+    } finally {
+      downloadAbortRef.current = null;
+      setDownloadProgress(null);
     }
   }, [sessionId, downloadPath, isConnected, addHistory]);
 
@@ -500,6 +592,11 @@ export default function FileTransferPanel({
               {status === "downloading" ? "下载中..." : "下载"}
             </button>
           </div>
+
+          {/* 下载进度 */}
+          {status === "downloading" && downloadProgress && (
+            <_DownloadProgress info={downloadProgress} />
+          )}
 
           {/* 历史记录 */}
           <div className="flex-1 min-h-0 overflow-y-auto">
@@ -700,6 +797,69 @@ function _HistoryItem({ record }: { record: TransferRecord }) {
       )}
       <span className={`shrink-0 ${statusColor}`}>{statusIcon}</span>
       <span className="shrink-0 text-gray-700">{time}</span>
+    </div>
+  );
+}
+
+// ── 下载进度子组件 ──────────────────────────────
+
+function _DownloadProgress({ info }: { info: DownloadProgressInfo }) {
+  const isVerifying = info.state === "verifying";
+
+  return (
+    <div className="space-y-1.5 px-1">
+      {/* 压缩标签 */}
+      {info.compressed && (
+        <div className="flex items-center gap-1 text-[10px] text-emerald-500/80">
+          <span title={`gzip 压缩: ${formatSize(info.originalBytes)} → ${formatSize(info.compressedBytes)}`}>
+            🗜️ 压缩传输 -{info.compressionRatio.toFixed(0)}%
+          </span>
+          <span className="text-gray-600">
+            ({formatSize(info.originalBytes)} → {formatSize(info.compressedBytes)})
+          </span>
+        </div>
+      )}
+
+      {isVerifying ? (
+        <>
+          {/* 校验阶段 */}
+          <div className="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
+            <div className="bg-emerald-500 h-full rounded-full transition-all duration-500" style={{ width: "100%" }} />
+          </div>
+          <div className="flex items-center justify-center gap-2 text-[10px] text-emerald-400/80">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span>
+              {info.subStep === "checksumming"
+                ? "🔍 MD5 校验中..."
+                : info.compressed
+                  ? "📦 解压写入中..."
+                  : "📦 解码写入中..."}
+            </span>
+            <_ElapsedTimer startedAt={info.startedAt} />
+          </div>
+        </>
+      ) : (
+        <>
+          {/* 传输阶段 */}
+          <div className="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
+            <div
+              className="bg-blue-500 h-full rounded-full transition-all duration-300"
+              style={{ width: `${Math.max(info.percentage, info.totalBytes > 0 ? 1 : 0)}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-[10px] text-gray-500">
+            <span>
+              {info.totalBytes > 0
+                ? `${formatSize(info.transferredBytes)} / ${formatSize(info.totalBytes)}`
+                : `${formatSize(info.transferredBytes)}`}
+              {info.compressed && <span className="text-emerald-500/60 ml-0.5">gz</span>}
+            </span>
+            {info.percentage > 0 && <span>{info.percentage}%</span>}
+            {info.speed > 0 && <span>{formatSpeed(info.speed)}</span>}
+            <_ElapsedTimer startedAt={info.startedAt} />
+          </div>
+        </>
+      )}
     </div>
   );
 }

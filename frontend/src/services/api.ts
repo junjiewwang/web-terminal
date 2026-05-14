@@ -806,45 +806,127 @@ export async function cancelUpload(sessionId: string): Promise<void> {
 }
 
 /**
- * 从远端节点下载文件
+ * 从远端节点下载文件（SSE 流式进度 + token 取文件）
  *
- * 触发浏览器文件下载（通过创建隐藏 <a> 标签）。
+ * 两步流程：
+ * 1. POST /download?remote_path=... → SSE 流式进度（progress/complete/error）
+ * 2. 收到 complete 事件中的 token → GET /download/{token} 触发浏览器下载
  *
  * @param sessionId - 终端会话 ID
  * @param remotePath - 远端文件路径
+ * @param onProgress - 下载进度回调（可选）
+ * @param signal - AbortSignal（用于取消）
+ * @returns 下载结果
  */
+
+export interface DownloadCompleteResult {
+  success: boolean;
+  token?: string;
+  filename?: string;
+  file_size?: number;
+  md5?: string;
+  message: string;
+}
+
 export async function downloadFile(
   sessionId: string,
   remotePath: string,
-): Promise<void> {
+  onProgress?: PtyProgressCallback,
+  signal?: AbortSignal,
+): Promise<DownloadCompleteResult> {
   const url = `${API_BASE}/terminal/${sessionId}/download?remote_path=${encodeURIComponent(remotePath)}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, { method: "POST", signal });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || `下载失败: ${res.statusText}`);
   }
 
-  // 从响应头获取文件名
-  const disposition = res.headers.get("content-disposition") || "";
-  const filenameMatch = disposition.match(/filename="?([^";\n]+)"?/);
-  const filename = filenameMatch?.[1] || remotePath.split("/").pop() || "download";
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("无法读取 SSE 流");
 
-  // 创建 Blob URL 触发浏览器下载
-  const blob = await res.blob();
-  const blobUrl = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = blobUrl;
-  anchor.download = filename;
-  anchor.style.display = "none";
-  document.body.appendChild(anchor);
-  anchor.click();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: DownloadCompleteResult | null = null;
+  let errorMsg = "";
 
-  // 清理
-  requestAnimationFrame(() => {
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(blobUrl);
-  });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      let eventType = "";
+      let eventData = "";
+
+      for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith("data: ")) {
+          eventData = line.slice(6);
+        } else if (line === "" && eventType && eventData) {
+          // 空行分隔 → 处理事件
+          try {
+            const parsed = JSON.parse(eventData);
+            switch (eventType) {
+              case "progress":
+                onProgress?.(parsed as PtyTransferProgress);
+                break;
+              case "complete":
+                result = parsed as DownloadCompleteResult;
+                break;
+              case "error":
+                errorMsg = parsed.message || "下载失败";
+                result = parsed as DownloadCompleteResult;
+                break;
+            }
+          } catch {
+            console.warn("SSE 事件解析失败:", eventData);
+          }
+          eventType = "";
+          eventData = "";
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (errorMsg && !result?.success) {
+    throw new Error(errorMsg);
+  }
+
+  if (!result) {
+    throw new Error("未收到下载结果");
+  }
+
+  // 下载成功 → 用 token 触发浏览器文件下载
+  if (result.success && result.token) {
+    const fileUrl = `${API_BASE}/terminal/${sessionId}/download/${result.token}`;
+    const fileRes = await fetch(fileUrl);
+    if (!fileRes.ok) {
+      throw new Error("获取下载文件失败");
+    }
+
+    const filename = result.filename || remotePath.split("/").pop() || "download";
+    const blob = await fileRes.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = blobUrl;
+    anchor.download = filename;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    requestAnimationFrame(() => {
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+
+  return result;
 }
 
 // ── SSE 事件订阅（模块级单例 · fetch + ReadableStream 实现）──
