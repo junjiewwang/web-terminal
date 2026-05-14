@@ -28,7 +28,7 @@
 | `__FT_EOF__` | 上传 | 数据发送完毕 |
 | `__FT_RECV_OK__:<bytes>` | 上传 | 接收成功，附字节数 |
 | `__FT_RECV_ERR__:<msg>` | 上传 | 接收失败 |
-| `__FT_SEND_BEGIN__:<size>` | 下载 | 开始发送，附文件大小 |
+| `__FT_SEND_BEGIN__:<size>` 或 `__FT_SEND_BEGIN__:<csize>:<osize>:C` | 下载 | 开始发送，附文件大小；压缩模式附压缩后/原始大小 + `C` 标记 |
 | `__FT_SEND_END__:<md5>` | 下载 | 发送完毕，附 MD5 |
 | `__FT_SEND_ERR__:<msg>` | 下载 | 发送失败 |
 | `__FT_CHECKSUM__:<md5>:<sha256>` | 校验 | 文件校验和 |
@@ -85,7 +85,8 @@
 |------|------|------|
 | `/api/terminal/{session_id}/upload` | POST | 浏览器上传文件到远端节点（SSE 流式进度） |
 | `/api/terminal/{session_id}/upload/cancel` | POST | 取消正在进行的上传（中断 PTY 传输） |
-| `/api/terminal/{session_id}/download` | GET | 从远端节点下载文件到浏览器（query: remote_path） |
+| `/api/terminal/{session_id}/download` | POST | 触发远端下载 + SSE 流式进度（query: remote_path） |
+| `/api/terminal/{session_id}/download/{token}` | GET | 一次性 token 取回已下载的文件（token 120s 过期） |
 
 ### 架构图
 
@@ -125,11 +126,17 @@ Agent 下载流程:
     → event: complete（最终结果） 或 event: error（失败）
     → 清理临时文件
 
-浏览器下载流程:
-  Browser → GET /api/terminal/{session_id}/download?remote_path=...
+浏览器下载流程（两步式 SSE 进度 + token 取文件）:
+  Step 1: Browser → POST /api/terminal/{session_id}/download?remote_path=...
     → _ensure_ft_snippet_loaded() — 自动加载 ft snippet
-    → PtyFileTransfer.download() — 复用 Agent 下载逻辑
-    → FileResponse 返回文件流 → 清理临时文件
+    → PtyFileTransfer.download(on_progress=callback)
+      → _collect_chunks() 每 10 个 chunk 调用 on_progress → asyncio.Queue
+      → SSE generator 读取 Queue → event: progress（实时进度）
+    → event: complete（含 token、filename、file_size、md5）
+    → 或 event: error（失败原因）
+  Step 2: Browser → GET /api/terminal/{session_id}/download/{token}
+    → 校验 token（一次性、120s TTL）→ FileResponse 返回文件
+    → 清理临时文件 + token
 ```
 
 ## 待验证 & 遗留问题
@@ -472,6 +479,102 @@ Agent 下载流程:
      `_UploadProgress` 组件根据子步骤显示 "📦 解码写入中..." 或 "🔍 MD5 校验中..."。
 - **用户体验流转**：`0% → 传输中 → 100% → 📦 解码写入中... → 🔍 MD5 校验中... → ✓ 上传成功`
 
+### O12: 下载方向优化（大 chunk + 压缩传输 + dd 修复）
+- **问题（三大下载瓶颈）**：
+  1. **`dd bs=1` 逐字节读取**：`ft_send` 使用 `dd if=... bs=1 skip=N count=M`，每个字节一次
+     系统调用，I/O 效率极低（36KB chunk 需要 36864 次 read syscall）
+  2. **2KB 默认 chunk**：5.8MB 文件需要 ~2900 个 chunk，每个 chunk 50ms sleep = 145s 纯延迟
+  3. **无压缩传输**：上传方向已有 O2 gzip 压缩，但下载方向直接传原始数据
+- **方案**：
+  1. **修复 dd 用法**：`dd bs=1 skip=N count=M` → `dd bs=CHUNK_SIZE skip=BLOCK_NUM count=1`
+     （按块大小整数倍跳过，所有平台兼容；最后不完整块 dd 自动返回实际字节数）
+  2. **大 chunk**：默认 36KB（与上传方向一致），减少 chunk 数：~2900 → ~166
+  3. **减少延迟**：sleep 从 50ms → 5ms（下载方向是 Shell 端单向输出，无 ACK 竞态风险）
+  4. **压缩传输**：`ft_send --compressed` 在远端 gzip 压缩后再 base64 分块传输
+     - Shell 端：`gzip -c file > temp.gz`，对 .gz 文件分块 base64 传输
+     - 新 `__FT_SEND_BEGIN__` 格式：`<compressed_size>:<original_size>:C`
+     - Python 端：收到 base64 数据 → 解码 → `gzip.decompress()` → 写入文件
+     - MD5 校验基于原始未压缩文件，压缩/解压对校验透明
+     - gzip 不可用或压缩失败时自动回退为无压缩传输
+  5. **前端**：`_DownloadProgress` 组件显示压缩标签和压缩后传输量
+- **改动文件**：
+  - `file-transfer-snippet.sh`：ft_send 重写（--compressed + 高效 dd + 36KB chunk + 5ms delay），版本升至 2026.05.14.5
+  - `pty_file_transfer.py`：download() 请求压缩传输 + 解析新 SEND_BEGIN 格式 + gunzip 解压；_collect_chunks() 传递压缩信息
+  - `file_transfer.py`：下载 SSE 进度事件添加压缩字段
+  - `FileTransferPanel.tsx`：_DownloadProgress 组件显示压缩标签/解压提示
+- **预估收益**（5.8MB 文本文件，假设 60% 压缩率）：
+  - dd 修复：36KB chunk 从 36864 次 read → 1 次 read（单个 chunk 速度提升 ~1000x）
+  - 大 chunk：~2900 → ~166 chunks（减少 94%），纯延迟 145s → 0.83s
+  - 压缩：传输量 5.8MB → ~2.3MB，chunk 数 ~166 → ~66
+  - 综合加速：**~145s → ~5-10s**（~15-30x 提升）
+
+### Bugfix #23: 下载 base64 解码失败（chunk 拼接 + PTY 截断）
+- **症状**：下载完成后 base64 解码报错 `Invalid base64-encoded string: number of data characters (240945) cannot be 1 more than a multiple of 4`
+- **根因（双重问题）**：
+  1. **拼接解码**：`download()` 把所有 chunk 的 base64 字符串 `"".join()` 后整体 `b64decode()`。
+     每个 chunk 是 Shell 端 `dd | base64` 独立编码的，最后一个 chunk 可能有 `=` padding。
+     拼接后 padding 出现在中间位置，但更关键的是——任何一个 chunk 被 PTY 截断 1 个字符，
+     错误会累积到最终整体解码时才暴露，且无法定位是哪个 chunk。
+  2. **PTY 行截断**：下载方向没有 ACK 确认机制（不同于上传方向的 ACK + base64 试解码 + 重传），
+     Shell 端 `echo __FT_CHUNK__:...` 输出后不等确认就继续发送。如果 PTY 通道在某行传输时
+     截断了末尾字符，Python 端 `_collect_chunks` 无法感知，静默收集了不完整的 base64 数据。
+- **修复（两层防御）**：
+  1. **`_collect_chunks` 逐 chunk 校验 + padding 补齐**：
+     - 每收到一个 chunk 立即检查 `len(b64_data) % 4`
+     - 非 4 的倍数时自动补齐 `=` padding（`4 - remainder` 个）并记录 warning
+     - 同时做 `base64.b64decode()` 即时校验，解码异常时记录精确的 chunk 序号、
+       长度、前/后 40 字符，方便定位问题
+  2. **`download()` 逐 chunk 独立解码**：
+     - 替代 `"".join(b64_chunks)` + 整体 `b64decode()`
+     - 每个 chunk 独立 `b64decode()` → `raw_parts.append()`
+     - 失败时精确报错：`chunk #N/M, b64_len=X, <error>`
+     - 最终 `b"".join(raw_parts)` 拼接二进制数据
+- **改动文件**：`pty_file_transfer.py`（`_collect_chunks` + `download`）
+
+### Bugfix #23a: 浏览器刷新后终端回放 base64 乱码
+- **症状**：下载传输期间刷新浏览器页面，终端中显示大量 base64 原始数据
+- **根因**：`terminal_manager.py` 的 `_on_pty_readable()` 中 `_append_scrollback(data)` 在
+  `_ws_muted` 检查 **之前** 执行。文件传输期间 `_ws_muted=True` 阻止了 WebSocket 广播，
+  但 base64 数据已经写入 scrollback 缓冲区。浏览器刷新重连时 `add_ws_client()` 回放
+  scrollback 历史，把传输期间的 base64 数据全部渲染到终端。
+- **修复**：将 `_append_scrollback(data)` 移到 `_ws_muted` 检查 **之后**。
+  静默模式下 Agent 缓冲区（`_raw_buffer`）仍正常写入（`wait_for` 扫描不受影响），
+  但 scrollback、vterm feed、WebSocket 广播 **全部跳过**。
+- **改动文件**：`terminal_manager.py`（`_on_pty_readable`）
+
+### Bugfix #23b: base64 数据 ANSI 残留导致解码失败
+- **症状**：Bugfix #23 实施后仍失败：`chunk #3/65, b64_len=800`，实际只有 797 个
+  合法 base64 字符（3 个非法字符导致长度异常 → padding 补齐后仍解码失败）
+- **根因**：`strip_ansi()` 基于正则匹配标准 ANSI 转义序列（`ESC[...`），但 PTY 传输
+  过程中某些不完整的 ANSI 片段、控制字符（如 `\x00`-`\x1f`）无法被标准正则覆盖。
+  base64 合法字符集是 `A-Za-z0-9+/=`，任何不属于该集合的字符都会使 `b64decode()` 失败。
+- **修复**：在 `_collect_chunks()` 提取 `b64_data` 后，使用正则 `_NON_B64_RE = re.compile(r"[^A-Za-z0-9+/=]")`
+  **主动清洗**所有非 base64 合法字符，而非依赖 `strip_ansi()` 的 ANSI 模式匹配。
+  清洗前后长度不一致时记录 warning（含 chunk 序号、清洗前后长度、移除字符数）。
+- **改动文件**：`pty_file_transfer.py`（模块级 `_NON_B64_RE` 常量 + `_collect_chunks` 清洗逻辑）
+
+### Bugfix #23c → #23d: os.read 边界截断导致 chunk 数据丢失（行拼接修复）
+- **症状**：#23b 实施后仍有 chunk 解码失败（`b64_len=2020, data chars 2017 余1`），
+  且 gzip 解压报 `invalid distance too far back`——说明数据本身被截断，修补 padding 无法恢复。
+- **根因（真正原因）**：`_on_pty_readable()` 中 `os.read(fd, 65536)` 不保证返回完整行。
+  Shell 端 `ft_send` 的 `echo "__FT_CHUNK__:$(dd|base64|tr -d '\n')"` 输出的行长达 ~49KB，
+  极容易在 `os.read` 边界被截断为两段：
+  - 第 1 段：`__FT_CHUNK__:...partial_b64`（有前缀，数据不完整）
+  - 第 2 段：`remaining_b64`（无前缀，是上一行的续行）
+
+  `text.split("\n")` 将两段分别写入 `_raw_buffer`。`_collect_chunks` 只匹配
+  `startswith("__FT_CHUNK__:")` 的行，**第 2 段（续行）被静默丢弃**，第 1 段缺尾。
+  原来的 #23c"截尾 1 字符"虽然让 `b64decode` 不报错，但解出来的数据缺少真实字节，
+  gzip 数据流被破坏。
+- **修复（#23d 行拼接 line reassembly）**：
+  在 `_collect_chunks` 中增加续行检测：如果当前行不含任何协议标记前缀
+  （`__FT_CHUNK__:`/`__FT_SEND_END__`/`__FT_SEND_ERR__`），且已有收集的 chunks，
+  则视为上一个 chunk 的续行，清洗后拼接到 `b64_chunks[-1]`。
+  同时在 `download()` 的逐 chunk 解码阶段，对每个 chunk 做最终清洗 + padding 规范化
+  （续行拼接可能引入额外的 ANSI 残留或 padding 错位）。
+- **回滚 #23c**：移除"余 1 截尾"逻辑（会丢失真实数据），改为纯 ERROR 日志。
+- **改动文件**：`pty_file_transfer.py`（`_collect_chunks` 续行拼接 + `download()` 解码前规范化）
+
 ## 使用示例
 
 ```
@@ -516,3 +619,13 @@ Agent 下载流程:
 - 2026-05-14: Bugfix #20 — wait_for 缓冲区扫描竞态条件：`send_input()` 后 Shell 可能在 `wait_for()` 记录 `start_pos` 之前就输出了标记（如 `__FT_RECV_READY__`），导致扫描起始位置跳过目标标记、永远超时。修复：在 `send_input()` 前记录 `pre_pos = len(_raw_buffer)` 并传入 `wait_for(_start_pos=pre_pos)`，与 ACK 循环已有的正确模式保持一致。涉及三处：① upload() 的 RECV_READY ② download() 的 SEND_BEGIN ③ _ensure_ft_snippet_loaded() 的 INJECT_DONE
 - 2026-05-14: O8 — Snippet 精简 + 压缩注入：① 精简 file-transfer-snippet.sh（324行/10.8KB → 104行/3.7KB），删除大段注释、合并 base64 解码重复逻辑、精简变量名；② 移除 `ft_checksum` 函数，改用 Python 端 inline `md5sum/md5` 命令；③ `build_heredoc_loader()` 支持 gzip+base64 压缩注入模式（`echo '<b64>' | base64 -d | gunzip > /tmp/ts-ft.sh`），最终注入传输量 10.7KB → 2.1KB（节省 80.5%）
 - 2026-05-14: O9 — 批量 ACK 传输（pipeline overlap）：从 stop-and-wait 改为每批 5 个 chunk 发送 + 批量收集 ACK，Shell 端逻辑不变（仍逐 chunk 回复 ACK），Python 端新增 `_collect_batch_acks()` 方法 + 重写上传循环，失败 chunk 降级为逐个重传。预估加速 2-3x（主要节省 ACK idle 时间）
+- 2026-05-14: O10a — 参数微调：batch_size 5→8（8×49KB=392KB，PTY 缓冲区安全）；初始延迟 30→15ms（自适应翻倍兜底，慢环境自动回退）
+- 2026-05-14: O11 — 自适应 chunk size（借鉴 trzsz）：替代固定 36KB chunk，采用 slow-start + 指数增长 + 失败回退策略。核心变更：① `ChunkSizeController` 类（动态增长，失败立即减半，probing→stable 状态机）；② 动态 batch size（`_compute_batch_size()` 保持每批 ~400KB 恒定，chunk 越大 batch 越小）；③ 惰性切分（offset 指针 + controller.size 实时切片，替代预切分 `_split_into_chunks()`）；④ 移除固定 `_DEFAULT_CHUNK_SIZE`/`_BATCH_SIZE` 常量。Shell 端无需任何改动（`read -r` + ACK 逻辑完全 chunk-size 无关）。核心收益：新环境自动探测最优 chunk 大小，不稳定链路自动降级，稳定链路快速收敛到上限
+- 2026-05-14: O11a — 自适应参数调优：初始 4KB + 3 批门槛导致探测期过长（5.6MB 文件 3.5MB 都在探测阶段，耗时 41s）。修复：`_CHUNK_SIZE_INIT` 4KB→16KB，`_CHUNK_GROW_THRESHOLD` 3→1。增长路径从 4 级 12 批（4→8→16→32→36KB）缩短为 2 级 2 批（16→32→36KB），探测期数据量从 3.5MB 降至 ~580KB
+- 2026-05-14: Bugfix #22 — ft_send 终端 base64 乱码回显：下载时终端显示原始 base64 数据，原因是 `ft_send` 缺少 `stty -echo`（`ft_recv` 已有）。修复：ft_send 添加 `stty -echo` + `_ft_send_cleanup()` 恢复函数 + `trap INT TERM HUP` 信号处理，与 ft_recv 模式保持一致。snippet 版本升至 2026.05.14.4
+- 2026-05-14: UX 改进 — 下载进度展示：将同步 GET/FileResponse 下载 API 重构为两步式架构：① POST 触发下载 + SSE 流式进度（progress/complete/error 事件，复用上传的 asyncio.Queue 桥接模式）；② GET token 取回文件（一次性 token，120s TTL）。后端 `_collect_chunks()` 增加 `on_progress` 回调（每 10 个 chunk 上报一次）；前端新增 `_DownloadProgress` 组件（进度条 + 速度 + 耗时，与 `_UploadProgress` 一致）
+- 2026-05-14: O12 — 下载方向优化（大 chunk + 压缩传输 + dd 修复）：① ft_send 重写支持 `--compressed` 模式 + 36KB 默认 chunk + `dd bs=CHUNK skip=BLK count=1` 高效块读取（替代 `bs=1` 逐字节）+ 5ms 延迟；② Python download() 请求压缩传输 + 解析新 `__FT_SEND_BEGIN__:<csize>:<osize>:C` 格式 + gunzip 解压；③ 下载 SSE 进度事件 + 前端压缩标签。snippet 版本升至 2026.05.14.5。综合加速 ~15-30x（5.8MB 文本: ~145s → ~5-10s）
+- 2026-05-14: Bugfix #23 — 下载 base64 解码失败（chunk 拼接 + PTY 截断）：所有 chunk 的 base64 直接 `"".join()` 后整体 `b64decode()`，PTY 截断 1 个字符导致长度非 4 倍数。修复：① `_collect_chunks` 逐 chunk 校验 + padding 补齐（`len % 4 != 0` 时补 `=`）；② `download()` 逐 chunk 独立 `b64decode()`（精确定位损坏 chunk 序号和长度）
+- 2026-05-14: Bugfix #23a — 浏览器刷新后终端回放 base64 乱码：`_on_pty_readable()` 中 `_append_scrollback(data)` 在 `_ws_muted` 检查之前执行，传输期间 base64 数据写入 scrollback，刷新重连时全部回放。修复：将 scrollback/vterm/WS 广播全部移到 `_ws_muted` 检查之后，静默模式下仅写入 Agent 缓冲区
+- 2026-05-14: Bugfix #23b — base64 数据 ANSI 残留导致解码失败：`strip_ansi()` 无法清除所有 PTY 残留字符（不完整 ANSI 片段、控制字符），导致 chunk 中混入 3 个非法字符（800 chars → 797 valid）。修复：新增 `_NON_B64_RE = re.compile(r"[^A-Za-z0-9+/=]")` 正则，在 `_collect_chunks` 中主动清洗所有非 base64 合法字符
+- 2026-05-14: Bugfix #23c → #23d — os.read 边界截断导致 chunk 数据丢失：`os.read(fd, 65536)` 不保证返回完整行，~49KB 的 `__FT_CHUNK__:...` 行跨两次 read 被切成两段，第 2 段无前缀被 `_collect_chunks` 丢弃。#23c 的"截尾 1 字符"修复仅消除 b64decode 报错但丢失真实数据，导致 gzip 解压 `invalid distance too far back`。最终修复 #23d：在 `_collect_chunks` 中实现行拼接（line reassembly），无协议前缀的行视为上一个 chunk 续行拼接；`download()` 解码前做最终清洗 + padding 规范化
