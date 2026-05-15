@@ -870,7 +870,395 @@ def should_deliver(event: Event, subscriber: SSESubscription) -> bool:
 
 ---
 
+## 10. 运营管理端设计
+
+### 10.1 需求概述
+
+在多租户体系基础上，增加**运营管理控制台**，供运维人员（super_admin / admin）管理租户、监控会话、查看审计日志。
+
+#### 核心需求
+
+| 需求 | 说明 |
+|------|------|
+| **租户管理** | CRUD 租户、重置密码、启用/禁用租户 |
+| **会话监控** | 实时查看所有租户的活跃会话，支持强制断开 |
+| **审计日志** | 可查询、可筛选的操作记录 |
+| **Dashboard** | 运营概览（在线用户数、活跃会话数、主机状态等） |
+
+### 10.2 用户角色体系
+
+在现有 `admin` / `user` 基础上，扩展为三级角色：
+
+| 角色 | 权限范围 | 可访问页面 |
+|------|----------|------------|
+| `super_admin` | 全部权限 + 管理其他 admin | Admin Console + 普通终端 |
+| `admin` | 全部主机可见 + 查看所有会话 + 查看审计日志 | Admin Console（部分） + 普通终端 |
+| `user` | 仅 `allowed_tags` 匹配的主机 + 仅自己的会话 | 普通终端 |
+
+角色在 `tenants.yaml` 中配置：
+
+```yaml
+tenants:
+  - id: ops-admin
+    name: 运维管理员
+    password_hash: "$2b$12$..."
+    role: super_admin           # 新增角色
+    allowed_tags: []
+    max_sessions: 5
+
+  - id: team-lead
+    name: 团队 Leader
+    password_hash: "$2b$12$..."
+    role: admin
+    allowed_tags: []
+    max_sessions: 3
+```
+
+### 10.3 Admin Console 前端架构
+
+#### 架构原则：同一 SPA，路由级分离
+
+```
+App.tsx
+├── /login               → LoginPage.tsx
+├── /                    → MainLayout.tsx (普通终端)
+│   ├── HostList
+│   ├── TerminalView
+│   └── ...
+└── /admin/*             → AdminLayout.tsx (管理控制台)
+    ├── /admin/dashboard  → DashboardPage.tsx
+    ├── /admin/tenants    → TenantManagePage.tsx
+    ├── /admin/sessions   → SessionMonitorPage.tsx
+    └── /admin/audit      → AuditLogPage.tsx
+```
+
+**路由守卫**：
+```typescript
+// frontend/src/components/AdminRoute.tsx
+function AdminRoute({ children }: { children: React.ReactNode }) {
+  const { tenant } = useAuth();
+
+  if (!tenant || !["super_admin", "admin"].includes(tenant.role)) {
+    return <Navigate to="/" replace />;
+  }
+  return <>{children}</>;
+}
+```
+
+#### 页面入口
+
+管理员登录后，Header 右侧显示「管理控制台」入口按钮，点击跳转 `/admin/dashboard`。
+
+### 10.4 Admin API 设计
+
+#### 10.4.1 租户管理 API
+
+| 方法 | 路径 | 说明 | 权限 |
+|------|------|------|------|
+| `GET` | `/api/admin/tenants` | 租户列表（含在线状态） | admin+ |
+| `POST` | `/api/admin/tenants` | 创建租户 | super_admin |
+| `PUT` | `/api/admin/tenants/{id}` | 修改租户信息 | super_admin |
+| `DELETE` | `/api/admin/tenants/{id}` | 删除租户 | super_admin |
+| `PUT` | `/api/admin/tenants/{id}/password` | 重置密码 | admin+ |
+| `PUT` | `/api/admin/tenants/{id}/status` | 启用/禁用租户 | super_admin |
+
+#### 10.4.2 会话监控 API
+
+| 方法 | 路径 | 说明 | 权限 |
+|------|------|------|------|
+| `GET` | `/api/admin/sessions` | 所有活跃会话列表 | admin+ |
+| `DELETE` | `/api/admin/sessions/{id}` | 强制断开会话 | admin+ |
+| `GET` | `/api/admin/sessions/stats` | 会话统计信息 | admin+ |
+
+#### 10.4.3 审计日志 API
+
+| 方法 | 路径 | 说明 | 权限 |
+|------|------|------|------|
+| `GET` | `/api/admin/audit-logs` | 查询审计日志（分页、筛选） | admin+ |
+| `GET` | `/api/admin/audit-logs/export` | 导出审计日志（CSV） | super_admin |
+
+**查询参数**：
+```
+GET /api/admin/audit-logs?
+  tenant_id=alice&          # 按租户筛选
+  action=connect_host&      # 按操作类型筛选
+  start_time=2026-05-01&    # 时间范围
+  end_time=2026-05-15&
+  page=1&
+  page_size=50
+```
+
+#### 10.4.4 Dashboard API
+
+| 方法 | 路径 | 说明 | 权限 |
+|------|------|------|------|
+| `GET` | `/api/admin/dashboard` | 运营概览数据 | admin+ |
+
+**响应结构**：
+```json
+{
+  "online_users": 5,
+  "total_tenants": 12,
+  "active_sessions": 8,
+  "host_status": {
+    "total": 20,
+    "online": 18,
+    "offline": 2
+  },
+  "recent_activities": [
+    {
+      "tenant_id": "alice",
+      "action": "connect_host",
+      "target": "prod-server-01",
+      "timestamp": "2026-05-15T14:30:00Z"
+    }
+  ]
+}
+```
+
+### 10.5 审计日志存储
+
+#### SQLite 存储方案
+
+审计日志需要可查询、可筛选，结构化日志不够灵活，采用 SQLite 持久化：
+
+```sql
+-- 文件位置：data/audit.db
+
+CREATE TABLE audit_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,          -- ISO 8601
+    tenant_id   TEXT NOT NULL,          -- 操作者
+    tenant_name TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL,          -- 操作类型
+    target      TEXT NOT NULL DEFAULT '',-- 操作目标（主机名、session_id 等）
+    detail      TEXT NOT NULL DEFAULT '',-- 详细信息（JSON 字符串）
+    ip_address  TEXT NOT NULL DEFAULT '',-- 客户端 IP
+    success     INTEGER NOT NULL DEFAULT 1,  -- 1=成功, 0=失败
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 索引
+CREATE INDEX idx_audit_tenant ON audit_logs(tenant_id);
+CREATE INDEX idx_audit_action ON audit_logs(action);
+CREATE INDEX idx_audit_timestamp ON audit_logs(timestamp);
+```
+
+#### 审计事件类型
+
+| 事件 | action 值 | target | detail |
+|------|-----------|--------|--------|
+| 登录 | `login` | - | `{"ip": "..."}` |
+| 登出 | `logout` | - | - |
+| 登录失败 | `login_failed` | - | `{"reason": "wrong_password"}` |
+| 连接主机 | `connect_host` | 主机名 | `{"session_id": "..."}` |
+| 断开主机 | `disconnect_host` | 主机名 | `{"session_id": "...", "duration": "1h30m"}` |
+| 执行命令 | `run_command` | session_id | `{"command": "ls -la"}` |
+| 加载脚本 | `load_snippet` | snippet 名称 | - |
+| 上传文件 | `upload_file` | 文件路径 | `{"size": 1024}` |
+| 下载文件 | `download_file` | 文件路径 | `{"size": 2048}` |
+| 管理操作 | `admin_*` | 目标租户 ID | 变更详情 |
+
+#### AuditService
+
+```python
+# src/services/audit_service.py
+
+class AuditService:
+    """审计日志服务
+    
+    负责审计事件的写入和查询，使用 SQLite 持久化。
+    写入异步化（aiosqlite），不阻塞主流程。
+    """
+    
+    async def log(self, tenant_id: str, action: str, 
+                  target: str = "", detail: dict = None,
+                  ip_address: str = "", success: bool = True) -> None:
+        """记录审计事件"""
+    
+    async def query(self, tenant_id: str = None, action: str = None,
+                    start_time: str = None, end_time: str = None,
+                    page: int = 1, page_size: int = 50) -> dict:
+        """查询审计日志（分页）"""
+    
+    async def export_csv(self, **filters) -> str:
+        """导出审计日志为 CSV"""
+```
+
+### 10.6 Admin 页面线框图
+
+#### Dashboard 页面
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🏠 Dashboard    👥 租户管理    📡 会话监控    📋 审计日志  │
+├────────────┬──────────┬──────────┬───────────────────────┤
+│ 在线用户    │ 总租户数  │ 活跃会话  │ 主机状态              │
+│    5       │    12    │    8     │ 🟢 18 / 🔴 2         │
+├────────────┴──────────┴──────────┴───────────────────────┤
+│                                                         │
+│  最近活动                                                │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ 14:30  alice    连接主机    prod-server-01         │  │
+│  │ 14:25  bob      上传文件    /tmp/config.yaml       │  │
+│  │ 14:20  alice    执行命令    session-abc123          │  │
+│  │ 14:15  charlie  登录        -                      │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 租户管理页面
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  👥 租户管理                            [+ 新增租户]     │
+├─────────────────────────────────────────────────────────┤
+│  🔍 搜索租户...                                         │
+├──────┬────────┬────────┬────────┬──────────┬────────────┤
+│ ID   │ 名称    │ 角色    │ 状态    │ 活跃会话  │ 操作      │
+├──────┼────────┼────────┼────────┼──────────┼────────────┤
+│alice │ Alice  │ user   │ 🟢在线  │ 3        │ ✏️ 🔑 🗑️  │
+│bob   │ Bob    │ user   │ 🔴离线  │ 0        │ ✏️ 🔑 🗑️  │
+│admin │ 管理员  │ admin  │ 🟢在线  │ 1        │ ✏️ 🔑     │
+└──────┴────────┴────────┴────────┴──────────┴────────────┘
+```
+
+### 10.7 路由保护
+
+#### 后端：require_admin 装饰器
+
+```python
+# src/utils/auth_decorators.py
+
+from functools import wraps
+from fastapi import HTTPException
+
+def require_admin(func):
+    """要求 admin 或 super_admin 角色"""
+    @wraps(func)
+    async def wrapper(*args, request, **kwargs):
+        tenant = getattr(request.state, "tenant", None)
+        if not tenant or tenant.role not in ("admin", "super_admin"):
+            raise HTTPException(status_code=403, detail="需要管理员权限")
+        return await func(*args, request=request, **kwargs)
+    return wrapper
+
+def require_super_admin(func):
+    """要求 super_admin 角色"""
+    @wraps(func)
+    async def wrapper(*args, request, **kwargs):
+        tenant = getattr(request.state, "tenant", None)
+        if not tenant or tenant.role != "super_admin":
+            raise HTTPException(status_code=403, detail="需要超级管理员权限")
+        return await func(*args, request=request, **kwargs)
+    return wrapper
+```
+
+#### 前端：AdminRoute 路由守卫
+
+```typescript
+// frontend/src/components/AdminRoute.tsx
+
+import { Navigate } from "react-router-dom";
+import { useAuth } from "../hooks/useAuth";
+
+export function AdminRoute({ children }: { children: React.ReactNode }) {
+  const { tenant, isLoading } = useAuth();
+
+  if (isLoading) return <LoadingSpinner />;
+
+  if (!tenant || !["super_admin", "admin"].includes(tenant.role)) {
+    return <Navigate to="/" replace />;
+  }
+
+  return <>{children}</>;
+}
+```
+
+### 10.8 Admin Console 与现有系统的集成影响
+
+| 模块 | 改动量 | 说明 |
+|------|--------|------|
+| `src/models/tenant.py` | 小量改动 | `TenantRole` 枚举新增 `SUPER_ADMIN` |
+| `src/services/audit_service.py` | **新增** | SQLite 审计日志服务 |
+| `src/api/admin.py` | **新增（扩展）** | 完整 Admin API（租户 CRUD、会话监控、审计查询、Dashboard） |
+| `src/utils/auth_decorators.py` | **新增** | `require_admin` / `require_super_admin` 装饰器 |
+| `frontend/src/components/AdminLayout.tsx` | **新增** | Admin Console 布局组件 |
+| `frontend/src/pages/admin/DashboardPage.tsx` | **新增** | Dashboard 页面 |
+| `frontend/src/pages/admin/TenantManagePage.tsx` | **新增** | 租户管理页面 |
+| `frontend/src/pages/admin/SessionMonitorPage.tsx` | **新增** | 会话监控页面 |
+| `frontend/src/pages/admin/AuditLogPage.tsx` | **新增** | 审计日志页面 |
+| `frontend/src/components/AdminRoute.tsx` | **新增** | 路由守卫组件 |
+| `frontend/src/App.tsx` | 中等改动 | 引入 react-router-dom + Admin 路由配置 |
+| `config/tenants.yaml` | 小量改动 | 新增 `super_admin` 角色的租户示例 |
+| `requirements.txt` | 小量改动 | 新增 `aiosqlite` 依赖 |
+
+### 10.9 设计决策记录（Admin Console）
+
+| 决策 | 选项 | 决定 | 理由 |
+|------|------|------|------|
+| Admin 前端架构 | 独立 SPA / 同一 SPA 路由分离 | **同一 SPA 路由分离** | 共享 auth、API 层，减少维护成本 |
+| 审计日志存储 | 结构化日志文件 / SQLite / PostgreSQL | **SQLite** | 轻量、无外部依赖、支持 SQL 查询 |
+| 角色层级 | 二级(admin/user) / 三级(super_admin/admin/user) | **三级** | 分离"运维管理"和"全量访问"两种 admin 职责 |
+| 路由库 | 条件渲染 / react-router-dom | **react-router-dom** | Admin Console 多页面需要路由管理 |
+| 审计写入 | 同步写入 / 异步写入 | **异步写入（aiosqlite）** | 不阻塞主业务流程 |
+| 会话强制断开 | API 直接 kill / 通知后超时 kill | **API 直接 kill** | 运维场景需要即时生效 |
+
+---
+
+## 11. 更新后的完整实施计划
+
+### Sprint 1 — 后端认证核心 + Token 刷新
+
+（内容同 §9 Sprint 1，不变）
+
+### Sprint 2 — 会话隔离 + 主机授权 + SSE 隔离
+
+（内容同 §9 Sprint 2，不变）
+
+### Sprint 3 — 前端登录 UI + Token 管理
+
+（内容同 §9 Sprint 3，不变）
+
+### Sprint 4 — 审计日志 + 管理 API + 热加载 + 测试
+
+（内容同 §9 Sprint 4，不变）
+
+### Sprint 5 — 运营管理控制台（新增）
+
+| 任务 | 详情 | 依赖 |
+|------|------|------|
+| 创建 `src/services/audit_service.py` | SQLite 审计日志服务（写入 + 分页查询 + CSV 导出） | Sprint 4 |
+| 扩展 `src/api/admin.py` | 完整 Admin API（租户 CRUD、会话监控、Dashboard、审计查询） | Sprint 4 |
+| 创建 `src/utils/auth_decorators.py` | `require_admin` / `require_super_admin` 装饰器 | Sprint 1 |
+| 引入 react-router-dom | 前端路由改造 | Sprint 3 |
+| 创建 Admin Console 页面组件 | Dashboard、租户管理、会话监控、审计日志 4 个页面 | Admin API |
+| 创建 `AdminRoute.tsx` | 路由守卫组件 | Sprint 3 |
+| 升级 `App.tsx` | 路由配置 + Admin 入口按钮 | 全部上述 |
+
+**验收标准**：
+- super_admin 可访问所有 Admin 页面
+- admin 可访问 Dashboard、会话监控、审计日志，但不能创建/删除租户
+- user 访问 `/admin/*` 被重定向到首页
+- Dashboard 数据实时刷新
+- 审计日志支持按租户、操作类型、时间范围筛选
+- 会话监控可强制断开指定会话
+- 普通终端功能不受影响
+
+---
+
 ## 状态
 
-- **当前阶段**：方案设计完成，遗留问题已全部决策
-- **下一步**：确认后说"开始实施"，从 Sprint 1 开始
+- **当前阶段**：Sprint 3 已完成（前端登录 UI + Token 管理）
+- **下一步**：Sprint 4 — 审计日志 + 管理 API + 热加载 + 测试
+- **最后更新**：2026-05-15
+
+### 实施进展
+
+| Sprint | 状态 | 说明 |
+|--------|------|------|
+| Sprint 1 | ✅ 完成 | 后端认证核心 + Token 刷新，详见 `docs/tenant-auth-progress.md` |
+| Sprint 2 | ✅ 完成 | 会话隔离 + 主机授权 + SSE 隔离 |
+| Sprint 3 | ✅ 完成 | 前端登录 UI + Token 管理（auth.ts + api.ts 升级 + LoginPage + App 认证守卫） |
+| Sprint 4 | 🔲 待开始 | 审计日志 + 管理 API + 热加载 + 测试 |
+| Sprint 5 | 🔲 待开始 | 运营管理控制台 |
