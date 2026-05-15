@@ -252,13 +252,13 @@ class SnippetRegistry:
     PROBE_NO = "__PROBE_NO__"
 
     # ── 版本号常量（脚本中嵌入 __<DOMAIN_ID>_SNIPPET_VERSION__="..." ）
+    # ★ 已废弃：版本号探测已由 MD5 探测替代（Optimization #1）
     _VERSION_PATTERN = re.compile(r'__(\w+)_SNIPPET_VERSION__="([^"]+)"')
 
     def get_script_version(self, domain_id: str) -> str | None:
         """从脚本内容中提取版本号。
 
-        脚本中需要包含如下格式的版本声明（大小写不敏感的 domain_id）：
-            __FT_SNIPPET_VERSION__="2026.05.14.1"
+        ★ 已废弃：保留供外部兼容调用，内部检测已由 MD5 替代。
 
         Returns:
             版本号字符串，或 None（脚本无版本声明）。
@@ -267,10 +267,53 @@ class SnippetRegistry:
         if not content:
             return None
         for match in self._VERSION_PATTERN.finditer(content):
-            # 匹配 domain_id（大小写不敏感）
             if match.group(1).upper() == domain_id.upper():
                 return match.group(2)
         return None
+
+    # ── MD5 探测（Optimization #1: 替代版本号比对）──────
+
+    def get_script_md5(self, domain_id: str) -> str | None:
+        """计算本地脚本文件的 MD5 摘要。
+
+        对脚本文件内容（UTF-8 编码）计算 MD5，用于与远端已注入脚本的 MD5 比对。
+        任何脚本修改（包括注释、空格）都会导致 MD5 变化，自动触发重新注入。
+
+        优于版本号方式：无需手动维护版本字符串。
+
+        Returns:
+            32 位十六进制 MD5 字符串，或 None（脚本不存在）。
+        """
+        content = self.get_script_content(domain_id)
+        if not content:
+            return None
+        return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    def get_md5_probe_command(self, domain_id: str) -> str | None:
+        """获取检测远端已注入脚本 MD5 的探测命令。
+
+        在远端对 /tmp/ts-{domain_id}.sh 文件计算 MD5，
+        兼容 Linux（md5sum）和 macOS（md5 -q）。
+        如果文件不存在，输出 __PROBE_MD5_RESULT__:none。
+
+        输出格式：__PROBE_MD5_RESULT__:<md5_hex_or_none>
+
+        ★ 使用 _RESULT__ 后缀区分输出行与命令回显行（与版本探测相同策略）。
+
+        Returns:
+            MD5 探测命令字符串，或 None（领域不存在）。
+        """
+        domain = self._domains.get(domain_id)
+        if not domain:
+            return None
+        script_name = f"ts-{domain_id}.sh"
+        # 优先 md5sum（Linux），回退 md5 -q（macOS），都没有则输出 none
+        return (
+            f'_ft_md5=$(md5sum /tmp/{script_name} 2>/dev/null | awk \'{{print $1}}\') || '
+            f'_ft_md5=$(md5 -q /tmp/{script_name} 2>/dev/null) || '
+            f'_ft_md5=none; '
+            f'echo "__PROBE_MD5_RESULT__:$_ft_md5"'
+        )
 
     def get_probe_command(self, domain_id: str) -> str | None:
         """获取检测脚本是否已在远端加载的探测命令。
@@ -294,11 +337,7 @@ class SnippetRegistry:
     def get_version_probe_command(self, domain_id: str) -> str | None:
         """获取检测远端脚本版本号的探测命令。
 
-        在远端 echo 版本变量的值，格式：__PROBE_VER_RESULT__:<version>
-        如果变量未定义（脚本未加载或旧版本无版本号），输出 __PROBE_VER_RESULT__:none
-
-        ★ Bugfix #21: 使用 __PROBE_VER_RESULT__ 而非 __PROBE_VER__ 作为输出标记，
-        避免 wait_pattern 匹配到命令回显行（回显行含未展开的 ${...}，不含 _RESULT__）。
+        ★ 已废弃：保留供外部兼容调用，内部检测已由 get_md5_probe_command() 替代。
 
         Returns:
             版本探测命令字符串，或 None（领域不存在）。
@@ -426,13 +465,14 @@ async def ensure_snippet_loaded(
     registry: SnippetRegistry,
     domain_id: str,
 ) -> str | None:
-    """确保指定域的 snippet 已加载到远端会话且版本最新。
+    """确保指定域的 snippet 已加载到远端会话且内容最新。
 
     三步探测逻辑（避免不必要的重注入）：
     1. 探测函数是否存在（type <first_command>）
-    2. 如果存在，探测版本号是否与本地一致
-    3. 仅在函数不存在或版本过期时才注入
+    2. 如果存在，探测远端脚本文件 MD5 是否与本地一致
+    3. 仅在函数不存在或 MD5 不匹配时才注入
 
+    ★ Optimization #1: 由版本号比对改为 MD5 比对，无需手动维护版本字符串。
     ★ Bugfix #21: 修复探测回显/注入超时/日志等问题
     ★ Bugfix #22c: 注入期间静默 WebSocket 广播，避免 base64 刷屏浏览器终端
 
@@ -468,44 +508,44 @@ async def ensure_snippet_loaded(
             )
             last_line = _extract_last_nonempty_line(probe_output)
             if SnippetRegistry.PROBE_YES in last_line:
-                # 函数存在 → 步骤 2: 检查版本号
+                # 函数存在 → 步骤 2: 检查 MD5（Optimization #1）
                 need_inject = False
-                local_version = registry.get_script_version(domain_id)
-                if local_version:
-                    ver_probe = registry.get_version_probe_command(domain_id)
-                    if ver_probe:
+                local_md5 = registry.get_script_md5(domain_id)
+                if local_md5:
+                    md5_probe = registry.get_md5_probe_command(domain_id)
+                    if md5_probe:
                         try:
-                            ver_output = await session.send_command(
-                                command=ver_probe,
-                                wait_pattern=r"__PROBE_VER_RESULT__:\w",
+                            md5_output = await session.send_command(
+                                command=md5_probe,
+                                wait_pattern=r"__PROBE_MD5_RESULT__:\w",
                                 timeout=5.0,
                             )
-                            remote_version = _extract_version_from_output(ver_output)
+                            remote_md5 = _extract_md5_from_output(md5_output)
                             if (
-                                remote_version
-                                and remote_version != "none"
-                                and remote_version == local_version
+                                remote_md5
+                                and remote_md5 != "none"
+                                and remote_md5 == local_md5
                             ):
                                 logger.debug(
-                                    "%s snippet 已是最新版本: %s",
-                                    domain_id, local_version,
+                                    "%s snippet MD5 一致 (%s)，无需注入",
+                                    domain_id, local_md5[:8],
                                 )
-                                return None  # 版本一致，无需注入
+                                return None  # MD5 一致，无需注入
                             else:
                                 logger.info(
-                                    "%s snippet 版本过期: 远端=%s, 本地=%s, 将重新注入",
+                                    "%s snippet MD5 不匹配: 远端=%s, 本地=%s, 将重新注入",
                                     domain_id,
-                                    remote_version or "unknown",
-                                    local_version,
+                                    (remote_md5 or "unknown")[:8],
+                                    local_md5[:8],
                                 )
                                 need_inject = True
-                                inject_reason = "版本更新"
+                                inject_reason = "MD5 不匹配"
                         except (TimeoutError, ConnectionError):
-                            logger.debug("版本探测超时，将重新注入")
+                            logger.debug("MD5 探测超时，将重新注入")
                             need_inject = True
-                            inject_reason = "版本探测超时"
+                            inject_reason = "MD5 探测超时"
                 else:
-                    # 本地脚本没有版本号，已加载就够了
+                    # 本地脚本不存在，已加载就够了
                     return None
         except (TimeoutError, ConnectionError):
             pass  # 探测失败，继续注入
@@ -590,6 +630,8 @@ def _extract_last_nonempty_line(text: str) -> str:
 def _extract_version_from_output(output: str) -> str | None:
     """从版本探测输出中提取远端版本号。
 
+    ★ 已废弃：保留供外部兼容调用。
+
     从最后一行向上扫描，过滤回显行残留（含 $ { } 等未展开变量引用）。
     """
     for line in reversed(output.splitlines()):
@@ -598,4 +640,25 @@ def _extract_version_from_output(output: str) -> str | None:
             val = stripped.split("__PROBE_VER_RESULT__:", 1)[1].strip()
             if val and "$" not in val and "{" not in val:
                 return val
+    return None
+
+
+def _extract_md5_from_output(output: str) -> str | None:
+    """从 MD5 探测输出中提取远端脚本 MD5。
+
+    从最后一行向上扫描，过滤回显行残留（含 $ { } 等未展开变量引用）。
+    合法 MD5 为 32 位十六进制字符串。
+
+    Returns:
+        MD5 字符串（32 位 hex），或 "none"（文件不存在），或 None（解析失败）。
+    """
+    _MD5_HEX_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if "__PROBE_MD5_RESULT__:" in stripped:
+            val = stripped.split("__PROBE_MD5_RESULT__:", 1)[1].strip()
+            if val and "$" not in val and "{" not in val:
+                # 合法值："none" 或 32 位 hex
+                if val == "none" or _MD5_HEX_RE.match(val):
+                    return val
     return None

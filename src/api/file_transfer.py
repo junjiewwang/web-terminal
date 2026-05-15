@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import gzip
 import tempfile
 from pathlib import Path
 
@@ -47,8 +48,16 @@ terminal_manager: TerminalManager | None = None
 _TEMP_DIR = Path(tempfile.gettempdir()) / "wetty-file-transfer"
 _TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# 上传文件大小限制（10MB，与 PtyFileTransfer 推荐上限一致）
-_MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+# ★ Optimization #2: 双阈值文件大小限制 ★
+# PTY 传输瓶颈是压缩后数据量，而非原始文件大小。
+# 例如 20MB 日志 → gzip → 4MB 压缩数据 → 允许传输。
+#
+# 两个阈值：
+#   _MAX_RAW_SIZE     = 50MB  原始大小绝对上限（防止内存爆炸）
+#   _MAX_TRANSFER_SIZE = 10MB  压缩后传输大小上限（PTY 通道限制）
+_MAX_RAW_SIZE = 50 * 1024 * 1024       # 50MB：原始文件绝对上限
+_MAX_TRANSFER_SIZE = 10 * 1024 * 1024  # 10MB：压缩后传输大小上限
+_GZIP_COMPRESS_LEVEL = 6               # gzip 压缩级别（与 pty_file_transfer 一致）
 
 # 活跃上传任务注册表：session_id → asyncio.Task
 # 用于取消 API 查找并 cancel 正在进行的上传
@@ -125,10 +134,41 @@ async def upload_file(
 
     # 读取上传文件
     content = await file.read()
-    if len(content) > _MAX_UPLOAD_SIZE:
+
+    # ★ Optimization #2: 双阈值大小校验 ★
+    # 阈值1：原始大小绝对上限（防止内存爆炸）
+    if len(content) > _MAX_RAW_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"文件大小 {len(content)} 字节超过限制 {_MAX_UPLOAD_SIZE} 字节（10MB）",
+            detail=(
+                f"文件大小 {len(content)} 字节（{len(content) / 1024 / 1024:.1f}MB）"
+                f"超过绝对上限 {_MAX_RAW_SIZE / 1024 / 1024:.0f}MB"
+            ),
+        )
+
+    # 阈值2：评估压缩后传输大小
+    # 如果原始大小已 <= 传输上限，直接放行
+    # 如果原始大小 > 传输上限，尝试 gzip 压缩，压缩后 <= 传输上限则放行
+    if len(content) > _MAX_TRANSFER_SIZE:
+        try:
+            compressed = gzip.compress(content, compresslevel=_GZIP_COMPRESS_LEVEL)
+            compressed_size = len(compressed)
+        except Exception:
+            compressed_size = len(content)  # 压缩失败，用原始大小评估
+
+        if compressed_size > _MAX_TRANSFER_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"文件大小 {len(content) / 1024 / 1024:.1f}MB，"
+                    f"压缩后 {compressed_size / 1024 / 1024:.1f}MB，"
+                    f"仍超过传输上限 {_MAX_TRANSFER_SIZE / 1024 / 1024:.0f}MB。"
+                    f"建议使用 SCP/SFTP 传输大文件。"
+                ),
+            )
+        logger.info(
+            "文件大小 %.1fMB 超过传输上限但压缩后 %.1fMB 可接受，允许上传",
+            len(content) / 1024 / 1024, compressed_size / 1024 / 1024,
         )
 
     if not content:

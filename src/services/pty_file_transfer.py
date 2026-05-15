@@ -298,8 +298,11 @@ _POST_ACK_DELAY_MIN = 0.005   # 下限 5ms
 _POST_ACK_DELAY_MAX = 0.5     # 上限 500ms
 _SPEEDUP_THRESHOLD = 20        # 连续成功 20 个 chunk 后尝试减半（大 chunk 总数少，更快加速）
 
-# 最大推荐文件大小（PTY 通道传输本身较慢，大文件建议用 SCP/SFTP）
-_MAX_RECOMMENDED_SIZE = 10 * 1024 * 1024  # 10MB
+# ★ Optimization #2: 双阈值文件大小限制 ★
+# PTY 传输瓶颈是压缩后数据量。大文件如果可压缩（日志/文本），
+# 压缩后 <= 10MB 即可通过 PTY 传输。
+_MAX_RECOMMENDED_SIZE = 10 * 1024 * 1024  # 10MB：压缩后传输推荐上限（软警告）
+_MAX_RAW_SIZE = 50 * 1024 * 1024          # 50MB：原始大小绝对上限
 
 # ── 智能压缩参数（O2 优化）──────────────────────
 # 传输前尝试 gzip 压缩，只有压缩率 > 阈值时才使用压缩传输。
@@ -380,10 +383,16 @@ class PtyFileTransfer:
             )
 
         file_size = local_file.stat().st_size
-        if file_size > _MAX_RECOMMENDED_SIZE:
-            logger.warning(
-                "文件 %s 大小 %.1fMB 超过推荐上限 %.1fMB，传输可能较慢",
-                local_path, file_size / 1024 / 1024, _MAX_RECOMMENDED_SIZE / 1024 / 1024,
+        if file_size > _MAX_RAW_SIZE:
+            return TransferResult(
+                success=False, remote_path=remote_path,
+                local_path=local_path, file_size=file_size,
+                message=(
+                    f"文件 {local_path} 大小 {file_size / 1024 / 1024:.1f}MB "
+                    f"超过绝对上限 {_MAX_RAW_SIZE / 1024 / 1024:.0f}MB，"
+                    "建议使用 SCP/SFTP 传输大文件"
+                ),
+                state=TransferState.FAILED,
             )
 
         file_data = local_file.read_bytes()
@@ -419,6 +428,17 @@ class PtyFileTransfer:
         # 确定实际传输的数据
         transfer_data = compressed_data if use_compression else file_data
         transfer_size = len(transfer_data)  # 实际要通过 PTY 传输的字节数
+
+        # ★ Optimization #2: 基于压缩后大小的传输推荐上限软警告
+        if transfer_size > _MAX_RECOMMENDED_SIZE:
+            logger.warning(
+                "文件 %s 传输大小 %.1fMB%s 超过推荐上限 %.1fMB，传输可能较慢",
+                local_path, transfer_size / 1024 / 1024,
+                f"（原始 {file_size / 1024 / 1024:.1f}MB gzip→ {transfer_size / 1024 / 1024:.1f}MB）"
+                if use_compression else "",
+                _MAX_RECOMMENDED_SIZE / 1024 / 1024,
+            )
+
         transfer_timeout = _compute_timeout(transfer_size, timeout)
 
         logger.info(
