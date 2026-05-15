@@ -21,11 +21,14 @@ from src.api import events, hosts, sessions, tmux
 from src.api import terminal as terminal_api
 from src.api import snippets as snippets_api
 from src.api import file_transfer as file_transfer_api
+from src.api import auth as auth_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
 from src.models.database import async_session_factory, init_db
+from src.models.tenant import SYSTEM_TENANT
 from src.services.host_manager import HostManager
 from src.services.snippet_registry import SnippetRegistry
 from src.services.ssh_session import SSHSessionManager
+from src.services.tenant_registry import TenantRegistry, current_tenant_var
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
 from src.utils.security import generate_api_token, verify_api_token
@@ -37,11 +40,14 @@ ssh_manager = SSHSessionManager()
 terminal_manager = TerminalManager()
 tmux_manager_instance = TmuxWindowManager()
 snippet_registry = SnippetRegistry()
+tenant_registry = TenantRegistry()
 
 # hosts.yaml 路径
 _HOSTS_YAML = Path(__file__).resolve().parent.parent / "config" / "hosts.yaml"
 # snippets.yaml 路径
 _SNIPPETS_YAML = Path(__file__).resolve().parent.parent / "config" / "snippets.yaml"
+# tenants.yaml 路径
+_TENANTS_YAML = Path(__file__).resolve().parent.parent / "config" / "tenants.yaml"
 
 # 文件监听防抖间隔（秒）
 _WATCH_DEBOUNCE_SECONDS = 2.0
@@ -70,6 +76,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Snippet Registry 初始加载失败，Snippet 功能不可用")
 
+    # 加载 Tenant Registry（启动时首次加载，文件不存在时降级为开发模式）
+    try:
+        tenant_registry.load_from_yaml(_TENANTS_YAML)
+        if tenant_registry.loaded:
+            logger.info("多租户认证已启用 ✓")
+        else:
+            logger.info("tenants.yaml 未找到或为空，多租户认证未启用（开发模式）")
+    except Exception:
+        logger.exception("Tenant Registry 加载失败，多租户认证未启用")
+
     # 注入全局服务实例到 API 模块
     sessions.ssh_manager = ssh_manager
     tmux.tmux_manager = tmux_manager_instance
@@ -77,6 +93,7 @@ async def lifespan(app: FastAPI):
     terminal_api.tmux_manager = tmux_manager_instance
     snippets_api.snippet_registry = snippet_registry
     file_transfer_api.terminal_manager = terminal_manager
+    auth_api._tenant_registry = tenant_registry
 
     # 初始化 MCP Server 依赖
     init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance, snippet_registry=snippet_registry)
@@ -95,6 +112,9 @@ async def lifespan(app: FastAPI):
     # 启动 snippets.yaml 文件监听后台任务
     watch_snippets_task = asyncio.create_task(_watch_snippets_yaml())
 
+    # 启动 tenants.yaml 文件监听后台任务
+    watch_tenants_task = asyncio.create_task(_watch_tenants_yaml())
+
     # 启动 zombie tmux session 定期清理后台任务
     zombie_cleanup_task = asyncio.create_task(_cleanup_zombie_sessions_loop())
 
@@ -109,6 +129,7 @@ async def lifespan(app: FastAPI):
         logger.info("服务关闭中...")
         watch_task.cancel()
         watch_snippets_task.cancel()
+        watch_tenants_task.cancel()
         zombie_cleanup_task.cancel()
         try:
             await watch_task
@@ -116,6 +137,10 @@ async def lifespan(app: FastAPI):
             pass
         try:
             await watch_snippets_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await watch_tenants_task
         except asyncio.CancelledError:
             pass
         try:
@@ -222,6 +247,42 @@ async def _watch_snippets_yaml() -> None:
         raise
 
 
+async def _watch_tenants_yaml() -> None:
+    """后台任务：监听 tenants.yaml 文件变更，自动触发热加载
+
+    使用 watchfiles 异步监听 + 防抖机制。
+    如果 watchfiles 不可用，静默退出。
+    """
+    try:
+        from watchfiles import awatch
+    except ImportError:
+        logger.warning("watchfiles 未安装，tenants.yaml 热加载已禁用")
+        return
+
+    yaml_dir = _TENANTS_YAML.parent
+    yaml_name = _TENANTS_YAML.name
+
+    logger.info("启动 tenants.yaml 文件监听: %s", _TENANTS_YAML)
+
+    try:
+        async for changes in awatch(yaml_dir, debounce=int(_WATCH_DEBOUNCE_SECONDS * 1000)):
+            relevant = any(
+                Path(path).name == yaml_name
+                for _, path in changes
+            )
+            if not relevant:
+                continue
+
+            logger.info("检测到 tenants.yaml 变更，触发热加载...")
+            try:
+                tenant_registry.reload()
+            except Exception:
+                logger.exception("tenants.yaml 热加载失败")
+    except asyncio.CancelledError:
+        logger.info("tenants.yaml 文件监听已停止")
+        raise
+
+
 # zombie tmux session 清理间隔（秒）
 _ZOMBIE_CLEANUP_INTERVAL = 60
 
@@ -278,16 +339,25 @@ _AUTH_WHITELIST = {"/health", "/docs", "/openapi.json", "/redoc"}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Bearer Token 认证中间件
+    """Bearer Token 认证中间件（多租户升级版）
 
-    - /health、/docs 等路径免认证
-    - /api/ 和 /mcp/ 路径需要 Bearer Token
-    - 其他路径（静态文件等）免认证
+    认证优先级：
+    1. 环境变量 WETTY_API_TOKEN（全局 Token → SYSTEM_TENANT）
+    2. JWT Token（多租户模式 → 解析出 Tenant）
+    3. 自动生成 Token（旧版向后兼容 → SYSTEM_TENANT）
+
+    认证成功后：
+    - request.state.tenant = Tenant 对象（所有下游 API 可用）
+    - current_tenant_var.set(tenant)（MCP 工具通过 ContextVar 获取）
     """
     path = request.url.path
 
     # 白名单路径免认证
     if path in _AUTH_WHITELIST:
+        return await call_next(request)
+
+    # 登录/刷新/注销/状态 API 免认证
+    if path in ("/api/auth/login", "/api/auth/refresh", "/api/auth/logout", "/api/auth/status"):
         return await call_next(request)
 
     # /api/ 和 /mcp/ 路径需要认证，其他路径（静态文件等）免认证
@@ -298,13 +368,28 @@ async def auth_middleware(request: Request, call_next):
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        # 优先检查环境变量 Token
+
+        # 1. 优先检查环境变量 Token（全局 Token → SYSTEM_TENANT）
         env_token = os.environ.get("WETTY_API_TOKEN")
         if env_token:
             import secrets
             if secrets.compare_digest(token, env_token):
+                request.state.tenant = SYSTEM_TENANT
+                current_tenant_var.set(SYSTEM_TENANT)
                 return await call_next(request)
-        elif verify_api_token(token):
+
+        # 2. 尝试 JWT Token 解析（多租户模式）
+        if tenant_registry.loaded:
+            tenant = tenant_registry.verify_access_token(token)
+            if tenant:
+                request.state.tenant = tenant
+                current_tenant_var.set(tenant)
+                return await call_next(request)
+
+        # 3. 尝试自动生成的 Token（向后兼容）
+        if verify_api_token(token):
+            request.state.tenant = SYSTEM_TENANT
+            current_tenant_var.set(SYSTEM_TENANT)
             return await call_next(request)
 
         return JSONResponse(
@@ -312,8 +397,10 @@ async def auth_middleware(request: Request, call_next):
             content={"detail": "无效的 API Token"},
         )
 
-    # 未提供 Token 时：开发模式放行（未配置环境变量 Token 时视为开发模式）
-    if not os.environ.get("WETTY_API_TOKEN"):
+    # 未提供 Token 时：开发模式放行（未配置环境变量 Token 且未加载 tenants.yaml）
+    if not os.environ.get("WETTY_API_TOKEN") and not tenant_registry.loaded:
+        request.state.tenant = SYSTEM_TENANT
+        current_tenant_var.set(SYSTEM_TENANT)
         return await call_next(request)
 
     return JSONResponse(
@@ -325,6 +412,7 @@ async def auth_middleware(request: Request, call_next):
 
 # ── 注册路由 ──────────────────────────────────
 
+app.include_router(auth_api.router)
 app.include_router(hosts.router)
 app.include_router(sessions.router)
 app.include_router(events.router)

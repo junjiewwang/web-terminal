@@ -149,6 +149,7 @@ class TerminalInfo:
     ws_clients: int
     exit_reason: str | None = None
     exit_code: int | None = None
+    tenant_id: str = ""
 
 
 class TerminalSession:
@@ -175,10 +176,12 @@ class TerminalSession:
         instance_name: str,
         backend: TerminalBackend = TerminalBackend.TMUX,
         scrollback_capacity: int = _DEFAULT_SCROLLBACK_CAPACITY,
+        tenant_id: str = "",
     ) -> None:
         self.session_id = session_id
         self.instance_name = instance_name
         self.backend = backend
+        self.tenant_id = tenant_id
         self.tmux_session_name = f"{_TMUX_SESSION_PREFIX}-{instance_name}"
 
         # PTY 进程
@@ -259,6 +262,7 @@ class TerminalSession:
             ws_clients=len(self._ws_clients),
             exit_reason=self._exit_reason.value if self._exit_reason else None,
             exit_code=self._exit_code,
+            tenant_id=self.tenant_id,
         )
 
     # ── 退出回调管理 ──────────────────────────────
@@ -1107,7 +1111,7 @@ class TerminalManager:
         # 停止所有现有会话
         async with self._lock:
             sessions = list(self._sessions.values())
-            stopped_names = list(self._sessions.keys())
+            stopped_names = [s.instance_name for s in sessions]
             self._sessions.clear()
 
         for s in sessions:
@@ -1128,30 +1132,41 @@ class TerminalManager:
         host: Host,
         decrypted_password: str | None = None,
         backend: str | TerminalBackend | None = None,
+        tenant_id: str = "",
     ) -> tuple[TerminalSession, bool]:
         """创建并启动终端会话。
+
+        Args:
+            instance_name: 实例名（不含租户前缀，前缀由内部自动添加）
+            host: 目标主机
+            decrypted_password: 解密后的密码
+            backend: 终端后端
+            tenant_id: 租户 ID（用于会话隔离，空字符串表示系统会话）
 
         Returns:
             (session, is_new) 元组。is_new=True 表示新创建了会话，
             is_new=False 表示复用了已有会话（instance_name + backend 完全相同）。
         """
+        # 构建带租户前缀的内部键名（隔离不同租户的同名会话）
+        storage_key = self._build_storage_key(tenant_id, instance_name)
         selected_backend = resolve_terminal_backend(backend, fallback=self._default_backend)
         previous_session: TerminalSession | None = None
 
         async with self._lock:
-            existing = self._sessions.get(instance_name)
+            existing = self._sessions.get(storage_key)
             if existing and existing.running and existing.backend == selected_backend:
                 return existing, False
             if existing is not None:
-                previous_session = self._sessions.pop(instance_name, None)
+                previous_session = self._sessions.pop(storage_key, None)
 
             session_id = str(uuid.uuid4())
             session = TerminalSession(
                 session_id=session_id,
                 instance_name=instance_name,
                 backend=selected_backend,
+                tenant_id=tenant_id,
             )
-            self._sessions[instance_name] = session
+            self._sessions[storage_key] = session
 
         if previous_session is not None:
             await previous_session.stop()
@@ -1160,48 +1175,92 @@ class TerminalManager:
             await session.start(host, decrypted_password)
         except Exception:
             async with self._lock:
-                current = self._sessions.get(instance_name)
+                current = self._sessions.get(storage_key)
                 if current is session:
-                    self._sessions.pop(instance_name, None)
+                    self._sessions.pop(storage_key, None)
             raise
 
         logger.info(
-            "终端会话已创建: %s -> %s (backend=%s)",
+            "终端会话已创建: %s -> %s (backend=%s, tenant=%s)",
             session_id[:8],
             instance_name,
             selected_backend.value,
+            tenant_id or "_system",
         )
         return session, True
 
-    def get_session(self, instance_name: str) -> TerminalSession | None:
-        """根据实例名获取会话"""
-        session = self._sessions.get(instance_name)
+    @staticmethod
+    def _build_storage_key(tenant_id: str, instance_name: str) -> str:
+        """构建带租户前缀的内部存储键名。
+
+        格式："{tenant_id}:{instance_name}"（tenant_id 为空时为 ":{instance_name}"）。
+        不同租户连接同一主机会产生不同的会话。
+        """
+        return f"{tenant_id}:{instance_name}"
+
+    def get_session(self, instance_name: str, tenant_id: str = "") -> TerminalSession | None:
+        """根据实例名获取会话（需匹配 tenant_id）"""
+        storage_key = self._build_storage_key(tenant_id, instance_name)
+        session = self._sessions.get(storage_key)
         if session and session.running:
             return session
         return None
 
-    def get_session_by_id(self, session_id: str) -> TerminalSession | None:
-        """根据 session_id 获取会话"""
+    def get_session_by_id(self, session_id: str, tenant_id: str | None = None) -> TerminalSession | None:
+        """根据 session_id 获取会话
+
+        Args:
+            session_id: 会话 ID
+            tenant_id: 租户 ID。None 表示不校验归属（admin 场景），
+                       非 None 时校验 session.tenant_id 必须匹配。
+        """
         for session in self._sessions.values():
             if session.session_id == session_id:
+                if tenant_id is not None and session.tenant_id != tenant_id:
+                    return None  # 会话存在但不属于该租户
                 return session
         return None
 
-    def has_running_session(self, instance_name: str) -> bool:
+    def has_running_session(self, instance_name: str, tenant_id: str = "") -> bool:
         """检测是否有运行中的会话"""
-        session = self._sessions.get(instance_name)
+        storage_key = self._build_storage_key(tenant_id, instance_name)
+        session = self._sessions.get(storage_key)
         return session is not None and session.running
 
-    async def stop_session(self, instance_name: str) -> bool:
-        """停止指定会话"""
+    async def stop_session(self, instance_name: str, tenant_id: str = "") -> bool:
+        """停止指定会话（需匹配 tenant_id）"""
+        storage_key = self._build_storage_key(tenant_id, instance_name)
         async with self._lock:
-            session = self._sessions.pop(instance_name, None)
+            session = self._sessions.pop(storage_key, None)
 
         if not session:
             return False
 
         await session.stop()
-        logger.info("终端会话已停止: %s", instance_name)
+        logger.info("终端会话已停止: %s (tenant=%s)", instance_name, tenant_id or "_system")
+        return True
+
+    async def stop_session_by_id(self, session_id: str, tenant_id: str | None = None) -> bool:
+        """根据 session_id 停止会话（admin 强制断开场景）
+
+        Args:
+            session_id: 会话 ID
+            tenant_id: 租户 ID。None 表示不校验归属（admin 场景）。
+        """
+        async with self._lock:
+            target_key: str | None = None
+            for key, session in self._sessions.items():
+                if session.session_id == session_id:
+                    if tenant_id is not None and session.tenant_id != tenant_id:
+                        return False
+                    target_key = key
+                    break
+            if target_key is None:
+                return False
+            session = self._sessions.pop(target_key)
+
+        await session.stop()
+        logger.info("终端会话已停止(by_id): %s", session_id[:8])
         return True
 
     async def stop_all(self) -> None:
@@ -1215,9 +1274,19 @@ class TerminalManager:
 
         logger.info("所有终端会话已停止")
 
-    def list_sessions(self) -> list[TerminalInfo]:
-        """列出所有会话"""
-        return [s.info for s in self._sessions.values()]
+    def list_sessions(self, tenant_id: str | None = None) -> list[TerminalInfo]:
+        """列出会话
+
+        Args:
+            tenant_id: 租户 ID。None 表示返回全部（admin 场景），
+                       非 None 时仅返回属于该租户的会话。
+        """
+        if tenant_id is None:
+            return [s.info for s in self._sessions.values()]
+        return [
+            s.info for s in self._sessions.values()
+            if s.tenant_id == tenant_id
+        ]
 
     async def cleanup_zombie_sessions(self) -> int:
         """清理 zombie tmux session。"""

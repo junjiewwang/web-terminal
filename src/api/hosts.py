@@ -5,12 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.database import get_db
 from src.models.host import HostCreate, HostResponse, HostUpdate
 from src.services.host_manager import HostManager
+from src.utils.tenant_helpers import get_current_tenant
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 
@@ -24,13 +25,57 @@ def _get_manager(session: DbSessionDep) -> HostManager:
 HostManagerDep = Annotated[HostManager, Depends(_get_manager)]
 
 
+def _filter_hosts_by_tenant_tags(
+    hosts: list[HostResponse],
+    allowed_tags: list[str],
+) -> list[HostResponse]:
+    """递归过滤主机树：只保留 tags 与 allowed_tags 有交集的节点。
+
+    过滤逻辑：
+    - 如果一个主机的 tags 与 allowed_tags 有交集 → 保留（含所有子节点，因为子节点通过该主机访问）
+    - 如果一个主机的 tags 无交集，但某个子节点匹配 → 也保留（作为路径中间节点）
+    - 叶子节点无交集 → 移除
+    """
+    if not allowed_tags:
+        return hosts  # allowed_tags 为空表示无限制
+
+    tag_set = set(allowed_tags)
+    filtered: list[HostResponse] = []
+
+    for host in hosts:
+        # 递归过滤子节点
+        filtered_children = _filter_hosts_by_tenant_tags(host.children, allowed_tags)
+
+        # 当前节点匹配 OR 有匹配的子节点 → 保留
+        host_tags = set(host.tags) if host.tags else set()
+        if host_tags & tag_set or filtered_children:
+            # 浅拷贝 host，替换 children
+            filtered_host = host.model_copy(update={"children": filtered_children})
+            filtered.append(filtered_host)
+
+    return filtered
+
+
 @router.get("", response_model=list[HostResponse])
 async def list_hosts(
     manager: HostManagerDep,
+    request: Request,
     tag: str | None = None,
 ) -> list[HostResponse]:
-    """获取递归主机树，支持按标签过滤。"""
-    return await manager.list_host_responses(tag=tag)
+    """获取递归主机树，支持按标签过滤。
+
+    租户隔离规则：
+    - admin 角色或 allowed_tags 为空 → 返回全部主机
+    - 普通用户 + 有 allowed_tags → 只返回匹配标签的主机
+    """
+    hosts = await manager.list_host_responses(tag=tag)
+
+    # 租户主机过滤
+    tenant = get_current_tenant(request)
+    if not tenant.is_admin and tenant.allowed_tags:
+        hosts = _filter_hosts_by_tenant_tags(hosts, tenant.allowed_tags)
+
+    return hosts
 
 
 @router.get("/{host_id}", response_model=HostResponse)
