@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import LoginPage from "./components/LoginPage";
 import HostList from "./components/HostList";
 import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
@@ -18,6 +19,13 @@ import {
   fetchBackend,
   switchBackend,
 } from "./services/api";
+import {
+  getAuthState,
+  onAuthChange,
+  checkAuthStatus,
+  logout,
+  type TenantInfo,
+} from "./services/auth";
 
 const EVENT_LABELS: Record<string, string> = {
   command_start: "执行命令",
@@ -63,6 +71,58 @@ function eventSummary(event: AgentEvent | null): string | null {
 }
 
 export default function App() {
+  // ── 认证状态 ──────────────────────────────────
+  /** 后端是否要求认证（null = 尚未检测） */
+  const [authRequired, setAuthRequired] = useState<boolean | null>(null);
+  /** 当前租户信息（已登录时非 null） */
+  const [tenant, setTenant] = useState<TenantInfo | null>(() => getAuthState().tenant);
+
+  // 启动时检测后端认证状态
+  useEffect(() => {
+    checkAuthStatus().then((status) => setAuthRequired(status.auth_required));
+  }, []);
+
+  // 监听认证状态变更（refresh 失败清除 Token 时触发）
+  useEffect(() => {
+    return onAuthChange((state) => setTenant(state.tenant));
+  }, []);
+
+  const handleLoginSuccess = useCallback(() => {
+    setTenant(getAuthState().tenant);
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    await logout();
+    setTenant(null);
+  }, []);
+
+  // 正在检测后端认证状态 → 显示加载
+  if (authRequired === null) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[#050816]">
+        <div className="inline-block h-6 w-6 animate-spin rounded-full border-2 border-emerald-400/30 border-t-emerald-400" />
+      </div>
+    );
+  }
+
+  // 后端要求认证 + 未登录 → 显示登录页
+  if (authRequired && !tenant) {
+    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+  }
+
+  // 已登录或开发模式（不需要认证）→ 渲染主界面
+  return <MainApp tenant={tenant} onLogout={handleLogout} authRequired={authRequired} />;
+}
+
+// ── 主应用组件（原 App 主体）──────────────────
+
+interface MainAppProps {
+  tenant: TenantInfo | null;
+  onLogout: () => void;
+  authRequired: boolean;
+}
+
+function MainApp({ tenant, onLogout, authRequired }: MainAppProps) {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [hostsLoading, setHostsLoading] = useState(true);
@@ -416,6 +476,28 @@ export default function App() {
                   </span>
                 )}
               </button>
+
+              {/* 租户信息 + 登出按钮（仅在认证模式下显示） */}
+              {authRequired && tenant && (
+                <div className="flex items-center gap-1.5">
+                  <span className="hidden text-[11px] text-gray-500 sm:inline">
+                    {tenant.name}
+                    {tenant.role !== "user" && (
+                      <span className="ml-1 rounded bg-white/8 px-1 py-0.5 text-[9px] uppercase text-gray-400">
+                        {tenant.role}
+                      </span>
+                    )}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onLogout}
+                    className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-gray-400 transition-colors hover:border-red-400/30 hover:bg-red-500/10 hover:text-red-400"
+                    title="退出登录"
+                  >
+                    退出
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </header>

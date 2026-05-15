@@ -22,6 +22,7 @@
 
 import { useRef, useEffect, useCallback, useState } from "react";
 import type { TermSize } from "./useTerminal";
+import { getAccessToken } from "../services/auth";
 
 /** 连接状态 */
 export type SocketStatus = "disconnected" | "connecting" | "connected" | "error";
@@ -116,9 +117,11 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
 
       setStatus("connecting");
 
-      // 构造完整 WebSocket URL
+      // 构造完整 WebSocket URL（含认证 Token）
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const fullUrl = `${protocol}//${window.location.host}${wsUrl}`;
+      const token = getAccessToken();
+      const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+      const fullUrl = `${protocol}//${window.location.host}${wsUrl}${tokenParam}`;
 
       const ws = new WebSocket(fullUrl);
       wsRef.current = ws;

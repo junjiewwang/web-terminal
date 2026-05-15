@@ -2,17 +2,46 @@
  * API 调用 & SSE 订阅服务
  *
  * 集中管理所有后端 API 交互，前端组件只调用此模块。
+ * 所有 API 请求自动注入 Authorization Header + 401 自动刷新。
  */
+
+import {
+  getAccessToken,
+  isAccessTokenExpired,
+  refreshAccessToken,
+  clearAuth,
+} from "./auth";
 
 const API_BASE = "/api";
 
-// ── 通用重试工具 ──────────────────────────────
+// ── 通用重试工具（含认证注入） ──────────────────
+
+/**
+ * 为 RequestInit 注入 Authorization Header
+ *
+ * 如果调用者已手动设置 Authorization，则不覆盖。
+ */
+function _injectAuth(init?: RequestInit): RequestInit {
+  const token = getAccessToken();
+  if (!token) return init ?? {};
+
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  return { ...init, headers };
+}
 
 /**
  * 带指数退避的 fetch 重试封装
  *
  * 应对场景：浏览器导航竞态（前一页面 abort 请求）、
  * 网络瞬断、服务端冷启动等暂时性故障。
+ *
+ * 认证增强：
+ * - 自动注入 Authorization: Bearer <access_token>
+ * - 401 响应时自动 refresh access_token 并重放请求（仅一次）
+ * - refresh 也失败时清除 Token + 通知上层（触发登录页跳转）
  *
  * @param input   - fetch 的第一个参数
  * @param init    - fetch 的 RequestInit 选项
@@ -25,10 +54,28 @@ async function fetchWithRetry(
   retries = 3,
   baseDelay = 500,
 ): Promise<Response> {
+  // 如果 access_token 即将过期，提前静默刷新
+  if (getAccessToken() && isAccessTokenExpired()) {
+    await refreshAccessToken();
+  }
+
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(input, init);
+      const res = await fetch(input, _injectAuth(init));
+
+      // 401 自动刷新：只尝试一次，避免无限循环
+      if (res.status === 401 && attempt === 0) {
+        const refreshed = await refreshAccessToken();
+        if (refreshed) {
+          // 刷新成功，用新 Token 重放请求（不消耗重试次数）
+          return await fetch(input, _injectAuth(init));
+        }
+        // refresh 失败 → 清除 Token，上层通过 onAuthChange 感知
+        clearAuth();
+        return res;
+      }
+
       return res;
     } catch (err) {
       lastError = err;
@@ -39,6 +86,18 @@ async function fetchWithRetry(
     }
   }
   throw lastError;
+}
+
+/**
+ * 不带认证头的原始 fetch（用于文件上传等需要精确控制 Header 的场景）
+ *
+ * 仍然注入 Authorization，但不走 retry + 401 自动刷新逻辑。
+ */
+function _authedFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  return fetch(input, _injectAuth(init));
 }
 
 // ── 类型定义 ──────────────────────────────────
@@ -159,7 +218,7 @@ export async function fetchHosts(tag?: string): Promise<Host[]> {
 }
 
 export async function createHost(data: CreateHostRequest): Promise<Host> {
-  const res = await fetch(`${API_BASE}/hosts`, {
+  const res = await _authedFetch(`${API_BASE}/hosts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -172,7 +231,7 @@ export async function updateHost(
   hostId: number,
   data: Partial<CreateHostRequest>
 ): Promise<Host> {
-  const res = await fetch(`${API_BASE}/hosts/${hostId}`, {
+  const res = await _authedFetch(`${API_BASE}/hosts/${hostId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -182,14 +241,14 @@ export async function updateHost(
 }
 
 export async function deleteHost(hostId: number): Promise<void> {
-  const res = await fetch(`${API_BASE}/hosts/${hostId}`, { method: "DELETE" });
+  const res = await _authedFetch(`${API_BASE}/hosts/${hostId}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`删除主机失败: ${res.statusText}`);
 }
 
 // ── 会话管理 ──────────────────────────────────
 
 export async function createSession(hostId: number): Promise<{ session_id: string }> {
-  const res = await fetch(`${API_BASE}/sessions`, {
+  const res = await _authedFetch(`${API_BASE}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ host_id: hostId }),
@@ -203,7 +262,7 @@ export async function executeCommand(
   command: string,
   timeout = 30
 ): Promise<CommandResult> {
-  const res = await fetch(`${API_BASE}/sessions/${sessionId}/exec`, {
+  const res = await _authedFetch(`${API_BASE}/sessions/${sessionId}/exec`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ command, timeout }),
@@ -213,7 +272,7 @@ export async function executeCommand(
 }
 
 export async function closeSession(sessionId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/sessions/${sessionId}`, {
+  const res = await _authedFetch(`${API_BASE}/sessions/${sessionId}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`关闭会话失败: ${res.statusText}`);
@@ -230,7 +289,7 @@ export async function startWeTTY(hostId: number): Promise<WeTTYInstance> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-    const res = await fetch(`${API_BASE}/wetty/start`, {
+    const res = await _authedFetch(`${API_BASE}/wetty/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ host_id: hostId }),
@@ -251,14 +310,14 @@ export async function startWeTTY(hostId: number): Promise<WeTTYInstance> {
 }
 
 export async function stopWeTTY(hostName: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/wetty/stop/${encodeURIComponent(hostName)}`, {
+  const res = await _authedFetch(`${API_BASE}/wetty/stop/${encodeURIComponent(hostName)}`, {
     method: "POST",
   });
   if (!res.ok) throw new Error(`停止 WeTTY 失败: ${res.statusText}`);
 }
 
 export async function listWeTTYInstances(): Promise<WeTTYInstance[]> {
-  const res = await fetch(`${API_BASE}/wetty`);
+  const res = await _authedFetch(`${API_BASE}/wetty`);
   if (!res.ok) throw new Error(`获取 WeTTY 列表失败: ${res.statusText}`);
   return res.json();
 }
@@ -279,7 +338,7 @@ export async function startTerminal(
       body.backend = backend;
     }
 
-    const res = await fetch(`${API_BASE}/terminal/start`, {
+    const res = await _authedFetch(`${API_BASE}/terminal/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -300,7 +359,7 @@ export async function startTerminal(
 }
 
 export async function stopTerminal(instanceName: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/terminal/stop/${encodeURIComponent(instanceName)}`, {
+  const res = await _authedFetch(`${API_BASE}/terminal/stop/${encodeURIComponent(instanceName)}`, {
     method: "POST",
   });
   if (!res.ok && res.status !== 404) {
@@ -333,7 +392,7 @@ export interface SwitchBackendResult {
 export async function switchBackend(
   backend: TerminalBackend,
 ): Promise<SwitchBackendResult> {
-  const res = await fetch(`${API_BASE}/terminal/backend`, {
+  const res = await _authedFetch(`${API_BASE}/terminal/backend`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ backend }),
@@ -360,7 +419,7 @@ export interface TmuxClient {
  * @param bastionName - 堡垒机名称
  */
 export async function fetchClientTtys(bastionName: string): Promise<TmuxClient[]> {
-  const res = await fetch(`${API_BASE}/tmux/client-ttys/${encodeURIComponent(bastionName)}`);
+  const res = await _authedFetch(`${API_BASE}/tmux/client-ttys/${encodeURIComponent(bastionName)}`);
   if (!res.ok) throw new Error(`获取 tmux client 列表失败: ${res.statusText}`);
   const data = await res.json();
   return data.clients ?? [];
@@ -390,7 +449,7 @@ export async function switchTmuxWindow(
     body.client_tty = clientTty;
   }
 
-  const res = await fetch(`${API_BASE}/tmux/switch-window`, {
+  const res = await _authedFetch(`${API_BASE}/tmux/switch-window`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -702,7 +761,7 @@ export async function uploadFile(
     formData.append("remote_path", remotePath.trim());
   }
 
-  const res = await fetch(`${API_BASE}/terminal/${sessionId}/upload`, {
+  const res = await _authedFetch(`${API_BASE}/terminal/${sessionId}/upload`, {
     method: "POST",
     body: formData,
     signal,
@@ -796,7 +855,7 @@ export async function uploadFile(
  */
 export async function cancelUpload(sessionId: string): Promise<void> {
   try {
-    await fetch(`${API_BASE}/terminal/${sessionId}/upload/cancel`, {
+    await _authedFetch(`${API_BASE}/terminal/${sessionId}/upload/cancel`, {
       method: "POST",
     });
   } catch {
@@ -836,7 +895,7 @@ export async function downloadFile(
 ): Promise<DownloadCompleteResult> {
   const url = `${API_BASE}/terminal/${sessionId}/download?remote_path=${encodeURIComponent(remotePath)}`;
 
-  const res = await fetch(url, { method: "POST", signal });
+  const res = await _authedFetch(url, { method: "POST", signal });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || `下载失败: ${res.statusText}`);
@@ -906,7 +965,7 @@ export async function downloadFile(
   // 下载成功 → 用 token 触发浏览器文件下载
   if (result.success && result.token) {
     const fileUrl = `${API_BASE}/terminal/${sessionId}/download/${result.token}`;
-    const fileRes = await fetch(fileUrl);
+    const fileRes = await _authedFetch(fileUrl);
     if (!fileRes.ok) {
       throw new Error("获取下载文件失败");
     }
@@ -950,7 +1009,10 @@ async function _readSSEStream(
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/events/stream`, {
     signal,
-    headers: { Accept: "text/event-stream" },
+    headers: {
+      Accept: "text/event-stream",
+      ...(getAccessToken() ? { Authorization: `Bearer ${getAccessToken()}` } : {}),
+    },
   });
 
   if (!res.ok || !res.body) {
