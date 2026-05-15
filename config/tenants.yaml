@@ -1,0 +1,22 @@
+# 租户认证配置
+# 本文件是租户数据的 Single Source of Truth
+# 支持 watchfiles 热加载（修改后无需重启）
+
+# JWT 签名密钥（生产环境必须修改！可通过 WETTY_JWT_SECRET 环境变量覆盖）
+jwt_secret: "change-me-in-production"
+
+# Access Token 过期时间（小时）
+access_token_expire_hours: 2
+
+# Refresh Token 过期时间（天）
+refresh_token_expire_days: 7
+
+tenants:
+  - id: admin
+    name: 管理员
+    # 默认密码: admin123（请在生产环境中修改！）
+    # 使用 python -m src.utils.password_hash "new-password" 生成新哈希
+    password_hash: "$2b$12$.tmgyEVUZ7pQZWap.zGgpOjtPdFtXylkztzTQLjx8Ulmn1naHbanG"
+    role: super_admin
+    allowed_tags: []
+    max_sessions: 5
