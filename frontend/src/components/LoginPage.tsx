@@ -1,5 +1,5 @@
 /**
- * LoginPage — 租户登录页面
+ * LoginPage — 密码登录页面
  *
  * 设计风格与主应用一致：深色背景 + 玻璃态 + 渐变装饰。
  * 支持回车键提交、错误提示、加载状态。
@@ -14,7 +14,6 @@ interface LoginPageProps {
 }
 
 export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
-  const [tenantId, setTenantId] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -22,8 +21,8 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      if (!tenantId.trim() || !password.trim()) {
-        setError("请输入账号和密码");
+      if (!password.trim()) {
+        setError("请输入密码");
         return;
       }
 
@@ -31,7 +30,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
       setLoading(true);
 
       try {
-        await login(tenantId.trim(), password);
+        await login(password);
         onLoginSuccess();
       } catch (err) {
         setError(err instanceof Error ? err.message : "登录失败");
@@ -39,7 +38,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
         setLoading(false);
       }
     },
-    [tenantId, password, onLoginSuccess],
+    [password, onLoginSuccess],
   );
 
   return (
@@ -59,7 +58,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
             WebTerminal
           </h1>
           <p className="mt-2 text-sm text-gray-500">
-            SSH 终端管理平台
+            SSH 终端管理服务
           </p>
         </div>
 
@@ -68,27 +67,6 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
           onSubmit={handleSubmit}
           className="rounded-2xl border border-white/8 bg-gray-950/80 p-6 shadow-2xl backdrop-blur-xl"
         >
-          {/* 账号 */}
-          <div className="mb-4">
-            <label
-              htmlFor="tenant-id"
-              className="mb-1.5 block text-xs font-medium text-gray-400"
-            >
-              账号
-            </label>
-            <input
-              id="tenant-id"
-              type="text"
-              value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
-              placeholder="输入租户 ID"
-              autoComplete="username"
-              autoFocus
-              disabled={loading}
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white placeholder-gray-600 outline-none transition-colors focus:border-emerald-400/50 focus:ring-1 focus:ring-emerald-400/20 disabled:opacity-50"
-            />
-          </div>
-
           {/* 密码 */}
           <div className="mb-5">
             <label
@@ -102,8 +80,9 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="输入密码"
+              placeholder="输入访问密码"
               autoComplete="current-password"
+              autoFocus
               disabled={loading}
               className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white placeholder-gray-600 outline-none transition-colors focus:border-emerald-400/50 focus:ring-1 focus:ring-emerald-400/20 disabled:opacity-50"
             />

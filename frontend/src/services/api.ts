@@ -126,6 +126,9 @@ export interface EntrySpec {
   steps: LoginStep[];
 }
 
+/** 节点生命周期状态 */
+export type HostStatus = "active" | "deprecated" | "disabled";
+
 export interface Host {
   id: number;
   name: string;
@@ -134,12 +137,14 @@ export interface Host {
   username: string;
   auth_type: "key" | "password";
   private_key_path?: string;
+  credential_ref?: string | null;
   description?: string;
   tags: string[];
   host_type: HostType;
   parent_id?: number | null;
   ready_pattern?: string | null;
   entry: EntrySpec;
+  status: HostStatus;
   children: Host[];
   created_at: string;
   updated_at: string;
@@ -206,6 +211,7 @@ export interface CreateHostRequest {
   host_type?: HostType;
   parent_id?: number;
   entry?: EntrySpec;
+  status?: HostStatus;
 }
 
 // ── 主机管理 ──────────────────────────────────
@@ -245,7 +251,162 @@ export async function deleteHost(hostId: number): Promise<void> {
   if (!res.ok) throw new Error(`删除主机失败: ${res.statusText}`);
 }
 
+/** YAML 同步结果 */
+export interface SyncResult {
+  added: number;
+  updated: number;
+  deleted: number;
+  errors: string[];
+  mode?: string;
+  message: string;
+}
+
+/** 从服务端 config/hosts.yaml 同步 */
+export async function syncHostsFromYaml(): Promise<SyncResult> {
+  const res = await _authedFetch(`${API_BASE}/hosts/sync`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail?.message || err.detail || `同步失败: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** 上传 YAML 文件导入主机 */
+export async function importHostsYaml(
+  file: File,
+  mode: "merge" | "overwrite" = "merge",
+): Promise<SyncResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await _authedFetch(
+    `${API_BASE}/hosts/import?mode=${mode}`,
+    { method: "POST", body: formData },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail?.message || err.detail || `导入失败: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** 导出主机为 YAML 文件下载 */
+export async function exportHostsYaml(): Promise<void> {
+  const res = await _authedFetch(`${API_BASE}/hosts/export`);
+  if (!res.ok) throw new Error(`导出失败: ${res.statusText}`);
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "hosts.yaml";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  requestAnimationFrame(() => {
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  });
+}
+
+/** 获取当前主机配置的 YAML 纯文本（用于页面编辑器） */
+export async function fetchHostsYaml(): Promise<string> {
+  const res = await _authedFetch(`${API_BASE}/hosts/yaml`);
+  if (!res.ok) throw new Error(`获取 YAML 失败: ${res.statusText}`);
+  return res.text();
+}
+
+/** 提交 YAML 文本更新主机配置（带校验） */
+export async function updateHostsYaml(
+  content: string,
+  mode: "merge" | "overwrite" = "merge",
+): Promise<SyncResult> {
+  const res = await _authedFetch(`${API_BASE}/hosts/yaml`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content, mode }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = err.detail;
+    if (typeof detail === "object" && detail.message) {
+      const msg = detail.errors?.length
+        ? `${detail.message}\n${detail.errors.join("\n")}`
+        : detail.message;
+      throw new Error(msg);
+    }
+    throw new Error(typeof detail === "string" ? detail : `更新失败: ${res.statusText}`);
+  }
+  return res.json();
+}
+
 // ── 会话管理 ──────────────────────────────────
+
+// ── 共享凭据管理 ──────────────────────────────
+
+export interface CredentialItem {
+  id: number;
+  name: string;
+  description: string | null;
+  has_password: boolean;
+  ref_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CredentialNameItem {
+  name: string;
+  description: string | null;
+}
+
+export async function listCredentials(): Promise<CredentialItem[]> {
+  const res = await _authedFetch(`${API_BASE}/credentials`);
+  if (!res.ok) throw new Error(`获取凭据列表失败: ${res.statusText}`);
+  return res.json();
+}
+
+export async function listCredentialNames(): Promise<CredentialNameItem[]> {
+  const res = await _authedFetch(`${API_BASE}/credentials/names`);
+  if (!res.ok) throw new Error(`获取凭据名称列表失败: ${res.statusText}`);
+  return res.json();
+}
+
+export async function createCredential(data: { name: string; password: string; description?: string }): Promise<CredentialItem> {
+  const res = await _authedFetch(`${API_BASE}/credentials`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `创建失败: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function updateCredential(id: number, data: { password?: string; description?: string }): Promise<void> {
+  const res = await _authedFetch(`${API_BASE}/credentials/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `更新失败: ${res.statusText}`);
+  }
+}
+
+export async function deleteCredential(id: number): Promise<void> {
+  const res = await _authedFetch(`${API_BASE}/credentials/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `删除失败: ${res.statusText}`);
+  }
+}
+
+// ── 会话管理（继续） ──────────────────────────
 
 export async function createSession(hostId: number): Promise<{ session_id: string }> {
   const res = await _authedFetch(`${API_BASE}/sessions`, {

@@ -200,6 +200,7 @@ function _HostItem({
   const hasChildren = host.children && host.children.length > 0;
   const typeConfig = HOST_TYPE_CONFIG[host.host_type] ?? HOST_TYPE_CONFIG.root;
   const isConnected = connectedHostIds?.has(host.id) ?? false;
+  const isDeprecated = host.status === "deprecated";
   const rowIndent = depth * 14;
   const secondaryText = host.description
     ? `${entryDisplay(host)} · ${host.description}`
@@ -227,7 +228,7 @@ function _HostItem({
             isSelected
               ? "border-white/10 bg-white/[0.07]"
               : "border-transparent bg-transparent hover:border-white/8 hover:bg-white/[0.04]"
-          }`}
+          } ${isDeprecated ? "opacity-60" : ""}`}
         >
           <span
             className={`absolute bottom-2 left-1.5 top-2 w-0.5 rounded-full transition-colors ${
@@ -270,6 +271,14 @@ function _HostItem({
                 <span className={`truncate text-sm font-medium ${isSelected ? "text-white" : "text-gray-100"}`}>
                   <_Highlight text={host.name} query={searchQuery} />
                 </span>
+                {isDeprecated && (
+                  <span
+                    className="shrink-0 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400"
+                    title="待下线节点"
+                  >
+                    ⚠ 待下线
+                  </span>
+                )}
                 {isConnected && (
                   <span
                     className={`h-1.5 w-1.5 shrink-0 rounded-full ${

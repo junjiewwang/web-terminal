@@ -3,6 +3,8 @@ import LoginPage from "./components/LoginPage";
 import HostList from "./components/HostList";
 import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
+import HostManagePage from "./components/HostManagePage";
+import CredentialManagePanel from "./components/CredentialManagePanel";
 import TerminalTabs, {
   tabIdForHost,
   createTabForHost,
@@ -24,8 +26,9 @@ import {
   onAuthChange,
   checkAuthStatus,
   logout,
-  type TenantInfo,
 } from "./services/auth";
+
+type Page = "terminal" | "hosts" | "credentials";
 
 const EVENT_LABELS: Record<string, string> = {
   command_start: "执行命令",
@@ -46,6 +49,14 @@ function findHostByName(hosts: Host[], name: string): Host | undefined {
     if (child) return child;
   }
   return undefined;
+}
+
+function countByStatus(host: Host, status: string): number {
+  let count = host.status === status ? 1 : 0;
+  for (const child of host.children ?? []) {
+    count += countByStatus(child, status);
+  }
+  return count;
 }
 
 function targetNameFromInstance(instanceName: string): string {
@@ -74,8 +85,8 @@ export default function App() {
   // ── 认证状态 ──────────────────────────────────
   /** 后端是否要求认证（null = 尚未检测） */
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
-  /** 当前租户信息（已登录时非 null） */
-  const [tenant, setTenant] = useState<TenantInfo | null>(() => getAuthState().tenant);
+  /** 是否已通过认证 */
+  const [isAuthenticated, setIsAuthenticated] = useState(() => getAuthState().isAuthenticated);
 
   // 启动时检测后端认证状态
   useEffect(() => {
@@ -84,16 +95,16 @@ export default function App() {
 
   // 监听认证状态变更（refresh 失败清除 Token 时触发）
   useEffect(() => {
-    return onAuthChange((state) => setTenant(state.tenant));
+    return onAuthChange((state) => setIsAuthenticated(state.isAuthenticated));
   }, []);
 
   const handleLoginSuccess = useCallback(() => {
-    setTenant(getAuthState().tenant);
+    setIsAuthenticated(true);
   }, []);
 
   const handleLogout = useCallback(async () => {
     await logout();
-    setTenant(null);
+    setIsAuthenticated(false);
   }, []);
 
   // 正在检测后端认证状态 → 显示加载
@@ -106,23 +117,23 @@ export default function App() {
   }
 
   // 后端要求认证 + 未登录 → 显示登录页
-  if (authRequired && !tenant) {
+  if (authRequired && !isAuthenticated) {
     return <LoginPage onLoginSuccess={handleLoginSuccess} />;
   }
 
   // 已登录或开发模式（不需要认证）→ 渲染主界面
-  return <MainApp tenant={tenant} onLogout={handleLogout} authRequired={authRequired} />;
+  return <MainApp onLogout={handleLogout} authRequired={authRequired} />;
 }
 
 // ── 主应用组件（原 App 主体）──────────────────
 
 interface MainAppProps {
-  tenant: TenantInfo | null;
   onLogout: () => void;
   authRequired: boolean;
 }
 
-function MainApp({ tenant, onLogout, authRequired }: MainAppProps) {
+function MainApp({ onLogout, authRequired }: MainAppProps) {
+  const [currentPage, setCurrentPage] = useState<Page>("terminal");
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [hostsLoading, setHostsLoading] = useState(true);
@@ -411,149 +422,226 @@ function MainApp({ tenant, onLogout, authRequired }: MainAppProps) {
               {connectedHostIds.size > 0 ? `${connectedHostIds.size} 已连接` : "尚无活跃连接"}
             </span>
           </div>
+
+          {/* 页面导航标签 */}
+          <nav className="mt-4 flex items-center gap-1 rounded-xl border border-white/8 bg-white/[0.03] p-1">
+            <button
+              type="button"
+              onClick={() => setCurrentPage("terminal")}
+              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                currentPage === "terminal"
+                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
+                  : "text-gray-500 hover:text-gray-300 border border-transparent"
+              }`}
+            >
+              📡 终端
+            </button>
+            <button
+              type="button"
+              onClick={() => setCurrentPage("hosts")}
+              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                currentPage === "hosts"
+                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
+                  : "text-gray-500 hover:text-gray-300 border border-transparent"
+              }`}
+            >
+              📋 主机
+            </button>
+            <button
+              type="button"
+              onClick={() => setCurrentPage("credentials")}
+              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                currentPage === "credentials"
+                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
+                  : "text-gray-500 hover:text-gray-300 border border-transparent"
+              }`}
+            >
+              🔑 凭据
+            </button>
+          </nav>
         </div>
 
-        <HostList
-          hosts={hosts}
-          selectedHost={activeTab?.host ?? null}
-          onSelect={handleHostSelect}
-          loading={hostsLoading}
-          error={hostsError}
-          onRetry={loadHosts}
-          connectedHostIds={connectedHostIds}
-        />
+        {/* 侧边栏内容区：终端模式显示主机列表，主机管理/凭据模式显示统计 */}
+        {currentPage === "terminal" ? (
+          <HostList
+            hosts={hosts}
+            selectedHost={activeTab?.host ?? null}
+            onSelect={handleHostSelect}
+            loading={hostsLoading}
+            error={hostsError}
+            onRetry={loadHosts}
+            connectedHostIds={connectedHostIds}
+          />
+        ) : (
+          <div className="flex-1 flex flex-col px-4 py-4">
+            <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4">
+              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">节点概览</h3>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="flex items-center gap-2 text-gray-500">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                    活跃节点
+                  </span>
+                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "active"), 0)}</span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="flex items-center gap-2 text-gray-500">
+                    <span className="h-2 w-2 rounded-full bg-amber-400" />
+                    待下线
+                  </span>
+                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "deprecated"), 0)}</span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="flex items-center gap-2 text-gray-500">
+                    <span className="h-2 w-2 rounded-full bg-red-400" />
+                    已禁用
+                  </span>
+                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "disabled"), 0)}</span>
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 rounded-xl border border-white/8 bg-white/[0.02] p-4">
+              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">快捷说明</h3>
+              <ul className="space-y-2 text-[11px] text-gray-500">
+                <li>• 点击节点行的「编辑」可修改配置</li>
+                <li>• 「交互步骤」支持多步 wait → send 自动化</li>
+                <li>• 批量操作 → YAML 编辑器可直接修改全局配置</li>
+                <li>• 🔑 凭据标签页可管理共享密码</li>
+                <li>• 密码字段支持 <code className="rounded bg-white/5 px-1 text-cyan-400">{"{{password}}"}</code> 变量</li>
+              </ul>
+            </div>
+          </div>
+        )}
       </aside>
 
       <main className="relative z-10 flex min-w-0 flex-1 flex-col">
-        <header className="h-14 shrink-0 border-b border-white/8 bg-gray-950/60 px-5 backdrop-blur-xl">
-          <div className="flex h-full items-center justify-between gap-4">
-            <div className="min-w-0">
-              <p className="text-[11px] font-medium uppercase tracking-[0.28em] text-emerald-300/70">
-                WebTerminal
-              </p>
-              <div className="mt-1 flex items-center gap-2">
-                <span className="truncate text-sm font-medium text-gray-200">{headerText}</span>
-                {activeTab && (
-                  <span className="hidden rounded-full border border-white/8 bg-white/5 px-2 py-0.5 text-[10px] text-gray-400 sm:inline-flex">
-                    {activeTab.host.host_type === "nested" ? "多跳节点" : "首跳节点"}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <div className="ml-3 flex items-center gap-2 shrink-0">
-              {/* 全局 Backend 切换按钮 */}
-              {globalBackend && (
-                <button
-                  type="button"
-                  onClick={handleGlobalBackendSwitch}
-                  disabled={backendSwitching}
-                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium transition-colors ${
-                    globalBackend === "tmux"
-                      ? "border-blue-500/30 bg-blue-500/10 text-blue-400 hover:border-blue-400/50 hover:bg-blue-500/20"
-                      : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:border-emerald-400/50 hover:bg-emerald-500/20"
-                  } ${backendSwitching ? "opacity-50 cursor-wait" : ""}`}
-                  title={`当前模式: ${globalBackend.toUpperCase()}，点击切换到 ${globalBackend === "tmux" ? "BROKER" : "TMUX"} 模式`}
-                >
-                  {backendSwitching ? (
-                    <span className="inline-block h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />
-                  ) : (
-                    <span className="text-[10px]">⇄</span>
-                  )}
-                  <span>{globalBackend.toUpperCase()}</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => setIsAgentPanelOpen((prev) => !prev)}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/6 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-white"
-              >
-                <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
-                {unreadEventCount > 0 && (
-                  <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
-                    {unreadEventCount}
-                  </span>
-                )}
-              </button>
-
-              {/* 租户信息 + 登出按钮（仅在认证模式下显示） */}
-              {authRequired && tenant && (
-                <div className="flex items-center gap-1.5">
-                  <span className="hidden text-[11px] text-gray-500 sm:inline">
-                    {tenant.name}
-                    {tenant.role !== "user" && (
-                      <span className="ml-1 rounded bg-white/8 px-1 py-0.5 text-[9px] uppercase text-gray-400">
-                        {tenant.role}
+        {currentPage === "terminal" ? (
+          <>
+            <header className="h-14 shrink-0 border-b border-white/8 bg-gray-950/60 px-5 backdrop-blur-xl">
+              <div className="flex h-full items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-medium uppercase tracking-[0.28em] text-emerald-300/70">
+                    WebTerminal
+                  </p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-gray-200">{headerText}</span>
+                    {activeTab && (
+                      <span className="hidden rounded-full border border-white/8 bg-white/5 px-2 py-0.5 text-[10px] text-gray-400 sm:inline-flex">
+                        {activeTab.host.host_type === "nested" ? "多跳节点" : "首跳节点"}
                       </span>
                     )}
-                  </span>
+                  </div>
+                </div>
+
+                <div className="ml-3 flex items-center gap-2 shrink-0">
+                  {/* 全局 Backend 切换按钮 */}
+                  {globalBackend && (
+                    <button
+                      type="button"
+                      onClick={handleGlobalBackendSwitch}
+                      disabled={backendSwitching}
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium transition-colors ${
+                        globalBackend === "tmux"
+                          ? "border-blue-500/30 bg-blue-500/10 text-blue-400 hover:border-blue-400/50 hover:bg-blue-500/20"
+                          : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:border-emerald-400/50 hover:bg-emerald-500/20"
+                      } ${backendSwitching ? "opacity-50 cursor-wait" : ""}`}
+                      title={`当前模式: ${globalBackend.toUpperCase()}，点击切换到 ${globalBackend === "tmux" ? "BROKER" : "TMUX"} 模式`}
+                    >
+                      {backendSwitching ? (
+                        <span className="inline-block h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />
+                      ) : (
+                        <span className="text-[10px]">⇄</span>
+                      )}
+                      <span>{globalBackend.toUpperCase()}</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
-                    onClick={onLogout}
-                    className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-gray-400 transition-colors hover:border-red-400/30 hover:bg-red-500/10 hover:text-red-400"
-                    title="退出登录"
+                    onClick={() => setIsAgentPanelOpen((prev) => !prev)}
+                    className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/6 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-white"
                   >
-                    退出
+                    <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
+                    {unreadEventCount > 0 && (
+                      <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
+                        {unreadEventCount}
+                      </span>
+                    )}
                   </button>
+
+                  {/* 登出按钮（仅在认证模式下显示） */}
+                  {authRequired && (
+                    <button
+                      type="button"
+                      onClick={onLogout}
+                      className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-gray-400 transition-colors hover:border-red-400/30 hover:bg-red-500/10 hover:text-red-400"
+                      title="退出登录"
+                    >
+                      退出
+                    </button>
+                  )}
+                </div>
+              </div>
+            </header>
+
+            <TerminalTabs
+              tabs={tabs}
+              activeTabId={activeTabId}
+              onSelectTab={handleTabSelect}
+              onCloseTab={handleTabClose}
+            />
+
+            <div className="relative min-h-0 flex-1 bg-[#040712]">
+              {tabs.length === 0 ? (
+                <div className="absolute inset-0 flex items-center justify-center text-gray-600">
+                  <div className="max-w-md text-center">
+                    <div className="mb-4 text-5xl text-emerald-300/80">⌘_</div>
+                    <p className="text-lg font-medium text-gray-200">选择左侧主机开始使用</p>
+                    <p className="mt-2 text-sm text-gray-500">也可由 Agent 自动创建会话后在这里接管</p>
+                  </div>
+                </div>
+              ) : (
+                tabs.map((tab) => (
+                  <div
+                    key={tab.id}
+                    className="absolute inset-0"
+                    style={{ display: tab.id === activeTabId ? undefined : "none" }}
+                  >
+                    <TerminalView
+                      host={tab.host}
+                      isActive={tab.id === activeTabId}
+                      initialWsUrl={tab.wsUrl}
+                      backend={tab.backend}
+                      onInstanceNameUpdate={(instanceName) => handleInstanceNameUpdate(tab.id, instanceName)}
+                    />
+                  </div>
+                ))
+              )}
+
+              {latestEventText && !isAgentPanelOpen && showEventToast && (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setShowEventToast(false)}
+                  onKeyDown={(e) => e.key === "Escape" && setShowEventToast(false)}
+                  className="absolute right-4 top-4 z-20 hidden max-w-sm cursor-pointer rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur transition-opacity duration-500 hover:border-emerald-400/30 md:block"
+                  title="点击关闭"
+                >
+                  <div className="flex items-center gap-2 text-[11px] text-gray-500">
+                    <span className="inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+                    最近轨迹
+                    <span className="ml-auto text-[10px] text-gray-600">点击关闭</span>
+                  </div>
+                  <p className="mt-1 truncate text-xs text-gray-300">{latestEventText}</p>
                 </div>
               )}
             </div>
-          </div>
-        </header>
-
-        <TerminalTabs
-          tabs={tabs}
-          activeTabId={activeTabId}
-          onSelectTab={handleTabSelect}
-          onCloseTab={handleTabClose}
-        />
-
-        <div className="relative min-h-0 flex-1 bg-[#040712]">
-          {tabs.length === 0 ? (
-            <div className="absolute inset-0 flex items-center justify-center text-gray-600">
-              <div className="max-w-md text-center">
-                <div className="mb-4 text-5xl text-emerald-300/80">⌘_</div>
-                <p className="text-lg font-medium text-gray-200">选择左侧主机开始使用</p>
-                <p className="mt-2 text-sm text-gray-500">也可由 Agent 自动创建会话后在这里接管</p>
-              </div>
-            </div>
-          ) : (
-            tabs.map((tab) => (
-              <div
-                key={tab.id}
-                className="absolute inset-0"
-                style={{ display: tab.id === activeTabId ? undefined : "none" }}
-              >
-                <TerminalView
-                  host={tab.host}
-                  isActive={tab.id === activeTabId}
-                  initialWsUrl={tab.wsUrl}
-                  backend={tab.backend}
-                  onInstanceNameUpdate={(instanceName) => handleInstanceNameUpdate(tab.id, instanceName)}
-                />
-              </div>
-            ))
-          )}
-
-          {latestEventText && !isAgentPanelOpen && showEventToast && (
-            <div
-              role="button"
-              tabIndex={0}
-              onClick={() => setShowEventToast(false)}
-              onKeyDown={(e) => e.key === "Escape" && setShowEventToast(false)}
-              className="absolute right-4 top-4 z-20 hidden max-w-sm cursor-pointer rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur transition-opacity duration-500 hover:border-emerald-400/30 md:block"
-              title="点击关闭"
-            >
-              <div className="flex items-center gap-2 text-[11px] text-gray-500">
-                <span className="inline-flex h-2 w-2 rounded-full bg-emerald-400" />
-                最近轨迹
-                <span className="ml-auto text-[10px] text-gray-600">点击关闭</span>
-              </div>
-              <p className="mt-1 truncate text-xs text-gray-300">{latestEventText}</p>
-            </div>
-          )}
-        </div>
+          </>
+        ) : currentPage === "hosts" ? (
+          <HostManagePage hosts={hosts} onHostsChange={loadHosts} />
+        ) : (
+          <CredentialManagePanel />
+        )}
       </main>
 
       {isAgentPanelOpen && (
