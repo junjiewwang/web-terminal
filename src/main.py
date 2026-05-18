@@ -22,13 +22,14 @@ from src.api import terminal as terminal_api
 from src.api import snippets as snippets_api
 from src.api import file_transfer as file_transfer_api
 from src.api import auth as auth_api
+from src.api import settings as settings_api
+from src.api import credentials as credentials_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
-from src.models.database import async_session_factory, init_db
-from src.models.tenant import SYSTEM_TENANT
+from src.models.database import async_session_factory, get_db_info, init_db
+from src.services.auth_service import AuthService
 from src.services.host_manager import HostManager
 from src.services.snippet_registry import SnippetRegistry
 from src.services.ssh_session import SSHSessionManager
-from src.services.tenant_registry import TenantRegistry, current_tenant_var
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
 from src.utils.security import generate_api_token, verify_api_token
@@ -40,14 +41,14 @@ ssh_manager = SSHSessionManager()
 terminal_manager = TerminalManager()
 tmux_manager_instance = TmuxWindowManager()
 snippet_registry = SnippetRegistry()
-tenant_registry = TenantRegistry()
+auth_service = AuthService()
 
 # hosts.yaml 路径
 _HOSTS_YAML = Path(__file__).resolve().parent.parent / "config" / "hosts.yaml"
 # snippets.yaml 路径
 _SNIPPETS_YAML = Path(__file__).resolve().parent.parent / "config" / "snippets.yaml"
-# tenants.yaml 路径
-_TENANTS_YAML = Path(__file__).resolve().parent.parent / "config" / "tenants.yaml"
+# auth.yaml 路径
+_AUTH_YAML = Path(__file__).resolve().parent.parent / "config" / "auth.yaml"
 
 # 文件监听防抖间隔（秒）
 _WATCH_DEBOUNCE_SECONDS = 2.0
@@ -65,7 +66,8 @@ async def lifespan(app: FastAPI):
 
     # 初始化数据库
     await init_db()
-    logger.info("数据库初始化完成")
+    db_info = get_db_info()
+    logger.info("数据库初始化完成 (%s: %s)", db_info["type"], db_info["url"])
 
     # 从 hosts.yaml 同步主机配置（启动时首次同步）
     await _sync_hosts_from_yaml()
@@ -76,15 +78,17 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Snippet Registry 初始加载失败，Snippet 功能不可用")
 
-    # 加载 Tenant Registry（启动时首次加载，文件不存在时降级为开发模式）
+    # 加载 Auth Service（从数据库初始化，首次启动从 auth.yaml 种子写入 DB）
     try:
-        tenant_registry.load_from_yaml(_TENANTS_YAML)
-        if tenant_registry.loaded:
-            logger.info("多租户认证已启用 ✓")
+        async with async_session_factory() as auth_session:
+            await auth_service.init_from_db(auth_session, yaml_path=_AUTH_YAML)
+            await auth_session.commit()
+        if auth_service.is_auth_enabled:
+            logger.info("密码保护已启用 ✓")
         else:
-            logger.info("tenants.yaml 未找到或为空，多租户认证未启用（开发模式）")
+            logger.info("密码保护未启用（开发模式）")
     except Exception:
-        logger.exception("Tenant Registry 加载失败，多租户认证未启用")
+        logger.exception("Auth Service 初始化失败，密码保护未启用")
 
     # 注入全局服务实例到 API 模块
     sessions.ssh_manager = ssh_manager
@@ -93,7 +97,8 @@ async def lifespan(app: FastAPI):
     terminal_api.tmux_manager = tmux_manager_instance
     snippets_api.snippet_registry = snippet_registry
     file_transfer_api.terminal_manager = terminal_manager
-    auth_api._tenant_registry = tenant_registry
+    auth_api._auth_service = auth_service
+    settings_api._auth_service = auth_service
 
     # 初始化 MCP Server 依赖
     init_mcp_server(terminal_manager, tmux_manager=tmux_manager_instance, snippet_registry=snippet_registry)
@@ -106,14 +111,18 @@ async def lifespan(app: FastAPI):
         token = generate_api_token()
         logger.info("API Token 认证已启用（自动生成）: %s", token)
 
-    # 启动 hosts.yaml 文件监听后台任务
-    watch_task = asyncio.create_task(_watch_hosts_yaml())
+    # 启动 hosts.yaml 文件监听后台任务（默认关闭，设置 WETTY_WATCH_YAML=true 启用）
+    watch_task: asyncio.Task[None] | None = None
+    if os.environ.get("WETTY_WATCH_YAML", "").lower() in ("true", "1", "yes"):
+        watch_task = asyncio.create_task(_watch_hosts_yaml())
+    else:
+        logger.info("hosts.yaml 文件监听已禁用（如需启用请设置 WETTY_WATCH_YAML=true）")
 
     # 启动 snippets.yaml 文件监听后台任务
     watch_snippets_task = asyncio.create_task(_watch_snippets_yaml())
 
-    # 启动 tenants.yaml 文件监听后台任务
-    watch_tenants_task = asyncio.create_task(_watch_tenants_yaml())
+    # 启动 refresh token 定期清理后台任务
+    token_cleanup_task = asyncio.create_task(_cleanup_expired_tokens_loop())
 
     # 启动 zombie tmux session 定期清理后台任务
     zombie_cleanup_task = asyncio.create_task(_cleanup_zombie_sessions_loop())
@@ -127,20 +136,22 @@ async def lifespan(app: FastAPI):
 
         # ── 关闭 ──
         logger.info("服务关闭中...")
-        watch_task.cancel()
+        if watch_task:
+            watch_task.cancel()
         watch_snippets_task.cancel()
-        watch_tenants_task.cancel()
+        token_cleanup_task.cancel()
         zombie_cleanup_task.cancel()
-        try:
-            await watch_task
-        except asyncio.CancelledError:
-            pass
+        if watch_task:
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
         try:
             await watch_snippets_task
         except asyncio.CancelledError:
             pass
         try:
-            await watch_tenants_task
+            await token_cleanup_task
         except asyncio.CancelledError:
             pass
         try:
@@ -156,10 +167,23 @@ async def lifespan(app: FastAPI):
     logger.info("服务已关闭 ✓")
 
 
-async def _sync_hosts_from_yaml() -> None:
-    """执行一次 hosts.yaml → DB 同步"""
+async def _sync_hosts_from_yaml(*, force: bool = False) -> None:
+    """执行一次 hosts.yaml → DB 同步。
+
+    首次初始化模式：
+    - DB 为空时，自动从 hosts.yaml 导入种子数据
+    - DB 已有数据时，跳过自动同步（避免覆盖页面编辑内容）
+    - force=True 时，强制执行同步（供手动 API 调用）
+    """
     async with async_session_factory() as db_session:
         manager = HostManager(db_session)
+
+        if not force:
+            has_data = await manager.has_hosts()
+            if has_data:
+                logger.info("数据库已有主机数据，跳过 YAML 自动同步（如需同步请使用 API: POST /api/hosts/sync）")
+                return
+
         result = await manager.sync_from_yaml(_HOSTS_YAML)
         await db_session.commit()
         if result.total_changes:
@@ -167,16 +191,14 @@ async def _sync_hosts_from_yaml() -> None:
                 "hosts.yaml 同步完成: 新增 %d, 更新 %d, 删除 %d",
                 result.added, result.updated, result.deleted,
             )
+        else:
+            logger.info("hosts.yaml 种子数据同步完成（无变化）")
         if result.errors:
             logger.error("hosts.yaml 同步错误: %s", result.errors)
 
 
 async def _watch_hosts_yaml() -> None:
-    """后台任务：监听 hosts.yaml 文件变更，自动触发同步
-
-    使用 watchfiles 异步监听 + 防抖机制，避免频繁触发。
-    如果 watchfiles 不可用（开发环境未安装），静默退出。
-    """
+    """后台任务：监听 hosts.yaml 文件变更，自动触发同步"""
     try:
         from watchfiles import awatch
     except ImportError:
@@ -190,7 +212,6 @@ async def _watch_hosts_yaml() -> None:
 
     try:
         async for changes in awatch(yaml_dir, debounce=int(_WATCH_DEBOUNCE_SECONDS * 1000)):
-            # 只关心 hosts.yaml 的变更
             relevant = any(
                 Path(path).name == yaml_name
                 for _, path in changes
@@ -200,7 +221,7 @@ async def _watch_hosts_yaml() -> None:
 
             logger.info("检测到 hosts.yaml 变更，触发同步...")
             try:
-                await _sync_hosts_from_yaml()
+                await _sync_hosts_from_yaml(force=True)
             except Exception:
                 logger.exception("hosts.yaml 热加载同步失败")
     except asyncio.CancelledError:
@@ -209,11 +230,7 @@ async def _watch_hosts_yaml() -> None:
 
 
 async def _watch_snippets_yaml() -> None:
-    """后台任务：监听 snippets.yaml 及 snippets/ 目录变更，自动触发热加载
-
-    监听 config/ 目录，关注 snippets.yaml 和 snippets/ 子目录的变更。
-    如果 watchfiles 不可用，静默退出。
-    """
+    """后台任务：监听 snippets.yaml 及 snippets/ 目录变更，自动触发热加载"""
     try:
         from watchfiles import awatch
     except ImportError:
@@ -228,7 +245,6 @@ async def _watch_snippets_yaml() -> None:
 
     try:
         async for changes in awatch(watch_dir, debounce=int(_WATCH_DEBOUNCE_SECONDS * 1000)):
-            # 关注 snippets.yaml 或 snippets/ 子目录下 .sh 文件的变更
             relevant = any(
                 Path(path).name == yaml_name
                 or (snippets_subdir in Path(path).parts and Path(path).suffix == ".sh")
@@ -247,39 +263,27 @@ async def _watch_snippets_yaml() -> None:
         raise
 
 
-async def _watch_tenants_yaml() -> None:
-    """后台任务：监听 tenants.yaml 文件变更，自动触发热加载
+async def _cleanup_expired_tokens_loop() -> None:
+    """后台任务：定期清理过期/已撤销的 Refresh Token"""
+    interval = 3600  # 每小时清理一次
+    logger.info("启动 Refresh Token 定期清理（间隔 %ds）", interval)
 
-    使用 watchfiles 异步监听 + 防抖机制。
-    如果 watchfiles 不可用，静默退出。
-    """
-    try:
-        from watchfiles import awatch
-    except ImportError:
-        logger.warning("watchfiles 未安装，tenants.yaml 热加载已禁用")
-        return
-
-    yaml_dir = _TENANTS_YAML.parent
-    yaml_name = _TENANTS_YAML.name
-
-    logger.info("启动 tenants.yaml 文件监听: %s", _TENANTS_YAML)
+    # 首次启动等待服务就绪
+    await asyncio.sleep(30)
 
     try:
-        async for changes in awatch(yaml_dir, debounce=int(_WATCH_DEBOUNCE_SECONDS * 1000)):
-            relevant = any(
-                Path(path).name == yaml_name
-                for _, path in changes
-            )
-            if not relevant:
-                continue
-
-            logger.info("检测到 tenants.yaml 变更，触发热加载...")
+        while True:
             try:
-                tenant_registry.reload()
+                async with async_session_factory() as session:
+                    count = await auth_service.cleanup_expired_tokens(session)
+                    await session.commit()
+                    if count:
+                        logger.info("定期清理: 清理了 %d 个过期 Refresh Token", count)
             except Exception:
-                logger.exception("tenants.yaml 热加载失败")
+                logger.exception("Refresh Token 清理异常")
+            await asyncio.sleep(interval)
     except asyncio.CancelledError:
-        logger.info("tenants.yaml 文件监听已停止")
+        logger.info("Refresh Token 定期清理已停止")
         raise
 
 
@@ -288,11 +292,7 @@ _ZOMBIE_CLEANUP_INTERVAL = 60
 
 
 async def _cleanup_zombie_sessions_loop() -> None:
-    """后台任务：定期清理 zombie tmux session
-
-    扫描所有 wetty- 前缀的 tmux session，清理没有对应活跃 WeTTY 实例的残留 session。
-    避免 SSH 连接和系统资源泄漏。
-    """
+    """后台任务：定期清理 zombie tmux session"""
     logger.info("启动 zombie tmux session 定期清理（间隔 %ds）", _ZOMBIE_CLEANUP_INTERVAL)
 
     # 首次启动等待服务就绪
@@ -339,16 +339,14 @@ _AUTH_WHITELIST = {"/health", "/docs", "/openapi.json", "/redoc"}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Bearer Token 认证中间件（多租户升级版）
+    """Bearer Token 认证中间件（单用户版）
 
     认证优先级：
-    1. 环境变量 WETTY_API_TOKEN（全局 Token → SYSTEM_TENANT）
-    2. JWT Token（多租户模式 → 解析出 Tenant）
-    3. 自动生成 Token（旧版向后兼容 → SYSTEM_TENANT）
+    1. 环境变量 WETTY_API_TOKEN（全局 Token）
+    2. JWT Token（auth.yaml 密码保护模式）
+    3. 自动生成 Token（旧版向后兼容）
 
-    认证成功后：
-    - request.state.tenant = Tenant 对象（所有下游 API 可用）
-    - current_tenant_var.set(tenant)（MCP 工具通过 ContextVar 获取）
+    认证成功后设置 request.state.authenticated = True。
     """
     path = request.url.path
 
@@ -369,27 +367,23 @@ async def auth_middleware(request: Request, call_next):
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
 
-        # 1. 优先检查环境变量 Token（全局 Token → SYSTEM_TENANT）
+        # 1. 优先检查环境变量 Token
         env_token = os.environ.get("WETTY_API_TOKEN")
         if env_token:
             import secrets
             if secrets.compare_digest(token, env_token):
-                request.state.tenant = SYSTEM_TENANT
-                current_tenant_var.set(SYSTEM_TENANT)
+                request.state.authenticated = True
                 return await call_next(request)
 
-        # 2. 尝试 JWT Token 解析（多租户模式）
-        if tenant_registry.loaded:
-            tenant = tenant_registry.verify_access_token(token)
-            if tenant:
-                request.state.tenant = tenant
-                current_tenant_var.set(tenant)
+        # 2. 尝试 JWT Token 解析（密码保护模式）
+        if auth_service.is_auth_enabled:
+            if auth_service.verify_access_token(token):
+                request.state.authenticated = True
                 return await call_next(request)
 
         # 3. 尝试自动生成的 Token（向后兼容）
         if verify_api_token(token):
-            request.state.tenant = SYSTEM_TENANT
-            current_tenant_var.set(SYSTEM_TENANT)
+            request.state.authenticated = True
             return await call_next(request)
 
         return JSONResponse(
@@ -397,10 +391,9 @@ async def auth_middleware(request: Request, call_next):
             content={"detail": "无效的 API Token"},
         )
 
-    # 未提供 Token 时：开发模式放行（未配置环境变量 Token 且未加载 tenants.yaml）
-    if not os.environ.get("WETTY_API_TOKEN") and not tenant_registry.loaded:
-        request.state.tenant = SYSTEM_TENANT
-        current_tenant_var.set(SYSTEM_TENANT)
+    # 未提供 Token 时：开发模式放行（未配置环境变量 Token 且未启用密码保护）
+    if not os.environ.get("WETTY_API_TOKEN") and not auth_service.is_auth_enabled:
+        request.state.authenticated = True
         return await call_next(request)
 
     return JSONResponse(
@@ -413,6 +406,8 @@ async def auth_middleware(request: Request, call_next):
 # ── 注册路由 ──────────────────────────────────
 
 app.include_router(auth_api.router)
+app.include_router(settings_api.router)
+app.include_router(credentials_api.router)
 app.include_router(hosts.router)
 app.include_router(sessions.router)
 app.include_router(events.router)
@@ -427,20 +422,18 @@ app.mount("/mcp", mcp.streamable_http_app())
 
 
 @app.get("/health", tags=["system"])
-async def health_check() -> dict:
+async def health_check() -> dict[str, str]:
     """健康检查"""
+    db_info = get_db_info()
     return {
         "status": "healthy",
         "service": "wetty-mcp-terminal",
         "version": "0.1.0",
+        "database": db_info["type"],
     }
 
 
 # ── 前端静态文件（生产模式）──────────────────
-# 前端构建产物放在 /app/static，由 Dockerfile COPY 进来。
-# 开发模式用 vite dev server，此目录不存在时自动跳过。
-# 注意：必须放在所有 router / mount 之后，作为最低优先级的 fallback。
-
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 if _STATIC_DIR.is_dir():

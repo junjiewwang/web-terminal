@@ -30,13 +30,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from src.models.database import async_session_factory
 from src.models.host import Host, HostResponse
-from src.models.tenant import SYSTEM_TENANT, Tenant
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
 from src.services.pty_file_transfer import PtyFileTransfer, TransferResult
 from src.services.snippet_registry import SnippetRegistry
-from src.services.tenant_registry import current_tenant_var
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
 
@@ -128,15 +126,6 @@ def _validate_command(command: str) -> str | None:
 # ── 内部工具函数 ──────────────────────────────
 
 
-def _get_current_tenant() -> Tenant:
-    """从 ContextVar 获取当前请求的租户身份。
-
-    auth_middleware 在 HTTP 请求处理前已将 Tenant 存入 current_tenant_var，
-    MCP 工具通过此函数获取。开发模式下降级为 SYSTEM_TENANT。
-    """
-    return current_tenant_var.get() or SYSTEM_TENANT
-
-
 def _get_terminal_manager() -> TerminalManager:
     """获取终端管理器实例"""
     if _terminal_manager is None:
@@ -159,29 +148,21 @@ def _get_snippet_registry() -> SnippetRegistry:
 
 
 async def _publish_event(event_type: str, session_id: str, host_name: str, data: JsonDict | None = None) -> None:
-    """发布 SSE 事件（自动携带当前租户 ID 用于隔离分发）"""
-    tenant = _get_current_tenant()
+    """发布 SSE 事件"""
     await event_bus.publish(
         AgentEvent(
             event_type=EventType(event_type),
             session_id=session_id,
             host_name=host_name,
             data=data or {},
-            tenant_id=tenant.id,
         )
     )
 
 
-def _get_session_for_tenant(session_id: str) -> "TerminalSession | None":
-    """获取会话并校验租户归属。
-
-    admin 可访问所有会话，普通用户只能访问自己创建的会话。
-    """
+def _get_session(session_id: str) -> "TerminalSession | None":
+    """获取会话（无归属检查）"""
     mgr = _get_terminal_manager()
-    tenant = _get_current_tenant()
-    # admin 不校验归属（tenant_id=None），普通用户校验
-    tenant_id_check = None if tenant.is_admin else tenant.id
-    return mgr.get_session_by_id(session_id, tenant_id=tenant_id_check)
+    return mgr.get_session_by_id(session_id)
 
 
 def _decrypt_host_password(host: Host) -> str | None:
@@ -206,19 +187,11 @@ async def list_hosts(tag: str | None = None) -> str:
     返回递归树结构：任意节点都可以继续包含 children，
     适用于 root -> nested -> nested 的多跳链路。
 
-    注意：返回的主机列表已按当前用户的 allowed_tags 过滤。
-    admin 用户可见所有主机。
+    注意：返回所有配置的主机列表。
     """
-    tenant = _get_current_tenant()
-
     async with async_session_factory() as session:
         mgr = HostManager(session)
         hosts = await mgr.list_host_responses(tag=tag)
-
-    # 租户主机过滤（复用 hosts API 中的过滤逻辑）
-    if not tenant.is_admin and tenant.allowed_tags:
-        from src.api.hosts import _filter_hosts_by_tenant_tags
-        hosts = _filter_hosts_by_tenant_tags(hosts, tenant.allowed_tags)
 
     if not hosts:
         return "没有找到可用的主机。请先通过管理界面添加主机。"
@@ -265,7 +238,6 @@ async def connect_host(host_name: str, backend: str | None = None) -> str:
 
 async def _connect_path(path: list[Host], backend: str | None = None) -> str:
     mgr = _get_terminal_manager()
-    tenant = _get_current_tenant()
     target = path[-1]
     root = path[0]
     instance_name = HostManager.build_instance_name(path)
@@ -278,7 +250,6 @@ async def _connect_path(path: list[Host], backend: str | None = None) -> str:
             host=root,
             decrypted_password=password,
             backend=backend,
-            tenant_id=tenant.id,
         )
     except Exception as e:
         return f"错误：终端启动失败 - {e}"
@@ -341,7 +312,7 @@ async def run_command(session_id: str, command: str, timeout: int = 30) -> str:
     if reject_reason:
         return f"错误：{reject_reason}"
 
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
 
@@ -389,7 +360,7 @@ async def send_input(session_id: str, text: str) -> str:
     Returns:
         发送确认
     """
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
@@ -427,7 +398,7 @@ async def wait_for_output(
     Returns:
         从等待开始到匹配成功之间的所有终端输出（已清除 ANSI）
     """
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
@@ -461,7 +432,7 @@ async def read_terminal(session_id: str, lines: int = 50) -> str:
     Returns:
         终端屏幕内容（已清除 ANSI 转义序列）
     """
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
 
@@ -483,10 +454,9 @@ async def get_session_status(session_id: str | None = None) -> str:
         会话状态信息
     """
     mgr = _get_terminal_manager()
-    tenant = _get_current_tenant()
 
     if session_id:
-        session = _get_session_for_tenant(session_id)
+        session = _get_session(session_id)
         if not session:
             return f"会话不存在: {session_id}"
         info = session.info
@@ -500,9 +470,7 @@ async def get_session_status(session_id: str | None = None) -> str:
             "ws_clients": info.ws_clients,
         }, ensure_ascii=False, indent=2)
 
-    # admin 可见全部会话，普通用户只能看到自己的
-    tenant_id_filter = None if tenant.is_admin else tenant.id
-    sessions = mgr.list_sessions(tenant_id=tenant_id_filter)
+    sessions = mgr.list_sessions()
     if not sessions:
         return "当前没有活跃的会话。"
 
@@ -533,12 +501,12 @@ async def disconnect(session_id: str) -> str:
     """
     mgr = _get_terminal_manager()
 
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"会话不存在: {session_id}"
 
     host_name = session.instance_name
-    closed = await mgr.stop_session(session.instance_name, tenant_id=session.tenant_id)
+    closed = await mgr.stop_session(session.instance_name)
 
     if closed:
         await _publish_event("session_closed", session_id, host_name)
@@ -666,7 +634,7 @@ async def load_snippet_domain(session_id: str, domain_id: str) -> str:
     """
     registry = _get_snippet_registry()
 
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
     if not session.running:
@@ -716,7 +684,7 @@ async def run_snippet_command(
     """
     registry = _get_snippet_registry()
 
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。"
     if not session.running:
@@ -822,7 +790,7 @@ async def upload_file(
     Returns:
         传输结果（包含文件大小、MD5 等信息）
     """
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
     if not session.running:
@@ -885,7 +853,7 @@ async def download_file(
     Returns:
         传输结果（包含文件大小、MD5 等信息）
     """
-    session = _get_session_for_tenant(session_id)
+    session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
     if not session.running:

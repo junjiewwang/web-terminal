@@ -13,11 +13,9 @@ from src.models.database import async_session_factory
 from src.models.host import Host
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
-from src.services.tenant_registry import current_tenant_var
 from src.services.terminal_backend import TerminalBackend
 from src.services.terminal_manager import TerminalManager, TerminalSession
 from src.services.tmux_manager import TmuxWindowManager
-from src.utils.tenant_helpers import get_current_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +23,6 @@ router = APIRouter(tags=["terminal"])
 
 terminal_manager: TerminalManager | None = None
 # 保留注入点，tmux copy-buffer 和脚本仍依赖 tmux 会话
-# 多跳编排本身已不再依赖 tmux 窗口切换。
 tmux_manager: TmuxWindowManager | None = None
 
 _COPY_BUFFER_DIR = "/tmp"
@@ -64,15 +61,8 @@ class TerminalResponse(BaseModel):
 
 @router.post("/api/terminal/start", response_model=TerminalResponse)
 async def start_terminal(req: StartTerminalRequest, request: Request) -> TerminalResponse:
-    """启动终端会话。
-
-    逻辑：
-    - root 节点：直接建立 PTY + SSH 会话
-    - nested 节点：先找到 root，会话建立在 root 上，再按路径执行多跳编排
-    - backend 为 None 时使用全局 default_backend
-    """
+    """启动终端会话。"""
     mgr = _get_terminal_manager()
-    tenant = get_current_tenant(request)
 
     async with async_session_factory() as db_session:
         host_mgr = HostManager(db_session)
@@ -90,10 +80,9 @@ async def start_terminal(req: StartTerminalRequest, request: Request) -> Termina
         host=root,
         decrypted_password=password,
         backend=req.backend,
-        tenant_id=tenant.id,
     )
 
-    # 仅在新建会话时触发多跳编排（is_new=False 表示复用了已有会话）
+    # 仅在新建会话时触发多跳编排
     if is_new and len(path) > 1:
         asyncio.create_task(_run_path_orchestration(session, path))
 
@@ -143,10 +132,7 @@ async def get_backend() -> BackendResponse:
 
 @router.put("/api/terminal/backend", response_model=SwitchBackendResponse)
 async def switch_backend(req: SwitchBackendRequest) -> SwitchBackendResponse:
-    """全局切换 terminal backend。
-
-    停止所有现有会话，前端收到响应后逐个 Tab 重新 startTerminal。
-    """
+    """全局切换 terminal backend。"""
     mgr = _get_terminal_manager()
     stopped = await mgr.switch_backend(req.backend)
     return SwitchBackendResponse(backend=req.backend, stopped_sessions=stopped)
@@ -155,21 +141,7 @@ async def switch_backend(req: SwitchBackendRequest) -> SwitchBackendResponse:
 @router.post("/api/terminal/stop/{instance_name}", status_code=204)
 async def stop_terminal(instance_name: str, request: Request) -> None:
     mgr = _get_terminal_manager()
-    tenant = get_current_tenant(request)
-
-    # admin 可停止任何会话，普通用户只能停止自己的
-    if tenant.is_admin:
-        # admin：先按用户自身 tenant_id 找，找不到再全局搜索
-        stopped = await mgr.stop_session(instance_name, tenant_id=tenant.id)
-        if not stopped:
-            # 遍历所有会话找到匹配 instance_name 的
-            for s in mgr.list_sessions():
-                if s.instance_name == instance_name:
-                    stopped = await mgr.stop_session(instance_name, tenant_id=s.tenant_id)
-                    break
-    else:
-        stopped = await mgr.stop_session(instance_name, tenant_id=tenant.id)
-
+    stopped = await mgr.stop_session(instance_name)
     if not stopped:
         raise HTTPException(status_code=404, detail=f"终端会话不存在: {instance_name}")
 
@@ -177,11 +149,7 @@ async def stop_terminal(instance_name: str, request: Request) -> None:
 @router.get("/api/terminal", response_model=list[TerminalResponse])
 async def list_terminals(request: Request) -> list[TerminalResponse]:
     mgr = _get_terminal_manager()
-    tenant = get_current_tenant(request)
-
-    # admin 可见全部会话，普通用户只能看到自己的
-    tenant_id_filter = None if tenant.is_admin else tenant.id
-    sessions = mgr.list_sessions(tenant_id=tenant_id_filter)
+    sessions = mgr.list_sessions()
     return [
         TerminalResponse(
             session_id=s.session_id,
@@ -196,7 +164,6 @@ async def list_terminals(request: Request) -> list[TerminalResponse]:
 
 class CopyBufferRequest(BaseModel):
     """tmux copy-buffer 通知请求（由 tmux hook 调用）"""
-
     session_name: str
 
 
@@ -211,8 +178,7 @@ async def handle_copy_buffer(req: CopyBufferRequest) -> None:
         return
 
     instance_name = session_name[len("wetty-"):]
-    # tmux copy-buffer 回调不含 tenant 信息，遍历全部会话查找匹配的
-    all_sessions = mgr.list_sessions(tenant_id=None)
+    all_sessions = mgr.list_sessions()
     session = None
     for s_info in all_sessions:
         if s_info.instance_name == instance_name and s_info.running:
@@ -250,36 +216,28 @@ async def terminal_websocket(
 ) -> None:
     """WebSocket 终端连接
 
-    认证方式：通过 query param `token` 传递 Bearer Token（浏览器 WebSocket API 不支持自定义 Header）。
-    会话归属校验：即使知道 session_id，也无法连接非本租户的会话（admin 除外）。
+    认证方式：通过 query param `token` 传递 Bearer Token。
     """
     mgr = _get_terminal_manager()
 
     # ── WebSocket Token 认证 ──
-    tenant = await _authenticate_ws_token(token)
-    if tenant is None:
+    authenticated = await _authenticate_ws_token(token)
+    if not authenticated:
         await websocket.close(code=1008, reason="认证失败：无效的 Token")
         return
 
-    # ── 会话归属校验 ──
-    # admin 可连接任何会话，普通用户只能连接自己的
-    tenant_id_check = None if tenant.is_admin else tenant.id
-    session = mgr.get_session_by_id(session_id, tenant_id=tenant_id_check)
+    session = mgr.get_session_by_id(session_id)
 
     if not session or not session.running:
         await websocket.close(code=1008, reason="终端会话不存在或已关闭")
         return
 
-    # 设置 ContextVar（WebSocket 长连接期间，MCP 工具可能通过 ContextVar 获取租户）
-    current_tenant_var.set(tenant)
-
     await websocket.accept()
 
-    # 获取初始终端尺寸（前端可能在首条消息中发送）
     client_id = session.add_ws_client(websocket)
     logger.debug(
-        "WebSocket 已建立: session=%s, client=%s, backend=%s, instance=%s, tenant=%s",
-        session_id[:8], client_id[:8], session.backend.value, session.instance_name, tenant.id,
+        "WebSocket 已建立: session=%s, client=%s, backend=%s, instance=%s",
+        session_id[:8], client_id[:8], session.backend.value, session.instance_name,
     )
 
     try:
@@ -307,48 +265,45 @@ async def terminal_websocket(
         session.remove_ws_client(client_id)
 
 
-async def _authenticate_ws_token(token: str) -> "Tenant | None":
-    """验证 WebSocket 连接的 Token，返回 Tenant 或 None。
+async def _authenticate_ws_token(token: str) -> bool:
+    """验证 WebSocket 连接的 Token，返回是否认证通过。
 
-    支持三种 Token 类型（与 auth_middleware 优先级一致）：
-    1. 环境变量 WETTY_API_TOKEN → SYSTEM_TENANT
-    2. JWT Token → 解析出 Tenant
-    3. 自动生成 Token → SYSTEM_TENANT
-    4. 开发模式（无 Token 配置）→ SYSTEM_TENANT
+    支持三种 Token 类型：
+    1. 环境变量 WETTY_API_TOKEN
+    2. JWT Token（密码保护模式）
+    3. 自动生成 Token
+    4. 开发模式（无 Token 配置）→ 放行
     """
     import os
     import secrets
 
-    from src.models.tenant import SYSTEM_TENANT, Tenant
-    from src.services.tenant_registry import TenantRegistry
+    from src.services.auth_service import AuthService
     from src.utils.security import verify_api_token
 
-    # 引用全局 tenant_registry（通过 main.py 模块级变量）
-    # 这里延迟导入以避免循环依赖
-    from src.main import tenant_registry
+    # 引用全局 auth_service
+    from src.main import auth_service as _auth_service
 
     if not token:
-        # 无 Token：开发模式放行（未配置环境变量 Token 且未加载 tenants.yaml）
-        if not os.environ.get("WETTY_API_TOKEN") and not tenant_registry.loaded:
-            return SYSTEM_TENANT
-        return None
+        # 无 Token：开发模式放行
+        if not os.environ.get("WETTY_API_TOKEN") and not _auth_service.is_auth_enabled:
+            return True
+        return False
 
     # 1. 环境变量 Token
     env_token = os.environ.get("WETTY_API_TOKEN")
     if env_token and secrets.compare_digest(token, env_token):
-        return SYSTEM_TENANT
+        return True
 
     # 2. JWT Token
-    if tenant_registry.loaded:
-        tenant = tenant_registry.verify_access_token(token)
-        if tenant:
-            return tenant
+    if _auth_service.is_auth_enabled:
+        if _auth_service.verify_access_token(token):
+            return True
 
     # 3. 自动生成 Token
     if verify_api_token(token):
-        return SYSTEM_TENANT
+        return True
 
-    return None
+    return False
 
 
 @router.post("/api/wetty/start", response_model=TerminalResponse)
