@@ -1,16 +1,40 @@
+# ══════════════════════════════════════════════
+# wetty-mcp-terminal docker-compose
+#
+# 单一配置文件，通过 .env 控制数据库模式：
+#   - DATABASE_URL 有值 → 连接 MySQL
+#   - DATABASE_URL 为空  → 使用本地 SQLite
+#
+# 快速开始：
+#   cp .env.example .env   # 按需编辑
+#   make up                # 启动服务
+#   make logs              # 查看日志
+#
+# 访问方式：
+#   容器内服务监听 8000 端口，不做宿主机端口映射
+#   获取容器 IP：docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' wetty-mcp-terminal-wetty-mcp-1
+#   然后直接访问：http://<容器IP>:8000
+#
+# 如需本地 MySQL 容器：
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   make up   # 自动合并 override，启动 MySQL + wetty-mcp
+# ══════════════════════════════════════════════
+
 services:
   wetty-mcp:
     build: .
-    ports:
-      - "8000"
+    # 不做端口映射，通过容器 IP 直接访问 8000 端口
+    # 获取 IP: make ip
     volumes:
       - wetty-data:/app/data
-      - ./config:/app/config:ro
+      - ./config:/app/config:ro    # 可选：仅首次初始化种子数据时需要
       - ~/.ssh:/root/.ssh:ro
     environment:
       - PYTHONPATH=/app
-      - WETTY_API_TOKEN=${WETTY_API_TOKEN:-}      # 设置后启用 API/MCP 认证，未设置时为开发模式（免认证）
-      # - WETTY_ENCRYPTION_KEY=your-fernet-key    # 生产环境设置固定加密密钥
+      - WETTY_API_TOKEN=${WETTY_API_TOKEN:-}
+      - WETTY_ENCRYPTION_KEY=${WETTY_ENCRYPTION_KEY:-}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - WETTY_WATCH_YAML=${WETTY_WATCH_YAML:-}
     restart: unless-stopped
 
 volumes:

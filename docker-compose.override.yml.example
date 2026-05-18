@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════
+# 本地 MySQL 容器（可选 override）
+#
+# 使用方法：
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   编辑 .env 设置 MYSQL_* 变量
+#   make up   # Docker Compose 自动合并 override
+#
+# 此文件提供本地 MySQL 8.0 容器，适用于：
+#   - 本地开发调试
+#   - 没有远程 MySQL 但又想用 MySQL 模式
+#
+# 注意：.env 中的 DATABASE_URL 需指向本地 MySQL：
+#   DATABASE_URL=mysql+aiomysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}?charset=utf8mb4
+# ══════════════════════════════════════════════
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wetty_terminal}
+      MYSQL_USER: ${MYSQL_USER:-wetty}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-wetty123}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  wetty-mcp:
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
