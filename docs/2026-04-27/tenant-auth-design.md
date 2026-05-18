@@ -1257,7 +1257,7 @@ export function AdminRoute({ children }: { children: React.ReactNode }) {
 
 | Sprint | 状态 | 说明 |
 |--------|------|------|
-| Sprint 1 | ✅ 完成 | 后端认证核心 + Token 刷新，详见 `docs/tenant-auth-progress.md` |
+| Sprint 1 | ✅ 完成 | 后端认证核心 + Token 刷新，详见 `docs/2026-05-15/tenant-auth-progress.md` |
 | Sprint 2 | ✅ 完成 | 会话隔离 + 主机授权 + SSE 隔离 |
 | Sprint 3 | ✅ 完成 | 前端登录 UI + Token 管理（auth.ts + api.ts 升级 + LoginPage + App 认证守卫） |
 | Sprint 4 | 🔲 待开始 | 审计日志 + 管理 API + 热加载 + 测试 |

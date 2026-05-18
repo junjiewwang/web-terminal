@@ -1,6 +1,6 @@
 # 租户认证系统 — 实施进展
 
-> 设计文档：[tenant-auth-design.md](./tenant-auth-design.md)
+> 设计文档：[tenant-auth-design.md](../2026-04-27/tenant-auth-design.md)
 
 ---
 
