@@ -16,7 +16,7 @@ from typing import cast
 
 import yaml
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.host import (
@@ -27,11 +27,13 @@ from src.models.host import (
     Host,
     HostCreate,
     HostResponse,
+    HostStatus,
     HostTreeYAMLSchema,
     HostType,
     HostUpdate,
 )
 from src.utils.security import encrypt_password
+from src.services.credential_service import CredentialService
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ _UPDATABLE_FIELDS: tuple[str, ...] = (
     "credential_ref",
     "host_type",
     "parent_id",
+    "status",
 )
 
 
@@ -95,6 +98,11 @@ class HostManager:
         self._session: AsyncSession = session
 
     # ── 查询 ──────────────────────────────────
+
+    async def has_hosts(self) -> bool:
+        """检查数据库中是否已有主机数据（用于判断是否需要首次初始化同步）。"""
+        result = await self._session.execute(select(func.count(Host.id)))
+        return (result.scalar_one() or 0) > 0
 
     async def list_hosts(self, tag: str | None = None) -> list[Host]:
         """列出主机树（仅返回顶层根节点）。"""
@@ -149,6 +157,7 @@ class HostManager:
             parent_id=data.parent_id,
             ready_pattern=data.ready_pattern,
             credential_ref=data.credential_ref,
+            status=data.status,
         )
 
         if data.auth_type == AuthType.PASSWORD and data.password:
@@ -202,6 +211,14 @@ class HostManager:
         await self._session.flush()
         return True
 
+    async def delete_all_hosts(self) -> int:
+        """删除所有主机记录（用于覆盖导入模式），返回删除数量。"""
+        from sqlalchemy import delete as sa_delete
+
+        result = await self._session.execute(sa_delete(Host))
+        await self._session.flush()
+        return result.rowcount  # type: ignore[return-value]
+
     # ── YAML 同步（Single Source of Truth）──────
 
     async def sync_from_yaml(self, yaml_path: str | Path) -> SyncResult:
@@ -225,6 +242,12 @@ class HostManager:
         except ValueError as e:
             result.errors.append(str(e))
             return result
+
+        # 将 YAML 中的 credentials 同步到数据库（upsert）
+        if credentials:
+            cred_service = CredentialService(self._session)
+            for cred_name, cred_password in credentials.items():
+                await cred_service.upsert_from_yaml(cred_name, cred_password)
 
         raw_hosts: object = config.get("hosts")
         hosts_config: list[object] = raw_hosts if isinstance(raw_hosts, list) else []
@@ -412,6 +435,7 @@ class HostManager:
                 ready_pattern=node.ready_pattern,
                 host_type=HostType.ROOT,
                 entry=EntrySpecSchema(type=EntryType.NONE),
+                status=node.status,
             )
         else:
             if root_conn is None:
@@ -434,6 +458,7 @@ class HostManager:
                 ready_pattern=node.ready_pattern,
                 host_type=HostType.NESTED,
                 entry=node.entry,
+                status=node.status,
             )
 
         flattened = [_FlattenedNode(data=current, parent_name=parent_name)]
@@ -495,6 +520,8 @@ class HostManager:
             return True
         if db_host.credential_ref != yaml_data.credential_ref:
             return True
+        if db_host.status != yaml_data.status:
+            return True
 
         db_tags = sorted(t.strip() for t in db_host.tags.split(",") if t.strip()) if db_host.tags else []
         yaml_tags = sorted(yaml_data.tags) if yaml_data.tags else []
@@ -529,4 +556,5 @@ class HostManager:
             host_type=yaml_data.host_type,
             parent_id=parent_id,
             entry=yaml_data.entry,
+            status=yaml_data.status,
         )
