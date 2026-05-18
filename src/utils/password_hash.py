@@ -4,7 +4,9 @@
     python -m src.utils.password_hash "your-password"
     python -m src.utils.password_hash  # 交互式输入
 
-输出 bcrypt 哈希字符串，可直接粘贴到 tenants.yaml 的 password_hash 字段。
+输出 bcrypt 哈希字符串。
+
+推荐使用 python -m src.utils.reset_password 直接重置数据库中的密码。
 """
 
 from __future__ import annotations
@@ -47,8 +49,9 @@ def main() -> None:
         sys.exit(1)
 
     hashed = hash_password(password)
-    print(f"\n密码哈希（粘贴到 tenants.yaml 的 password_hash 字段）：")
+    print(f"\n密码哈希：")
     print(hashed)
+    print(f"\n提示：推荐使用 python -m src.utils.reset_password 直接重置数据库密码")
 
     # 验证哈希正确性
     if verify_password(password, hashed):

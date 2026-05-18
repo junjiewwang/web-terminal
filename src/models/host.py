@@ -31,6 +31,14 @@ class EntryType(str, enum.Enum):
     SSH_COMMAND = "ssh_command"
 
 
+class HostStatus(str, enum.Enum):
+    """节点生命周期状态。"""
+
+    ACTIVE = "active"  # 正常使用中
+    DEPRECATED = "deprecated"  # 待下线（仍可连接，前端显示警告标识）
+    DISABLED = "disabled"  # 已禁用（前端不显示 / 拒绝连接）
+
+
 class Host(Base):
     """主机资产 ORM 模型。"""
 
@@ -50,6 +58,9 @@ class Host(Base):
     credential_ref: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="共享凭据引用名")
     description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="主机描述")
     tags: Mapped[str | None] = mapped_column(Text, nullable=True, comment="标签，逗号分隔")
+    status: Mapped[HostStatus] = mapped_column(
+        Enum(HostStatus), nullable=False, default=HostStatus.ACTIVE, comment="节点生命周期状态"
+    )
 
     host_type: Mapped[HostType] = mapped_column(
         Enum(HostType), nullable=False, default=HostType.ROOT, comment="节点类型: root | nested"
@@ -130,6 +141,7 @@ class HostCreate(HostBase):
     host_type: HostType = Field(default=HostType.ROOT, description="节点类型")
     parent_id: int | None = Field(default=None, description="父节点 ID")
     entry: EntrySpecSchema | None = Field(default=None, description="从父节点进入当前节点的动作定义")
+    status: HostStatus = Field(default=HostStatus.ACTIVE, description="节点生命周期状态")
 
 
 class HostUpdate(BaseModel):
@@ -148,6 +160,7 @@ class HostUpdate(BaseModel):
     host_type: HostType | None = None
     parent_id: int | None = None
     entry: EntrySpecSchema | None = None
+    status: HostStatus | None = None
 
 
 class HostResponse(BaseModel):
@@ -165,6 +178,7 @@ class HostResponse(BaseModel):
     host_type: HostType = Field(default=HostType.ROOT)
     parent_id: int | None = None
     entry: EntrySpecSchema = Field(default_factory=EntrySpecSchema)
+    status: HostStatus = Field(default=HostStatus.ACTIVE)
     children: list["HostResponse"] = Field(default_factory=list, description="子节点列表")
     created_at: datetime
     updated_at: datetime
@@ -203,6 +217,7 @@ class HostResponse(BaseModel):
             parent_id=host.parent_id,
             entry=entry,
             children=children,
+            status=host.status,
             created_at=host.created_at,
             updated_at=host.updated_at,
         )
@@ -222,6 +237,7 @@ class HostTreeYAMLSchema(BaseModel):
     tags: list[str] = Field(default_factory=list, description="标签")
     ready_pattern: str | None = Field(default=None, description="当前节点就绪模式")
     entry: EntrySpecSchema | None = Field(default=None, description="入口动作")
+    status: HostStatus = Field(default=HostStatus.ACTIVE, description="节点生命周期状态")
     children: list["HostTreeYAMLSchema"] = Field(default_factory=list, description="子节点")
 
 
