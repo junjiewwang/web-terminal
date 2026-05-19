@@ -553,12 +553,31 @@ async def ensure_snippet_loaded(
     if not need_inject:
         return None
 
-    # ── 步骤 3: 注入脚本 ──
-    loader = registry.build_heredoc_loader(domain_id)
+    # ── 步骤 3: 探测远端 gunzip 可用性 → 决定注入模式 ──
+    use_compressed_inject = True
+    try:
+        gunzip_probe_output = await session.send_command(
+            command="command -v gunzip >/dev/null 2>&1 && echo '__GZ_YES__' || echo '__GZ_NO__'",
+            wait_pattern=r"__GZ_(?:YES|NO)__",
+            timeout=5.0,
+        )
+        if "__GZ_NO__" in gunzip_probe_output:
+            use_compressed_inject = False
+            logger.info("远端无 gunzip，降级为 heredoc 注入模式")
+    except (TimeoutError, ConnectionError):
+        # 探测超时/失败，保守降级为 heredoc
+        use_compressed_inject = False
+        logger.warning("gunzip 可用性探测超时，降级为 heredoc 注入模式")
+
+    # ── 步骤 4: 注入脚本 ──
+    loader = registry.build_heredoc_loader(domain_id, compressed=use_compressed_inject)
     if not loader:
         return f"{domain_id} 域脚本文件不存在"
 
-    logger.info("注入 %s snippet（%s）", domain_id, inject_reason)
+    logger.info(
+        "注入 %s snippet（%s, %s）",
+        domain_id, inject_reason, "compressed" if use_compressed_inject else "heredoc",
+    )
 
     inject_confirmed = False
     try:

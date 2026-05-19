@@ -398,32 +398,39 @@ class PtyFileTransfer:
         file_data = local_file.read_bytes()
         local_md5 = hashlib.md5(file_data).hexdigest()
 
+        # ★ O2a: 远端 gunzip 可用性探测 ★
+        # ft_recv --compressed 依赖远端 gunzip，不可用时跳过压缩
+        remote_has_gunzip = await self._probe_remote_gunzip()
+
         # ★ O2 优化：智能 gzip 压缩 ★
         # 尝试压缩，只有压缩率达到阈值才使用，否则直接传原始数据
         use_compression = False
         compressed_data = b""
         original_size = file_size
 
-        try:
-            compressed_data = gzip.compress(file_data, compresslevel=_GZIP_COMPRESS_LEVEL)
-            if len(compressed_data) < len(file_data) * _COMPRESSION_THRESHOLD:
-                use_compression = True
-                logger.info(
-                    "启用 gzip 压缩: %d → %d (节省 %.1f%%)",
-                    file_size, len(compressed_data),
-                    (1 - len(compressed_data) / file_size) * 100,
-                )
-            else:
-                logger.info(
-                    "跳过 gzip 压缩: %d → %d (仅节省 %.1f%%, 低于 %.0f%% 阈值)",
-                    file_size, len(compressed_data),
-                    (1 - len(compressed_data) / file_size) * 100,
-                    (1 - _COMPRESSION_THRESHOLD) * 100,
-                )
-                compressed_data = b""  # 释放内存
-        except Exception as e:
-            logger.warning("gzip 压缩失败，使用原始数据传输: %s", e)
-            compressed_data = b""
+        if not remote_has_gunzip:
+            logger.info("远端无 gunzip/gzip，跳过压缩传输（纯 base64 模式）")
+        else:
+            try:
+                compressed_data = gzip.compress(file_data, compresslevel=_GZIP_COMPRESS_LEVEL)
+                if len(compressed_data) < len(file_data) * _COMPRESSION_THRESHOLD:
+                    use_compression = True
+                    logger.info(
+                        "启用 gzip 压缩: %d → %d (节省 %.1f%%)",
+                        file_size, len(compressed_data),
+                        (1 - len(compressed_data) / file_size) * 100,
+                    )
+                else:
+                    logger.info(
+                        "跳过 gzip 压缩: %d → %d (仅节省 %.1f%%, 低于 %.0f%% 阈值)",
+                        file_size, len(compressed_data),
+                        (1 - len(compressed_data) / file_size) * 100,
+                        (1 - _COMPRESSION_THRESHOLD) * 100,
+                    )
+                    compressed_data = b""  # 释放内存
+            except Exception as e:
+                logger.warning("gzip 压缩失败，使用原始数据传输: %s", e)
+                compressed_data = b""
 
         # 确定实际传输的数据
         transfer_data = compressed_data if use_compression else file_data
@@ -785,6 +792,29 @@ class PtyFileTransfer:
         finally:
             # ★ Bugfix #22c: 恢复 WebSocket 广播（无论传输成功/失败/超时）★
             self._session.set_ws_muted(False)
+
+    # ── 远端环境探测 ──────────────────────────────
+
+    async def _probe_remote_gunzip(self) -> bool:
+        """探测远端是否有 gunzip/gzip 命令（用于决定是否启用压缩传输）。
+
+        Returns:
+            True: 远端有 gunzip 可用
+            False: 远端无 gunzip，应使用纯 base64 传输
+        """
+        try:
+            output = await self._session.send_command(
+                command=(
+                    "{ command -v gunzip >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1; } "
+                    "&& echo '__GZ_YES__' || echo '__GZ_NO__'"
+                ),
+                wait_pattern=r"__GZ_(?:YES|NO)__",
+                timeout=5.0,
+            )
+            return "__GZ_NO__" not in output
+        except (TimeoutError, ConnectionError):
+            logger.warning("远端 gunzip 可用性探测超时，保守禁用压缩")
+            return False
 
     # ── 下载（远端 → 本地）──────────────────────
 
