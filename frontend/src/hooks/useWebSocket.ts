@@ -33,6 +33,20 @@ export interface ResizeHint {
   effective_rows: number;
 }
 
+/** 会话退出信息（增强的断连通知） */
+export interface SessionExitInfo {
+  /** 退出原因分类 */
+  reason: string;
+  /** 进程退出码 */
+  exitCode?: number | null;
+  /** 人类友好的断连消息（如 "远程主机强制断开了连接"） */
+  message?: string;
+  /** 是否可重连 */
+  recoverable: boolean;
+  /** 主机/实例名称 */
+  hostName?: string;
+}
+
 /** Hook 配置 */
 export interface UseWebSocketOptions {
   /** WebSocket URL（如 /ws/terminal/{session_id}），null 时不连接 */
@@ -45,6 +59,8 @@ export interface UseWebSocketOptions {
   onConnect?: () => void;
   /** 连接断开回调 */
   onDisconnect?: (reason?: string) => void;
+  /** 会话退出回调（含增强断连信息） */
+  onSessionExit?: (info: SessionExitInfo) => void;
   /** 收到 tmux clipboard 推送的回调 */
   onClipboard?: (text: string) => void;
   /** 收到 resize_hint 消息的回调（Broker 模式 min-size 策略通知有效尺寸） */
@@ -81,7 +97,7 @@ function _decodeBase64Utf8(base64Text: string): string {
  * 原生 WebSocket 终端连接 Hook
  */
 export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
-  const { wsUrl, onData, onHistory, onConnect, onDisconnect, onClipboard, onResizeHint } = options;
+  const { wsUrl, onData, onHistory, onConnect, onDisconnect, onSessionExit, onClipboard, onResizeHint } = options;
   const [status, setStatus] = useState<SocketStatus>("disconnected");
   const wsRef = useRef<WebSocket | null>(null);
   const attemptsRef = useRef(0);
@@ -93,12 +109,14 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
   const onHistoryRef = useRef(onHistory);
   const onConnectRef = useRef(onConnect);
   const onDisconnectRef = useRef(onDisconnect);
+  const onSessionExitRef = useRef(onSessionExit);
   const onClipboardRef = useRef(onClipboard);
   const onResizeHintRef = useRef(onResizeHint);
   onDataRef.current = onData;
   onHistoryRef.current = onHistory;
   onConnectRef.current = onConnect;
   onDisconnectRef.current = onDisconnect;
+  onSessionExitRef.current = onSessionExit;
   onClipboardRef.current = onClipboard;
   onResizeHintRef.current = onResizeHint;
 
@@ -173,10 +191,18 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
             setStatus("disconnected");
             onDisconnectRef.current?.(msg.reason || "closed");
           } else if (msg.type === "session_exit") {
-            // Broker 模式会话退出通知
+            // Broker 模式会话退出通知（增强：含断连友好信息）
             const reason = msg.reason || "session_exit";
-            console.log(`[WebSocket] 会话退出: reason=${reason}, exit_code=${msg.exit_code}`);
+            const exitInfo: SessionExitInfo = {
+              reason,
+              exitCode: msg.exit_code ?? null,
+              message: msg.message,
+              recoverable: msg.recoverable ?? true,
+              hostName: msg.host_name,
+            };
+            console.log(`[WebSocket] 会话退出: reason=${reason}, message=${exitInfo.message || "N/A"}, recoverable=${exitInfo.recoverable}`);
             setStatus("disconnected");
+            onSessionExitRef.current?.(exitInfo);
             onDisconnectRef.current?.(reason);
           } else if (msg.type === "resize_hint") {
             // Broker 模式 min-size 策略有效尺寸通知

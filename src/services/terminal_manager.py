@@ -107,10 +107,80 @@ class SessionExitReason(str, enum.Enum):
 
     NORMAL = "normal"               # 正常退出（exit/logout）
     SSH_FAILED = "ssh_failed"       # SSH 连接失败
+    SSH_DISCONNECTED = "ssh_disconnected"  # SSH 连接中断（网络断开/服务端关闭）
     PTY_CLOSED = "pty_closed"       # PTY fd 被关闭（EOF/error）
     CHILD_CRASHED = "child_crashed" # 子进程异常退出（非零 exit code）
     STOPPED = "stopped"             # 被主动 stop() 调用停止
     UNKNOWN = "unknown"             # 无法归类的退出原因
+
+
+# ── SSH 断连模式识别 ──────────────────────────────
+# 从 PTY 缓冲区末尾提取断连原因的正则模式映射。
+# key: 编译后的正则, value: (人类友好消息, 是否可重连)
+_DISCONNECT_PATTERNS: list[tuple[re.Pattern[str], str, bool]] = [
+    (
+        re.compile(r"Connection reset by peer", re.IGNORECASE),
+        "远程主机强制断开了连接",
+        True,
+    ),
+    (
+        re.compile(r"Connection closed by (?:remote host|.+)", re.IGNORECASE),
+        "远程主机关闭了连接",
+        True,
+    ),
+    (
+        re.compile(r"Broken pipe", re.IGNORECASE),
+        "网络连接中断（Broken pipe）",
+        True,
+    ),
+    (
+        re.compile(r"Connection timed? ?out", re.IGNORECASE),
+        "连接超时",
+        True,
+    ),
+    (
+        re.compile(r"Network is unreachable", re.IGNORECASE),
+        "网络不可达",
+        True,
+    ),
+    (
+        re.compile(r"No route to host", re.IGNORECASE),
+        "无法到达主机",
+        True,
+    ),
+    (
+        re.compile(r"Host key verification failed", re.IGNORECASE),
+        "主机密钥验证失败",
+        False,
+    ),
+    (
+        re.compile(r"Permission denied", re.IGNORECASE),
+        "认证失败（权限被拒绝）",
+        False,
+    ),
+    (
+        re.compile(r"Connection refused", re.IGNORECASE),
+        "连接被拒绝（目标端口未开放）",
+        True,
+    ),
+    (
+        re.compile(r"Read from remote host .+: Connection reset", re.IGNORECASE),
+        "远程主机断开了连接",
+        True,
+    ),
+]
+
+
+def _extract_disconnect_info(buffer_tail: str) -> tuple[SessionExitReason, str, bool] | None:
+    """从 PTY 缓冲区尾部文本中提取断连信息。
+
+    Returns:
+        (exit_reason, human_message, recoverable) 或 None（未匹配到已知模式）
+    """
+    for pattern, message, recoverable in _DISCONNECT_PATTERNS:
+        if pattern.search(buffer_tail):
+            return SessionExitReason.SSH_DISCONNECTED, message, recoverable
+    return None
 
 
 # 会话退出回调类型：(session_id, exit_reason, exit_code)
@@ -396,15 +466,40 @@ class TerminalSession:
             except ChildProcessError:
                 pass
 
+        # ── 断连模式识别：从缓冲区尾部提取友好消息 ──
+        disconnect_message: str | None = None
+        recoverable = True  # 默认可重连
+
+        if self._exit_reason in (SessionExitReason.PTY_CLOSED, SessionExitReason.UNKNOWN):
+            # 取缓冲区最后 20 行做断连模式匹配
+            tail_lines = list(self._raw_buffer)[-20:]
+            buffer_tail = "\n".join(tail_lines)
+            disconnect_info = _extract_disconnect_info(buffer_tail)
+            if disconnect_info:
+                self._exit_reason, disconnect_message, recoverable = disconnect_info
+                logger.info(
+                    "检测到 SSH 断连: session=%s, message=%s, recoverable=%s",
+                    self.session_id[:8],
+                    disconnect_message,
+                    recoverable,
+                )
+
         # 通知所有 WebSocket 客户端会话已结束
         reason_msg = self._exit_reason.value if self._exit_reason else "unknown"
+        exit_payload: dict[str, object] = {
+            "type": "session_exit",
+            "reason": reason_msg,
+            "exit_code": self._exit_code,
+        }
+        # 附带增强字段（前端可选消费）
+        if disconnect_message:
+            exit_payload["message"] = disconnect_message
+        exit_payload["recoverable"] = recoverable
+        exit_payload["host_name"] = self.instance_name
+
         for client in list(self._ws_clients.values()):
             try:
-                await client.ws.send_json({
-                    "type": "session_exit",
-                    "reason": reason_msg,
-                    "exit_code": self._exit_code,
-                })
+                await client.ws.send_json(exit_payload)
             except Exception:
                 pass
 

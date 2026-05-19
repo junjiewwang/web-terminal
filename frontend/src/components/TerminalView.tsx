@@ -19,14 +19,16 @@ import type { Host, TerminalInstance, TerminalBackend } from "../services/api";
 import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
 import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
+import type { SessionExitInfo } from "../hooks/useWebSocket";
 import SnippetPanel from "./SnippetPanel";
 import FileTransferPanel from "./FileTransferPanel";
+import DisconnectOverlay from "./DisconnectOverlay";
 
 // xterm.js 样式（必须导入，否则终端无法正确渲染）
 import "@xterm/xterm/css/xterm.css";
 
 // ── 终端连接状态 ──────────────────────────────
-type ConnectionStatus = "idle" | "starting" | "connecting" | "connected" | "error";
+type ConnectionStatus = "idle" | "starting" | "connecting" | "connected" | "disconnected" | "error";
 
 interface TerminalViewProps {
   host: Host;
@@ -63,6 +65,8 @@ export default function TerminalView({
   const [snippetPanelOpen, setSnippetPanelOpen] = useState(false);
   /** FileTransferPanel 展开状态 */
   const [fileTransferPanelOpen, setFileTransferPanelOpen] = useState(false);
+  /** 断连退出信息（用于 DisconnectOverlay 展示） */
+  const [exitInfo, setExitInfo] = useState<SessionExitInfo | null>(null);
 
   // ── scrollback 历史回放标志 ──
   // 当正在回放 scrollback 时，屏蔽 xterm.js 的 onData 输出到 WebSocket，
@@ -134,11 +138,22 @@ export default function TerminalView({
     onClipboard: showCopyToast,
     onConnect: () => {
       setStatus("connected");
+      setExitInfo(null); // 连接成功时清除旧的断连信息
       requestAnimationFrame(() => {
         terminal.fit();
         terminal.focus();
         ws.sendResize(terminal.getSize());
       });
+    },
+    onSessionExit: (info) => {
+      // 收到结构化的退出消息 → 进入 disconnected 状态
+      setExitInfo(info);
+      if (info.reason === "normal" || info.reason === "stopped") {
+        setStatus("idle");
+        setWsUrl(null);
+      } else {
+        setStatus("disconnected");
+      }
     },
     onDisconnect: (reason) => {
       if (reason === "closed" || reason === "normal") {
@@ -324,6 +339,21 @@ export default function TerminalView({
             </div>
           </div>
         )}
+
+        {status === "disconnected" && exitInfo && (
+          <DisconnectOverlay
+            exitInfo={exitInfo}
+            onReconnect={() => {
+              setExitInfo(null);
+              connectToHost(host);
+            }}
+            onDismiss={() => {
+              setExitInfo(null);
+              setStatus("idle");
+              setWsUrl(null);
+            }}
+          />
+        )}
       </div>
 
       {/* SnippetPanel — 底部展开面板 */}
@@ -360,6 +390,7 @@ const STATUS_MAP: Record<ConnectionStatus, { dot: string; label: string }> = {
   starting: { dot: "text-yellow-400 animate-pulse", label: "启动中..." },
   connecting: { dot: "text-yellow-400 animate-pulse", label: "连接中..." },
   connected: { dot: "text-emerald-500", label: "已连接" },
+  disconnected: { dot: "text-orange-400", label: "已断开" },
   error: { dot: "text-red-500", label: "连接失败" },
 };
 
