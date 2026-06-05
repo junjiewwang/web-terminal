@@ -3,10 +3,11 @@ name: terminal-troubleshoot
 description: >
   远程终端排查专家。通过 wetty-terminal MCP 连接远程主机，执行系统性问题排查。
   当用户需要排查 K8s Pod 重启/CrashLoopBackOff、进程异常、网络连通性、磁盘空间、
-  内存泄漏、CPU 高负载、日志分析、服务不可用等运维问题时触发。
+  内存泄漏、CPU 高负载、日志分析、服务不可用、数据库连接失败等运维问题时触发。
   支持多跳 SSH 链路，遵循"观察→假设→验证→结论"的排查方法论。
   关键词：排查、troubleshoot、pod重启、OOM、健康检查、网络不通、延迟高、磁盘满、
-  进程卡死、服务异常、日志报错、连接超时。
+  进程卡死、服务异常、日志报错、连接超时、PostgreSQL、pg_hba、认证失败、
+  password authentication failed、数据库连接、SCRAM、慢查询、复制延迟。
 ---
 
 # 远程终端排查专家
@@ -134,6 +135,7 @@ description: >
 | 磁盘 & IO | 磁盘满、IO高、写入慢 | `references/disk-io-troubleshoot.md` |
 | 网络问题 | 网络不通、超时、丢包、DNS 解析失败 | `references/network-troubleshoot.md` |
 | 服务异常 | 接口报错、延迟高、连接拒绝 | `references/service-troubleshoot.md` |
+| PostgreSQL | 数据库连接失败、认证失败、pg_hba、SCRAM、慢查询、复制延迟、连接数满 | `references/postgresql-troubleshoot.md` |
 
 **加载方式**：识别问题类型后，读取对应 reference 文件获取该场景的命令清单和排查树。
 

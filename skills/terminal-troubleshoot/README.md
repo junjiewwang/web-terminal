@@ -3,8 +3,8 @@
 ### 基本信息
 - 技能名: `terminal-troubleshoot`
 - 创建人: @junjiewwang (junjiewwang@tencent.com)
-- 版本: v1.0.0
-- 更新时间: 2026-06-04
+- 版本: v1.1.0
+- 更新时间: 2026-06-05
 
 ### 适用场景
 
@@ -17,6 +17,7 @@
 - 磁盘满 / IO 延迟高
 - 网络不通 / DNS 失败 / 延迟高
 - 服务接口异常 / 延迟突增
+- PostgreSQL 连接认证失败 / 慢查询 / 复制延迟 / 连接数问题
 
 ### 设计原则
 
@@ -40,7 +41,8 @@ terminal-troubleshoot/
     ├── memory-troubleshoot.md       # 内存
     ├── disk-io-troubleshoot.md      # 磁盘 & IO
     ├── network-troubleshoot.md      # 网络
-    └── service-troubleshoot.md      # 服务异常
+    ├── service-troubleshoot.md      # 服务异常
+    └── postgresql-troubleshoot.md   # PostgreSQL 连接与运维
 ```
 
 ### 前置条件
@@ -56,6 +58,8 @@ terminal-troubleshoot/
 "xx 主机 CPU 飙到 100%，帮我看看什么进程在占用"
 "检查一下生产环境的 Redis 服务为什么连接不上"
 "磁盘快满了，帮我看看哪里占用最大"
+"应用连 PostgreSQL 报 password authentication failed，帮我排查"
+"PG 连接数满了，帮我看看哪些连接占用最多"
 ```
 
 ### 扩展指南
@@ -76,8 +80,9 @@ terminal-troubleshoot/
 ### 已知问题
 
 - [x] K8s Pod 排查完整流程验证（v1.0.0）
+- [x] PostgreSQL 连接认证 / HBA / SCRAM 排查（v1.1.0）
 - [ ] 添加 Java 性能分析（Arthas）排查场景
-- [ ] 添加数据库慢查询排查场景
+- [ ] 添加 Redis / MySQL 排查场景
 - [ ] 添加容器镜像/构建问题排查场景
 
 ### 相关技能
