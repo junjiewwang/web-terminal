@@ -12,7 +12,7 @@
 #
 # 访问方式：
 #   容器内服务监听 8000 端口，不做宿主机端口映射
-#   获取容器 IP：docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' wetty-mcp-terminal-wetty-mcp-1
+#   获取容器 IP：make ip
 #   然后直接访问：http://<容器IP>:8000
 #
 # 如需本地 MySQL 容器：

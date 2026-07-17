@@ -93,12 +93,17 @@ ps: ## 查看服务状态
 status: ps ## ps 的别名
 
 ip: ## 获取容器 IP 及访问地址
-	@CONTAINER_IP=$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' wetty-mcp-terminal-wetty-mcp-1 2>/dev/null); \
-	if [ -z "$$CONTAINER_IP" ]; then \
+	@CID=$$(docker compose ps -q wetty-mcp 2>/dev/null); \
+	if [ -z "$$CID" ]; then \
 		echo "⚠ 容器未运行，请先 make up"; \
 	else \
-		echo "  容器 IP: $$CONTAINER_IP"; \
-		echo "  访问地址: http://$$CONTAINER_IP:8000"; \
+		CONTAINER_IP=$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$$CID" 2>/dev/null); \
+		if [ -z "$$CONTAINER_IP" ]; then \
+			echo "⚠ 无法获取容器 IP"; \
+		else \
+			echo "  容器 IP: $$CONTAINER_IP"; \
+			echo "  访问地址: http://$$CONTAINER_IP:8000"; \
+		fi; \
 	fi
 
 # ── 密码工具 ──────────────────────────────────

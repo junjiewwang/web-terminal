@@ -10,7 +10,7 @@
 #   Stage 2: 组装最终运行镜像（纯 Python）
 #
 # 层缓存优化原则：不变的在前，常变的在后
-# 镜像源优化：apt 清华源 / npm 淘宝源 / pip 清华源
+# 镜像源优化：apt 阿里云源 / npm 淘宝源 / pip 阿里云源
 # ══════════════════════════════════════════════
 
 # ── Stage 1: 前端编译 ────────────────────────
@@ -36,7 +36,7 @@ WORKDIR /app
 #    - sshpass: tmux-session.sh 内通过 sshpass 自动输入 SSH 密码
 #    - tmux: 会话复用，浏览器和 MCP Agent 共享同一个 SSH PTY
 #    - nginx: 前端反向代理，解决浏览器 SSE 连接阻塞问题
-RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
         sshpass \
@@ -49,7 +49,7 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 
 # 2) Python 依赖（偶尔变）
 COPY requirements.txt .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
     -r requirements.txt
 
 # 3) nginx 配置（偶尔变）
