@@ -38,6 +38,34 @@
 - `Makefile`：`ip` 目标
 - `docker-compose.yml`：第 15 行注释
 
+## MCP `list_hosts` 输出截断修复（2026-07-28）
+
+### 问题
+
+MCP 客户端调用 `list_hosts` 时，主机列表结果被截断。实际堡垒机下有 10+ 子节点，但返回仅能看到 3 个。
+
+### 根本原因
+
+`list_hosts` 返回了每个节点的**全部字段**（id、port、username、tags、entry 等），其中 `entry` 字段包含嵌套的 `LoginStepSchema` 数组，用 `indent=2` 格式化后 JSON 体积极大。主机节点数多时，输出超出 MCP 客户端的 `maxOutputLength` 限制被截断。
+
+截断层在 **MCP 客户端**，非服务端代码。
+
+### 解决方案
+
+`list_hosts` 默认返回精简输出，仅包含 Agent 做路由决策需要的 5 个核心字段：
+- `name` — 连接时用
+- `hostname` — 帮助识别 IP
+- `description` — 理解主机用途
+- `type` — root/nested
+- `children` — 树结构
+
+新增 `verbose=True` 参数，需要完整信息时显式开启。
+
+### 变更文件
+
+- `src/mcp_server/server.py`：`list_hosts` 函数（新增 `verbose` 参数，默认精简输出）
+
+
 ## 遗留问题
 
 - 清华镜像 403 是否为长期故障未知。如后续恢复，可考虑切换回去或引入多镜像 fallback 策略。

@@ -181,13 +181,17 @@ def _decrypt_host_password(host: Host) -> str | None:
 
 
 @mcp.tool()
-async def list_hosts(tag: str | None = None) -> str:
+async def list_hosts(tag: str | None = None, verbose: bool = False) -> str:
     """列出所有可用的 SSH 主机
 
     返回递归树结构：任意节点都可以继续包含 children，
     适用于 root -> nested -> nested 的多跳链路。
 
-    注意：返回所有配置的主机列表。
+    Args:
+        tag: 可选，按标签过滤主机
+        verbose: 是否返回完整详情（含 port/username/entry 等）。默认 False 仅返回核心字段以避免结果截断。
+
+    注意：结果可能因客户端文本长度限制被截断，如被截断请用 verbose=false（默认）。
     """
     async with async_session_factory() as session:
         mgr = HostManager(session)
@@ -211,7 +215,20 @@ async def list_hosts(tag: str | None = None) -> str:
             "children": [_to_dict(child) for child in host.children],
         }
 
-    return json.dumps([_to_dict(host) for host in hosts], ensure_ascii=False, indent=2)
+    def _to_compact(host: HostResponse) -> JsonDict:
+        """精简输出：仅返回 Agent 做路由决策所需的核心字段，避免客户端截断。"""
+        return {
+            "name": host.name,
+            "hostname": host.hostname,
+            "description": host.description or "",
+            "type": host.host_type.value,
+            "children": [_to_compact(child) for child in host.children],
+        }
+
+    if verbose:
+        return json.dumps([_to_dict(host) for host in hosts], ensure_ascii=False, indent=2)
+
+    return json.dumps([_to_compact(host) for host in hosts], ensure_ascii=False)
 
 
 @mcp.tool()
