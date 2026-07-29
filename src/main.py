@@ -331,6 +331,22 @@ app.add_middleware(
 )
 
 
+# ── MCP 请求 Host 捕获中间件 ──────────────────
+# 捕获客户端 Host 头，供 MCP download_file 工具自动生成正确的下载 URL。
+# 优先级高于 WETTY_EXTERNAL_URL 环境变量，无需手动配置。
+
+
+@app.middleware("http")
+async def _capture_host_middleware(request: Request, call_next):
+    """将当前请求的 Host 头注入 MCP 工具上下文。"""
+    from src.mcp_server.server import set_mcp_request_host
+
+    host = request.headers.get("Host", "")
+    if host:
+        set_mcp_request_host(host)
+    return await call_next(request)
+
+
 # ── Bearer Token 认证中间件 ──────────────────
 
 # 无需认证的路径白名单

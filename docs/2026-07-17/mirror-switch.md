@@ -66,6 +66,38 @@ MCP 客户端调用 `list_hosts` 时，主机列表结果被截断。实际堡�
 - `src/mcp_server/server.py`：`list_hosts` 函数（新增 `verbose` 参数，默认精简输出）
 
 
+## MCP `download_file` 支持浏览器下载（2026-07-29）
+
+### 问题
+
+MCP `download_file` 工具只能将远端文件下载到容器内，Agent 返回的只是文本消息（"下载完成: /app/data/xxx.log"），用户无法真正拿到文件到本地电脑。
+
+### 解决方案
+
+复用已有的 REST API 两步下载机制：
+1. `download_file` 完成 PTY 传输后，调用 `_register_download_token()` 注册一次性 token（120 秒 TTL）
+2. 返回可直接在浏览器打开的下载 URL
+
+**URL 自动检测**（优先级从高到低）：
+1. **MCP 请求 Host 头**（推荐）：FastAPI 中间件 `_capture_host_middleware` 自动捕获客户端连接时使用的 Host（含端口），例如客户端配置 `http://10.0.0.5:8000/mcp` → 自动生成 `http://10.0.0.5:8000/...`。无需任何手动配置。
+2. **`WETTY_EXTERNAL_URL` 环境变量**：手动指定外部地址（如经反向代理时）
+3. **容器 IP**：兜底方案，用 `socket.gethostbyname()` 获取
+
+下载流程：
+```
+远端节点 → PTY → 容器暂存 → 注册 token + 自动检测 URL → 返回下载链接
+用户 → 浏览器打开 URL → GET .../download/{token} → 文件下载到本地
+```
+
+### 变更文件
+
+- `src/mcp_server/server.py`：
+  - 新增 `_mcp_request_host` ContextVar + `set_mcp_request_host()` + `_get_download_base_url()`
+  - `download_file`：`local_path` 改为可选；下载成功注册 token 并返回下载链接
+- `src/main.py`：
+  - 新增 `_capture_host_middleware` 中间件，自动捕获 Host 头注入 MCP 上下文
+
+
 ## 遗留问题
 
 - 清华镜像 403 是否为长期故障未知。如后续恢复，可考虑切换回去或引入多镜像 fallback 策略。

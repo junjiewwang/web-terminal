@@ -20,9 +20,13 @@ PTY 模式工具：
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
+import os
 import re
+import socket
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
@@ -49,6 +53,33 @@ JsonDict = dict[str, object]
 _terminal_manager: TerminalManager | None = None
 _tmux_manager: TmuxWindowManager | None = None
 _snippet_registry: SnippetRegistry | None = None
+
+# ── 请求上下文（通过 FastAPI 中间件注入）──
+# 捕获 MCP 客户端请求的 Host 头（含端口），用于构造正确的下载 URL。
+# 例如：客户端连接 http://10.0.0.5:8000/mcp → Host = "10.0.0.5:8000"
+_mcp_request_host: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "mcp_request_host", default=""
+)
+
+
+def set_mcp_request_host(host: str) -> None:
+    """由 main.py 中间件调用，记录当前请求的 Host 头。"""
+    _mcp_request_host.set(host)
+
+
+def _get_download_base_url() -> str:
+    """构造下载 URL 的 base，按优先级：MCP 请求 Host → 环境变量 → 容器 IP。"""
+    host = _mcp_request_host.get("")
+    if host:
+        return f"http://{host}"
+    env_url = os.environ.get("WETTY_EXTERNAL_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    try:
+        return f"http://{socket.gethostbyname(socket.gethostname())}:8000"
+    except Exception:
+        return "http://localhost:8000"
+
 
 # 创建 MCP Server 实例
 # DNS rebinding 保护已关闭：MCP 端点需要公开给外部 Agent 访问，
@@ -845,7 +876,7 @@ async def upload_file(
 async def download_file(
     session_id: str,
     remote_path: str,
-    local_path: str,
+    local_path: str | None = None,
     timeout: int | None = None,
     verify: bool = True,
 ) -> str:
@@ -853,6 +884,7 @@ async def download_file(
 
     通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
     文件通过 base64 编码分块接收，自动进行 MD5 完整性校验。
+    下载完成后返回浏览器下载链接，可在浏览器中打开直接下载到本地电脑。
 
     前提条件：终端会话已连接到目标节点。
 
@@ -863,13 +895,15 @@ async def download_file(
     Args:
         session_id: 终端会话 ID（由 connect_host 返回）
         remote_path: 远端文件路径（如 /var/log/app.log）
-        local_path: 本地保存路径
+        local_path: 本地保存路径（容器内临时路径）。不传则自动生成。
         timeout: 超时秒数（不传则根据文件大小自动计算）
         verify: 是否 MD5 校验（默认 True）
 
     Returns:
-        传输结果（包含文件大小、MD5 等信息）
+        传输结果，成功时包含浏览器下载链接（120 秒内有效）
     """
+    from src.api.file_transfer import _register_download_token
+
     session = _get_session(session_id)
     if not session:
         return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
@@ -880,6 +914,11 @@ async def download_file(
     load_err = await _ensure_ft_snippet_loaded(session)
     if load_err:
         return load_err
+
+    # 未指定本地路径则存到 /app/data 下
+    if not local_path:
+        filename = Path(remote_path).name
+        local_path = str(Path("/app/data") / f"{session_id}_{filename}")
 
     await _publish_event("command_start", session_id, session.instance_name, {
         "command": f"[download] {remote_path} → {local_path}",
@@ -901,4 +940,19 @@ async def download_file(
         "success": result.success,
     })
 
-    return result.message
+    if not result.success:
+        return result.message
+
+    # 下载成功：注册一次性下载 token，返回浏览器下载链接
+    filename = Path(remote_path).name
+    token = _register_download_token(Path(local_path), filename)
+
+    # 构造下载 URL：自动使用 MCP 客户端连接地址，无需额外配置
+    base_url = _get_download_base_url()
+    download_url = f"{base_url}/api/terminal/{session_id}/download/{token}"
+
+    return (
+        f"{result.message}\n\n"
+        f"浏览器下载地址（120 秒内有效）:\n"
+        f"  {download_url}"
+    )
