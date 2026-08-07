@@ -153,7 +153,7 @@ class ConnectionOrchestrator:
         actions_executed = 1
         logger.info("执行入口动作: %s -> %s (%s)", entry.type.value, node.name, entry.value)
 
-        entry_password = self._decrypt_entry_password(node)
+        entry_password = await self._decrypt_entry_password(node)
         success_pattern = entry.success_pattern or node.ready_pattern or _DEFAULT_SUCCESS_PATTERN
 
         for idx, step in enumerate(entry.steps, start=1):
@@ -277,16 +277,45 @@ class ConnectionOrchestrator:
             logger.warning("节点 %s 的 entry_spec 解析失败，使用默认值", node.name)
             return EntrySpecSchema()
 
-    @staticmethod
-    def _decrypt_entry_password(node: Host) -> Optional[str]:
-        if not node.entry_password_encrypted:
-            return None
-        try:
-            from src.utils.security import decrypt_password
-            return decrypt_password(node.entry_password_encrypted)
-        except Exception as e:
-            logger.warning("节点 %s 的 entry_password 解密失败: %s", node.name, e)
-            return None
+    async def _decrypt_entry_password(self, node: Host) -> Optional[str]:
+        """解密入口密码，用于 {{password}} 变量替换。
+
+        优先级：
+        1. 直接存储在 entry_password_encrypted 的加密密码
+        2. 通过 credential_ref 查询共享凭据表
+
+        注意: 从 @staticmethod 改为 async 方法，以便在 entry_password_encrypted
+        为空时通过数据库查询 credential_ref 对应的密码。
+        """
+        # 1. 优先用存储的加密密码
+        if node.entry_password_encrypted:
+            try:
+                from src.utils.security import decrypt_password
+                return decrypt_password(node.entry_password_encrypted)
+            except Exception as e:
+                logger.warning("节点 %s 的 entry_password 解密失败: %s", node.name, e)
+                return None
+
+        # 2. 回退：通过 credential_ref 查凭据表
+        if node.credential_ref:
+            try:
+                from src.models.database import async_session_factory
+                from src.services.credential_service import CredentialService
+                from src.utils.security import decrypt_password
+
+                async with async_session_factory() as db_session:
+                    cred_service = CredentialService(db_session)
+                    cred = await cred_service.get_by_name(node.credential_ref)
+                    if cred and cred.password_encrypted:
+                        return decrypt_password(cred.password_encrypted)
+            except Exception as e:
+                logger.warning(
+                    "节点 %s 的 credential_ref '%s' 密码解析失败: %s",
+                    node.name, node.credential_ref, e,
+                )
+                return None
+
+        return None
 
 
 # 兼容旧导入名，避免局部重构时出现大范围断裂
