@@ -28,6 +28,7 @@ import {
   updateHostsYaml,
   listCredentialNames,
 } from "../services/api";
+import ConfirmDialog from "./ConfirmDialog";
 
 // ── 类型定义 ──────────────────────────────────
 
@@ -94,6 +95,7 @@ export default function HostManagePage({ hosts, onHostsChange }: HostManagePageP
   const [loading, setLoading] = useState(false);
 
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<Host | null>(null);
 
   const showToast = useCallback((type: "success" | "error", text: string) => {
     setToast({ type, text });
@@ -115,14 +117,14 @@ export default function HostManagePage({ hosts, onHostsChange }: HostManagePageP
     setIsFormOpen(true);
   }, []);
 
-  const handleDelete = useCallback(async (host: Host) => {
-    const childCount = countChildren(host);
-    const msg = childCount > 0
-      ? `确认删除「${host.name}」及其 ${childCount} 个子节点？此操作不可撤销。`
-      : `确认删除「${host.name}」？此操作不可撤销。`;
+  const handleDelete = useCallback((host: Host) => {
+    setPendingDelete(host);
+  }, []);
 
-    if (!window.confirm(msg)) return;
-
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const host = pendingDelete;
+    setPendingDelete(null);
     try {
       await deleteHost(host.id);
       showToast("success", `已删除「${host.name}」`);
@@ -130,7 +132,7 @@ export default function HostManagePage({ hosts, onHostsChange }: HostManagePageP
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "删除失败");
     }
-  }, [onHostsChange, showToast]);
+  }, [pendingDelete, onHostsChange, showToast]);
 
   const handleFormSubmit = useCallback(async (data: CreateHostRequest) => {
     setLoading(true);
@@ -314,6 +316,23 @@ export default function HostManagePage({ hosts, onHostsChange }: HostManagePageP
         />
       )}
 
+      {/* 删除确认弹窗 */}
+      {pendingDelete && (
+        <ConfirmDialog
+          open={!!pendingDelete}
+          danger
+          title="删除主机"
+          message={
+            countChildren(pendingDelete) > 0
+              ? `确认删除「${pendingDelete.name}」及其 ${countChildren(pendingDelete)} 个子节点？此操作不可撤销。`
+              : `确认删除「${pendingDelete.name}」？此操作不可撤销。`
+          }
+          confirmText="删除"
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
+
       {/* Toast 通知 */}
       {toast && (
         <div
@@ -494,6 +513,14 @@ interface HostEditDrawerProps {
 }
 
 function HostEditDrawer({ mode, host, parentId, hosts: _hosts, onSubmit, onClose, loading }: HostEditDrawerProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const initial: HostFormData = host
     ? {
         name: host.name,
@@ -724,6 +751,14 @@ interface ImportModalProps {
 }
 
 function ImportModal({ onClose, onSuccess, showToast }: ImportModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<"merge" | "overwrite">("merge");
   const [loading, setLoading] = useState(false);
@@ -864,6 +899,14 @@ interface YamlEditorModalProps {
 }
 
 function YamlEditorModal({ onClose, onSuccess, showToast }: YamlEditorModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const [content, setContent] = useState("");
   const [mode, setMode] = useState<"merge" | "overwrite">("merge");
   const [loading, setLoading] = useState(false);

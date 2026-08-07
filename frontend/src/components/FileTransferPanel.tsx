@@ -19,6 +19,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { uploadFile, downloadFile, cancelUpload } from "../services/api";
 import type { FileUploadResponse, PtyTransferProgress, DownloadCompleteResult } from "../services/api";
+import ConfirmDialog from "./ConfirmDialog";
 
 // ── 类型定义 ──────────────────────────────────
 
@@ -201,6 +202,7 @@ export default function FileTransferPanel({
   const [downloadPath, setDownloadPath] = useState(() => readStoredPath(STORAGE_KEY_DOWNLOAD_PATH, ""));
   const [history, setHistory] = useState<TransferRecord[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  const [pendingLargeFile, setPendingLargeFile] = useState<File | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgressInfo | null>(null);
 
   // ── Toast 通知（自动消失） ──
@@ -263,33 +265,29 @@ export default function FileTransferPanel({
     setHistory([]);
   }, []);
 
-  // ── 上传逻辑 ──
+  // ── 上传前置校验 ──
   const handleUpload = useCallback(async (file: File) => {
     if (!isConnected) {
       showToast("error", "终端未连接，无法传输文件");
       return;
     }
-
     if (file.size > MAX_RAW_SIZE) {
       showToast("error", `文件 ${formatSize(file.size)} 超过上限 ${formatSize(MAX_RAW_SIZE)}，请使用 SCP/SFTP`);
       return;
     }
-
-    if (file.size > SOFT_WARN_SIZE) {
-      const confirmed = window.confirm(
-        `文件大小 ${formatSize(file.size)} 超过推荐上限 ${formatSize(SOFT_WARN_SIZE)}。\n` +
-        `如果文件可压缩（文本/日志等），后端会 gzip 压缩后传输。\n` +
-        `如果压缩后仍超过 ${formatSize(SOFT_WARN_SIZE)}，上传会被拒绝。\n\n` +
-        `确定继续上传吗？`
-      );
-      if (!confirmed) return;
-    }
-
     if (file.size === 0) {
       showToast("error", "文件为空，无法上传");
       return;
     }
+    if (file.size > SOFT_WARN_SIZE) {
+      setPendingLargeFile(file);
+      return;
+    }
+    await doUpload(file);
+  }, [isConnected, showToast, doUpload]);
 
+  // ── 上传逻辑（实际传输） ──
+  async function doUpload(file: File) {
     const now = Date.now();
     setStatus("uploading");
     setProgressInfo({
@@ -405,7 +403,7 @@ export default function FileTransferPanel({
       abortRef.current = null;
       setProgressInfo(null);
     }
-  }, [sessionId, remotePath, isConnected, addHistory, showToast, dismissToast]);
+  }
 
   // ── 下载逻辑 ──
   const handleDownload = useCallback(async () => {
@@ -573,7 +571,7 @@ export default function FileTransferPanel({
   return (
     <div className="h-full flex flex-col bg-gray-950 border-t border-white/8 text-gray-300">
       {/* ── 标题栏 + Tab 导航 ── */}
-      <div className="flex items-center justify-between px-3 py-0 border-b border-white/8 bg-gray-900/50 shrink-0">
+      <div className="flex items-center justify-between px-3 py-0 border-b border-white/8 bg-gray-950/50 shrink-0">
         <div className="flex items-center gap-0.5">
           {/* Tab: 上传 */}
           <_TabButton
@@ -677,6 +675,27 @@ export default function FileTransferPanel({
           </button>
         </div>
       )}
+
+      {/* 大文件确认弹窗 */}
+      {pendingLargeFile && (
+        <ConfirmDialog
+          open={!!pendingLargeFile}
+          title="文件较大"
+          message={
+            <div className="space-y-1.5">
+              <p>文件大小 {formatSize(pendingLargeFile.size)} 超过推荐上限 {formatSize(SOFT_WARN_SIZE)}。</p>
+              <p>若文件可压缩（文本/日志等），后端会先 gzip 再传输；压缩后仍超限则上传会被拒绝。</p>
+            </div>
+          }
+          confirmText="继续上传"
+          onConfirm={() => {
+            const f = pendingLargeFile;
+            setPendingLargeFile(null);
+            doUpload(f);
+          }}
+          onCancel={() => setPendingLargeFile(null)}
+        />
+      )}
     </div>
   );
 }
@@ -761,7 +780,7 @@ function _UploadTab({
           value={remotePath}
           onChange={(e) => onRemotePathChange(e.target.value)}
           placeholder="/tmp/"
-          className="flex-1 bg-gray-800/60 border border-white/8 rounded-md px-2.5 py-1.5 text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 min-w-0 transition-colors"
+          className="flex-1 bg-white/5 border border-white/8 rounded-md px-2.5 py-1.5 text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 min-w-0 transition-colors"
         />
       </div>
 
@@ -837,7 +856,7 @@ function _DownloadTab({
           value={downloadPath}
           onChange={(e) => onDownloadPathChange(e.target.value)}
           placeholder="输入远端文件路径，按 Enter 下载"
-          className="flex-1 bg-gray-800/60 border border-white/8 rounded-md px-2.5 py-1.5 text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 min-w-0 transition-colors"
+          className="flex-1 bg-white/5 border border-white/8 rounded-md px-2.5 py-1.5 text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 min-w-0 transition-colors"
           onKeyDown={(e) => e.key === "Enter" && onDownload()}
         />
         <button

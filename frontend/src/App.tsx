@@ -10,6 +10,7 @@ import TerminalTabs, {
   createTabForHost,
   type TerminalTab,
 } from "./components/TerminalTabs";
+import ConfirmDialog from "./components/ConfirmDialog";
 import type { Host, AgentEvent, TerminalBackend } from "./services/api";
 import {
   fetchHosts,
@@ -146,6 +147,8 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
   const [globalBackend, setGlobalBackend] = useState<TerminalBackend | null>(null);
   /** backend 切换进行中标志（防止重复点击） */
   const [backendSwitching, setBackendSwitching] = useState(false);
+  /** backend 切换确认弹窗状态 */
+  const [pendingBackendSwitch, setPendingBackendSwitch] = useState(false);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hostsRef = useRef<Host[]>([]);
@@ -323,9 +326,15 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
    * 2. stop 所有现有会话
    * 前端收到响应后，逐个 Tab 调用 startTerminal 用新 backend 重建。
    */
-  const handleGlobalBackendSwitch = useCallback(async () => {
+  const handleGlobalBackendSwitch = useCallback(() => {
+    if (backendSwitching || !globalBackend) return;
+    setPendingBackendSwitch(true);
+  }, [backendSwitching, globalBackend]);
+
+  const confirmBackendSwitch = useCallback(async () => {
     if (backendSwitching || !globalBackend) return;
     const newBackend: TerminalBackend = globalBackend === "tmux" ? "broker" : "tmux";
+    setPendingBackendSwitch(false);
 
     setBackendSwitching(true);
     try {
@@ -660,6 +669,23 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
       >
         <AgentPanel events={events} onClose={() => setIsAgentPanelOpen(false)} />
       </aside>
+
+      {pendingBackendSwitch && globalBackend && (
+        <ConfirmDialog
+          open={pendingBackendSwitch}
+          danger
+          title="切换终端后端"
+          message={
+            <div className="space-y-1.5">
+              <p>即将从 <span className="font-mono text-emerald-300">{globalBackend.toUpperCase()}</span> 切换到 <span className="font-mono text-emerald-300">{globalBackend === "tmux" ? "BROKER" : "TMUX"}</span>。</p>
+              <p>这会断开当前 {tabs.length} 个会话并逐一重建连接，过程约数秒。</p>
+            </div>
+          }
+          confirmText="切换"
+          onConfirm={confirmBackendSwitch}
+          onCancel={() => setPendingBackendSwitch(false)}
+        />
+      )}
     </div>
   );
 }

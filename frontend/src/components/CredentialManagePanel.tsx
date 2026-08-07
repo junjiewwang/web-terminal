@@ -15,6 +15,7 @@ import {
   updateCredential,
   deleteCredential,
 } from "../services/api";
+import ConfirmDialog from "./ConfirmDialog";
 
 // ── 主组件 ────────────────────────────────────
 
@@ -23,6 +24,7 @@ export default function CredentialManagePanel() {
   const [loading, setLoading] = useState(true);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingCred, setEditingCred] = useState<CredentialItem | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<CredentialItem | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const showToast = useCallback((type: "success" | "error", text: string) => {
@@ -55,12 +57,14 @@ export default function CredentialManagePanel() {
     setEditModalOpen(true);
   }, []);
 
-  const handleDelete = useCallback(async (cred: CredentialItem) => {
-    if (cred.ref_count > 0) {
-      if (!window.confirm(`凭据「${cred.name}」正在被 ${cred.ref_count} 个主机引用，确认删除？`)) return;
-    } else {
-      if (!window.confirm(`确认删除凭据「${cred.name}」？`)) return;
-    }
+  const handleDelete = useCallback((cred: CredentialItem) => {
+    setPendingDelete(cred);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const cred = pendingDelete;
+    setPendingDelete(null);
     try {
       await deleteCredential(cred.id);
       showToast("success", `已删除凭据「${cred.name}」`);
@@ -68,7 +72,7 @@ export default function CredentialManagePanel() {
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "删除失败");
     }
-  }, [refresh, showToast]);
+  }, [pendingDelete, refresh, showToast]);
 
   return (
     <div className="flex h-full flex-col">
@@ -156,6 +160,23 @@ export default function CredentialManagePanel() {
         />
       )}
 
+      {/* 删除确认弹窗 */}
+      {pendingDelete && (
+        <ConfirmDialog
+          open={!!pendingDelete}
+          danger
+          title="删除凭据"
+          message={
+            pendingDelete.ref_count > 0
+              ? `凭据「${pendingDelete.name}」正在被 ${pendingDelete.ref_count} 个主机引用，删除后这些引用将失效。确认删除？`
+              : `确认删除凭据「${pendingDelete.name}」？此操作不可撤销。`
+          }
+          confirmText="删除"
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
+
       {/* Toast */}
       {toast && (
         <div
@@ -182,6 +203,14 @@ interface CredentialEditModalProps {
 }
 
 function CredentialEditModal({ credential, onClose, onSuccess, showToast }: CredentialEditModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const isEdit = credential !== null;
   const [name, setName] = useState(credential?.name ?? "");
   const [password, setPassword] = useState("");

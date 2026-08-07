@@ -60,7 +60,7 @@ export default function TerminalTabs({
   if (tabs.length === 0) return null;
 
   return (
-    <div className="flex items-stretch bg-gray-900 border-b border-gray-800 overflow-x-auto">
+    <div className="flex items-stretch bg-gray-950/60 border-b border-white/8 overflow-x-auto tab-scroll">
       {tabs.map((tab) => {
         const isActive = tab.id === activeTabId;
         const prefix = _instancePrefix(tab.instanceName, tab.label);
@@ -71,7 +71,7 @@ export default function TerminalTabs({
             className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs border-r border-gray-800/50
               transition-colors whitespace-nowrap min-w-0 max-w-[220px]
               ${isActive
-                ? "bg-gray-950 text-emerald-400 border-b-2 border-b-emerald-500"
+                ? "bg-gray-950 text-emerald-400 border-b-2 border-b-emerald-400"
                 : "text-gray-500 hover:text-gray-300 hover:bg-gray-800/50"
               }
             `}
