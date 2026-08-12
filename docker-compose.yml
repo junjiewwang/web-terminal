@@ -25,6 +25,8 @@ services:
     build: .
     # 不做端口映射，通过容器 IP 直接访问 8000 端口
     # 获取 IP: make ip
+    ports:
+     - "18008:8000"
     volumes:
       - wetty-data:/app/data
       - ./config:/app/config:ro    # 可选：仅首次初始化种子数据时需要
