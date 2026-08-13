@@ -68,11 +68,11 @@ export default function TerminalTabs({
           <button
             key={tab.id}
             onClick={() => onSelectTab(tab.id)}
-            className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs border-r border-gray-800/50
+            className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs border-r border-white/8
               transition-colors whitespace-nowrap min-w-0 max-w-[220px]
               ${isActive
                 ? "bg-gray-950 text-emerald-400 border-b-2 border-b-emerald-400"
-                : "text-gray-500 hover:text-gray-300 hover:bg-gray-800/50"
+                : "text-gray-500 hover:text-gray-300 hover:bg-white/5"
               }
             `}
           >

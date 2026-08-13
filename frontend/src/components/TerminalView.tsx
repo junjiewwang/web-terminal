@@ -23,6 +23,7 @@ import type { SessionExitInfo } from "../hooks/useWebSocket";
 import SnippetPanel from "./SnippetPanel";
 import FileTransferPanel from "./FileTransferPanel";
 import DisconnectOverlay from "./DisconnectOverlay";
+import TerminalToolbar from "./TerminalToolbar";
 
 // xterm.js 样式（必须导入，否则终端无法正确渲染）
 import "@xterm/xterm/css/xterm.css";
@@ -65,6 +66,19 @@ export default function TerminalView({
   const [snippetPanelOpen, setSnippetPanelOpen] = useState(false);
   /** FileTransferPanel 展开状态 */
   const [fileTransferPanelOpen, setFileTransferPanelOpen] = useState(false);
+  /** 全屏状态 */
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  /** 当前是否有选中文本（控制复制按钮可用态） */
+  const [hasSelection, setHasSelection] = useState(false);
+  /** 底部面板高度（拖拽调整，存 localStorage） */
+  const [panelHeight, setPanelHeight] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("wt-panel-height"));
+      return v && v >= 200 && v <= 600 ? v : 280;
+    } catch {
+      return 280;
+    }
+  });
   /** 断连退出信息（用于 DisconnectOverlay 展示） */
   const [exitInfo, setExitInfo] = useState<SessionExitInfo | null>(null);
 
@@ -82,6 +96,9 @@ export default function TerminalView({
     },
     onResize: (size) => {
       ws.sendResize(size);
+    },
+    onSelectionChange: (text) => {
+      setHasSelection(!!text.trim());
     },
   });
 
@@ -118,6 +135,55 @@ export default function TerminalView({
       setToast("复制失败，请手动复制");
       toastTimerRef.current = setTimeout(() => setToast(null), 3000);
     }
+  }, []);
+
+  // ── 工具栏操作 ──
+  // ── 面板拖拽调整高度 ──
+  const handlePanelResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = panelHeight;
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.min(600, Math.max(200, startH + (startY - ev.clientY)));
+      setPanelHeight(next);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      try {
+        localStorage.setItem("wt-panel-height", String(panelHeight));
+      } catch {}
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [panelHeight]);
+
+  const handleToolbarCopy = useCallback(() => {
+    const sel = terminal.getSelection();
+    if (sel?.trim()) showCopyToast(sel.trim());
+  }, [terminal, showCopyToast]);
+
+  const handleToolbarClear = useCallback(() => {
+    terminal.clear();
+  }, [terminal]);
+
+  const handleToggleFullscreen = useCallback(() => {
+    setIsFullscreen((prev) => {
+      const next = !prev;
+      if (next) {
+        document.documentElement.requestFullscreen?.().catch(() => {});
+      } else {
+        document.exitFullscreen?.().catch(() => {});
+      }
+      return next;
+    });
+  }, []);
+
+  // 监听浏览器全屏变化（Esc 退出时同步状态）
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
   }, []);
 
   const ws = useWebSocket({
@@ -292,6 +358,11 @@ export default function TerminalView({
         onToggleSnippet={() => setSnippetPanelOpen((prev) => !prev)}
         fileTransferPanelOpen={fileTransferPanelOpen}
         onToggleFileTransfer={() => setFileTransferPanelOpen((prev) => !prev)}
+        hasSelection={hasSelection}
+        handleToolbarCopy={handleToolbarCopy}
+        handleToolbarClear={handleToolbarClear}
+        isFullscreen={isFullscreen}
+        handleToggleFullscreen={handleToggleFullscreen}
       />
 
       {/* 终端容器 */}
@@ -356,9 +427,16 @@ export default function TerminalView({
         )}
       </div>
 
-      {/* SnippetPanel — 底部展开面板 */}
+      {/* SnippetPanel — 底部展开面板（可拖拽调整高度） */}
       {snippetPanelOpen && isActive && (
-        <div className="h-[280px] shrink-0 relative">
+        <div className="relative shrink-0" style={{ height: panelHeight }}>
+          <div
+            onMouseDown={handlePanelResize}
+            className="absolute -top-1 left-0 right-0 z-10 flex h-2 cursor-row-resize items-center justify-center hover:bg-emerald-400/10"
+            title="拖拽调整高度"
+          >
+            <span className="h-1 w-8 rounded-full bg-white/10" />
+          </div>
           <SnippetPanel
             visible={snippetPanelOpen}
             onClose={() => setSnippetPanelOpen(false)}
@@ -368,9 +446,16 @@ export default function TerminalView({
         </div>
       )}
 
-      {/* FileTransferPanel — 底部展开面板 */}
+      {/* FileTransferPanel — 底部展开面板（可拖拽调整高度） */}
       {fileTransferPanelOpen && isActive && sessionId && (
-        <div className="h-[280px] shrink-0 relative">
+        <div className="relative shrink-0" style={{ height: panelHeight }}>
+          <div
+            onMouseDown={handlePanelResize}
+            className="absolute -top-1 left-0 right-0 z-10 flex h-2 cursor-row-resize items-center justify-center hover:bg-emerald-400/10"
+            title="拖拽调整高度"
+          >
+            <span className="h-1 w-8 rounded-full bg-white/10" />
+          </div>
           <FileTransferPanel
             sessionId={sessionId}
             visible={fileTransferPanelOpen}
@@ -410,6 +495,11 @@ function _StatusBar({
   onToggleSnippet,
   fileTransferPanelOpen,
   onToggleFileTransfer,
+  hasSelection,
+  handleToolbarCopy,
+  handleToolbarClear,
+  isFullscreen,
+  handleToggleFullscreen,
 }: {
   host: Host;
   status: ConnectionStatus;
@@ -420,6 +510,11 @@ function _StatusBar({
   onToggleSnippet: () => void;
   fileTransferPanelOpen: boolean;
   onToggleFileTransfer: () => void;
+  hasSelection: boolean;
+  handleToolbarCopy: () => void;
+  handleToolbarClear: () => void;
+  isFullscreen: boolean;
+  handleToggleFullscreen: () => void;
 }) {
   const cfg = STATUS_MAP[status];
   const backendCfg = backend ? BACKEND_CONFIG[backend] : null;
@@ -440,33 +535,17 @@ function _StatusBar({
         )}
       </span>
       <div className="ml-3 flex items-center gap-2 shrink-0">
-        {/* 文件传输面板切换按钮 */}
-        <button
-          type="button"
-          onClick={onToggleFileTransfer}
-          className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
-            fileTransferPanelOpen
-              ? "bg-blue-500/15 text-blue-400 border border-blue-500/30"
-              : "text-gray-500 hover:text-blue-400 hover:bg-white/5"
-          }`}
-          title={fileTransferPanelOpen ? "收起文件传输" : "打开文件传输"}
-        >
-          📁 Files
-        </button>
-
-        {/* Snippet 面板切换按钮 */}
-        <button
-          type="button"
-          onClick={onToggleSnippet}
-          className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
-            snippetPanelOpen
-              ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
-              : "text-gray-500 hover:text-emerald-400 hover:bg-white/5"
-          }`}
-          title={snippetPanelOpen ? "收起排障脚本" : "打开排障脚本"}
-        >
-          🔧 Snippets
-        </button>
+        <TerminalToolbar
+          canCopy={hasSelection}
+          onCopy={handleToolbarCopy}
+          onClear={handleToolbarClear}
+          isFullscreen={isFullscreen}
+          onToggleFullscreen={handleToggleFullscreen}
+          fileTransferOpen={fileTransferPanelOpen}
+          onToggleFileTransfer={onToggleFileTransfer}
+          snippetOpen={snippetPanelOpen}
+          onToggleSnippet={onToggleSnippet}
+        />
 
         <span className={cfg.dot}>●</span>
         <span>{cfg.label}</span>

@@ -11,6 +11,7 @@ import TerminalTabs, {
   type TerminalTab,
 } from "./components/TerminalTabs";
 import ConfirmDialog from "./components/ConfirmDialog";
+import CommandPalette, { type PaletteCommand } from "./components/CommandPalette";
 import type { Host, AgentEvent, TerminalBackend } from "./services/api";
 import {
   fetchHosts,
@@ -149,6 +150,10 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
   const [backendSwitching, setBackendSwitching] = useState(false);
   /** backend 切换确认弹窗状态 */
   const [pendingBackendSwitch, setPendingBackendSwitch] = useState(false);
+  /** 侧栏是否折叠 */
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  /** 命令面板是否打开 */
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hostsRef = useRef<Host[]>([]);
@@ -407,11 +412,77 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
     ? `当前目标 · ${headerText}`
     : "Multi-hop SSH Workspace";
 
+  // ── 命令面板 ──────────────────────────────────
+  // 构建命令列表（含主机、页面、动作）
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const cmds: PaletteCommand[] = [
+      { id: "page-terminal", title: "终端", group: "页面", icon: "📡", action: () => setCurrentPage("terminal") },
+      { id: "page-hosts", title: "主机管理", group: "页面", icon: "📋", action: () => setCurrentPage("hosts") },
+      { id: "page-credentials", title: "凭据管理", group: "页面", icon: "🔑", action: () => setCurrentPage("credentials") },
+      { id: "toggle-sidebar", title: sidebarCollapsed ? "展开侧栏" : "折叠侧栏", group: "界面", action: () => setSidebarCollapsed((p) => !p) },
+    ];
+    // 主机（连接）
+    const addHosts = (list: Host[], prefix: string) => {
+      for (const h of list) {
+        cmds.push({
+          id: `connect-${h.id}`,
+          title: `连接 ${h.name}`,
+          subtitle: `${h.username}@${h.hostname}:${h.port}${prefix ? `（${prefix}）` : ""}`,
+          group: "主机",
+          icon: h.host_type === "nested" ? "🔗" : "🖥",
+          action: () => handleHostSelect(h),
+        });
+        if (h.children?.length) addHosts(h.children, h.name);
+      }
+    };
+    addHosts(hosts, "");
+    return cmds;
+  }, [hosts, sidebarCollapsed, handleHostSelect]);
+
+  // ⌘K / Ctrl+K 全局触发
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setPaletteOpen((p) => !p);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   return (
     <div className="relative flex h-screen overflow-hidden bg-[#050816] text-gray-100">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
 
-      <aside className="relative z-10 flex w-[296px] flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl">
+      <aside
+        className={`relative z-10 flex flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl transition-[width] duration-200 ${
+          sidebarCollapsed ? "w-12" : "w-[296px]"
+        }`}
+      >
+        {/* 折叠/展开切换按钮 */}
+        <button
+          type="button"
+          onClick={() => setSidebarCollapsed((p) => !p)}
+          title={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
+          aria-label={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
+          className="absolute -right-3 top-4 z-10 flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-gray-900 text-[10px] text-gray-500 shadow transition-colors hover:border-emerald-400/40 hover:text-emerald-400"
+        >
+          {sidebarCollapsed ? "»" : "«"}
+        </button>
+
+        {sidebarCollapsed ? (
+          /* 折叠态：仅图标栏 */
+          <div className="flex flex-col items-center gap-4 py-4">
+            <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
+              ⌘
+            </div>
+            <button type="button" onClick={() => setCurrentPage("terminal")} title="终端" className="text-lg opacity-60 hover:opacity-100">📡</button>
+            <button type="button" onClick={() => setCurrentPage("hosts")} title="主机" className="text-lg opacity-60 hover:opacity-100">📋</button>
+            <button type="button" onClick={() => setCurrentPage("credentials")} title="凭据" className="text-lg opacity-60 hover:opacity-100">🔑</button>
+          </div>
+        ) : (
+          <>
         <div className="border-b border-white/8 px-5 pb-4 pt-5">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300 shadow-[0_12px_28px_rgba(16,185,129,0.12)]">
@@ -521,6 +592,8 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             </div>
           </div>
         )}
+          </>
+        )}
       </aside>
 
       <main className="relative z-10 flex min-w-0 flex-1 flex-col">
@@ -569,7 +642,9 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
                     type="button"
                     onClick={() => setIsAgentPanelOpen((prev) => !prev)}
                     className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/6 px-3 py-2 text-xs font-medium text-gray-200 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-white"
+                    title={latestEventText ?? "查看操作轨迹"}
                   >
+                    <span className={`inline-flex h-2 w-2 rounded-full ${latestEvent ? "bg-emerald-400 animate-pulse" : "bg-gray-600"}`} />
                     <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
                     {unreadEventCount > 0 && (
                       <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
@@ -686,6 +761,12 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
           onCancel={() => setPendingBackendSwitch(false)}
         />
       )}
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={paletteCommands}
+      />
     </div>
   );
 }

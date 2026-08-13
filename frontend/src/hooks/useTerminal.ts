@@ -30,6 +30,8 @@ export interface UseTerminalOptions {
   onData?: (data: string) => void;
   /** 终端尺寸变化回调（resize → socket.emit('resize')） */
   onResize?: (size: TermSize) => void;
+  /** 用户选中文本回调（Shift+鼠标拖拽 → 写入剪贴板） */
+  onSelectionChange?: (text: string) => void;
 }
 
 /** Hook 返回的操作句柄 */
@@ -65,6 +67,8 @@ export interface TerminalHandle {
   focus: () => void;
   /** 获取当前尺寸 */
   getSize: () => TermSize;
+  /** 获取当前选中文本（复制工具栏用） */
+  getSelection: () => string;
 }
 
 /**
@@ -86,8 +90,10 @@ export function useTerminal(
   // 用 ref 存储回调避免 effect 频繁重建
   const onDataRef = useRef(options.onData);
   const onResizeRef = useRef(options.onResize);
+  const onSelectionChangeRef = useRef(options.onSelectionChange);
   onDataRef.current = options.onData;
   onResizeRef.current = options.onResize;
+  onSelectionChangeRef.current = options.onSelectionChange;
 
   /**
    * Callback ref：React 在 DOM 挂载时调用 (node)，卸载时调用 (null)。
@@ -158,6 +164,12 @@ export function useTerminal(
       onResizeRef.current?.({ cols: size.cols, rows: size.rows });
     });
 
+    // 监听选区变化（Shift+鼠标拖拽选中 / 双击选词）
+    const selectionDisposable = term.onSelectionChange(() => {
+      const text = term.getSelection();
+      onSelectionChangeRef.current?.(text ?? "");
+    });
+
     // ── 容器尺寸变化 → debounce fit ──────────────
     // 使用 ResizeObserver 替代 window.resize 事件：
     //  - window.resize 仅感知浏览器窗口尺寸变化
@@ -197,6 +209,7 @@ export function useTerminal(
       window.removeEventListener("resize", debouncedFit);
       dataDisposable.dispose();
       resizeDisposable.dispose();
+      selectionDisposable.dispose();
       term.dispose();
       termRef.current = null;
       fitAddonRef.current = null;
@@ -253,5 +266,9 @@ export function useTerminal(
     return { cols: term?.cols ?? 80, rows: term?.rows ?? 24 };
   }, []);
 
-  return { containerRef, write, clear, reset, fit, focus, getSize };
+  const getSelection = useCallback((): string => {
+    return termRef.current?.getSelection() ?? "";
+  }, []);
+
+  return { containerRef, write, clear, reset, fit, focus, getSize, getSelection };
 }
