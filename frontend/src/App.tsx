@@ -547,6 +547,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             hosts={hosts}
             selectedHost={activeTab?.host ?? null}
             onSelect={handleHostSelect}
+            onEdit={() => setCurrentPage("hosts")}
             loading={hostsLoading}
             error={hostsError}
             onRetry={loadHosts}

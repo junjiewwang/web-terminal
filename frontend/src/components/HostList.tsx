@@ -5,6 +5,8 @@ interface HostListProps {
   hosts: Host[];
   selectedHost: Host | null;
   onSelect: (host: Host) => void;
+  /** 可选：点击行内「编辑」图标 → 跳转到主机管理页 */
+  onEdit?: (host: Host) => void;
   loading?: boolean;
   error?: string | null;
   onRetry?: () => void;
@@ -44,6 +46,7 @@ export default function HostList({
   hosts,
   selectedHost,
   onSelect,
+  onEdit,
   loading,
   error,
   onRetry,
@@ -166,6 +169,7 @@ export default function HostList({
               host={host}
               selectedHost={selectedHost}
               onSelect={onSelect}
+              onEdit={onEdit}
               depth={0}
               connectedHostIds={connectedHostIds}
               searchQuery={query}
@@ -181,6 +185,7 @@ interface _HostItemProps {
   host: Host;
   selectedHost: Host | null;
   onSelect: (host: Host) => void;
+  onEdit?: (host: Host) => void;
   depth: number;
   connectedHostIds?: Set<number>;
   searchQuery?: string;
@@ -190,6 +195,7 @@ function _HostItem({
   host,
   selectedHost,
   onSelect,
+  onEdit,
   depth,
   connectedHostIds,
   searchQuery,
@@ -306,6 +312,30 @@ function _HostItem({
                 {filteredChildren.length}
               </span>
             )}
+
+            {/* 编辑入口：hover 显示，跳转主机管理页 */}
+            {onEdit && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEdit(host);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    onEdit(host);
+                  }
+                }}
+                title="编辑主机配置"
+                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs transition-opacity ${
+                  isSelected ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                } hover:bg-white/10 text-gray-500 hover:text-emerald-300`}
+              >
+                ✎
+              </span>
+            )}
           </div>
 
           {Boolean(searchQuery) && host.tags.length > 0 && (
@@ -331,6 +361,7 @@ function _HostItem({
               host={child}
               selectedHost={selectedHost}
               onSelect={onSelect}
+              onEdit={onEdit}
               depth={depth + 1}
               connectedHostIds={connectedHostIds}
               searchQuery={searchQuery}
