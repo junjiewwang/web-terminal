@@ -81,9 +81,18 @@ const EMPTY_FORM: HostFormData = {
 interface HostManagePageProps {
   hosts: Host[];
   onHostsChange: () => void;
+  /** 外部传入：要立即编辑的主机（侧栏「编辑」入口跳转时用），编辑完清空 */
+  editTargetId?: number | null;
+  /** 编辑目标被消费后回调（父组件清空 editTargetId） */
+  onEditTargetConsumed?: () => void;
 }
 
-export default function HostManagePage({ hosts, onHostsChange }: HostManagePageProps) {
+export default function HostManagePage({
+  hosts,
+  onHostsChange,
+  editTargetId,
+  onEditTargetConsumed,
+}: HostManagePageProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [editingHost, setEditingHost] = useState<Host | null>(null);
   const [isFormOpen, setIsFormOpen] = useState(false);
@@ -116,6 +125,24 @@ export default function HostManagePage({ hosts, onHostsChange }: HostManagePageP
     setFormMode("edit");
     setIsFormOpen(true);
   }, []);
+
+  // 侧栏「编辑」入口跳转：editTargetId 传入后，自动定位并打开编辑抽屉
+  useEffect(() => {
+    if (editTargetId == null || hosts.length === 0) return;
+    const find = (list: Host[]): Host | undefined => {
+      for (const h of list) {
+        if (h.id === editTargetId) return h;
+        const child = find(h.children ?? []);
+        if (child) return child;
+      }
+      return undefined;
+    };
+    const target = find(hosts);
+    if (target) {
+      handleEdit(target);
+      onEditTargetConsumed?.();
+    }
+  }, [editTargetId, hosts, handleEdit, onEditTargetConsumed]);
 
   const handleDelete = useCallback((host: Host) => {
     setPendingDelete(host);

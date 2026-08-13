@@ -154,6 +154,8 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   /** 命令面板是否打开 */
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /** 侧栏「编辑」入口：要编辑的主机 id（跳转管理页并自动打开抽屉） */
+  const [editTargetId, setEditTargetId] = useState<number | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hostsRef = useRef<Host[]>([]);
@@ -547,7 +549,10 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             hosts={hosts}
             selectedHost={activeTab?.host ?? null}
             onSelect={handleHostSelect}
-            onEdit={() => setCurrentPage("hosts")}
+            onEdit={(host) => {
+              setEditTargetId(host.id);
+              setCurrentPage("hosts");
+            }}
             loading={hostsLoading}
             error={hostsError}
             onRetry={loadHosts}
@@ -723,7 +728,12 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             </div>
           </>
         ) : currentPage === "hosts" ? (
-          <HostManagePage hosts={hosts} onHostsChange={loadHosts} />
+          <HostManagePage
+            hosts={hosts}
+            onHostsChange={loadHosts}
+            editTargetId={editTargetId}
+            onEditTargetConsumed={() => setEditTargetId(null)}
+          />
         ) : (
           <CredentialManagePanel />
         )}

@@ -1,5 +1,5 @@
 /**
- * 验证 2.5：侧栏主机「编辑」入口跳转管理页
+ * 验证：侧栏「编辑」→ 直接打开编辑抽屉（无需再手动选主机）
  */
 import { chromium } from "playwright";
 const BASE = "http://127.0.0.1:18008";
@@ -16,18 +16,18 @@ async function main() {
   await p.waitForSelector("text=/终端/", { timeout: 15000 });
   await p.waitForTimeout(500);
 
-  // 侧栏主机行 hover 显示编辑按钮
-  console.log("[1] 侧栏主机「编辑」入口");
+  console.log("[1] 侧栏主机「编辑」→ 直接打开编辑抽屉");
   const row = p.locator("button.group", { hasText: "dev-cloud" }).first();
   await row.hover();
   await p.waitForTimeout(300);
-  const editBtn = p.locator('[title="编辑主机配置"]').first();
-  chk("hover 后编辑按钮可见", await editBtn.isVisible());
+  await p.locator('[title="编辑主机配置"]').first().click();
+  await p.waitForTimeout(800);
 
-  // 点击编辑 → 跳转主机管理页
-  await editBtn.click();
-  await p.waitForTimeout(500);
-  chk("跳转到主机管理页", await p.getByText("主机管理").isVisible());
+  // 关键断言：编辑抽屉直接打开，标题「编辑 — dev-cloud」
+  const drawer = p.locator('h3', { hasText: "编辑 — dev-cloud" });
+  chk("编辑抽屉直接打开（标题=编辑 — dev-cloud）", await drawer.isVisible());
+
+  await p.screenshot({ path: "/tmp/wt-edit-drawer.png" });
 
   await b.close();
   console.log(`\n${f ? f + " FAIL ❌" : "ALL PASS ✅"}`);
