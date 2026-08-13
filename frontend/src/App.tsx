@@ -402,9 +402,6 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
   }, [tabs, activeTabId]);
 
   const headerText = headerForTab(activeTab);
-  const sidebarSubline = activeTab
-    ? `当前目标 · ${headerText}`
-    : "Multi-hop SSH Workspace";
 
   // ── 命令面板 ──────────────────────────────────
   // 构建命令列表（含主机、页面、动作）
@@ -449,129 +446,126 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
     <div className="relative flex h-screen overflow-hidden bg-[#050816] text-gray-100">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
 
-      <aside
-        className={`relative z-10 flex flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl transition-[width] duration-200 ${
-          sidebarCollapsed ? "w-12" : "w-[296px]"
-        }`}
-      >
-        {/* 折叠/展开切换按钮 */}
-        <button
-          type="button"
-          onClick={() => setSidebarCollapsed((p) => !p)}
-          title={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
-          aria-label={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
-          className="absolute -right-3 top-4 z-10 flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-gray-900 text-[10px] text-gray-500 shadow transition-colors hover:border-emerald-400/40 hover:text-emerald-400"
-        >
-          {sidebarCollapsed ? "»" : "«"}
-        </button>
+      {/* ── Activity Bar：最左窄栏（工作台/控制台导航） ── */}
+      <div className="relative z-10 flex w-12 shrink-0 flex-col items-center border-r border-white/8 bg-gray-950/90 py-4">
+        <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
+          ⌘
+        </div>
+        <div className="mt-6 flex flex-col items-center gap-1">
+          <button
+            type="button"
+            onClick={() => { setCurrentPage("terminal"); setSidebarCollapsed(false); }}
+            title="工作台"
+            aria-label="工作台"
+            className={`flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors ${
+              currentPage === "terminal"
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "text-gray-500 hover:bg-white/5 hover:text-gray-300"
+            }`}
+          >
+            📡
+          </button>
+          <button
+            type="button"
+            onClick={() => { setCurrentPage("hosts"); setSidebarCollapsed(false); }}
+            title="控制台"
+            aria-label="控制台"
+            className={`flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors ${
+              currentPage !== "terminal"
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "text-gray-500 hover:bg-white/5 hover:text-gray-300"
+            }`}
+          >
+            ⚙
+          </button>
+        </div>
+        <div className="flex-1" />
+        {authRequired && (
+          <button
+            type="button"
+            onClick={onLogout}
+            title="退出登录"
+            aria-label="退出登录"
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-base text-gray-500 transition-colors hover:bg-red-500/10 hover:text-red-400"
+          >
+            ↪
+          </button>
+        )}
+      </div>
 
-        {sidebarCollapsed ? (
-          /* 折叠态：仅图标栏 */
-          <div className="flex flex-col items-center gap-4 py-4">
-            <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
-              ⌘
-            </div>
-            <button type="button" onClick={() => setCurrentPage("terminal")} title="工作台" className={`text-lg transition-opacity ${currentPage === "terminal" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>📡</button>
-            <button type="button" onClick={() => setCurrentPage("hosts")} title="控制台·主机" className={`text-lg transition-opacity ${currentPage === "hosts" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>📋</button>
-            <button type="button" onClick={() => setCurrentPage("credentials")} title="控制台·凭据" className={`text-lg transition-opacity ${currentPage === "credentials" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>🔑</button>
-          </div>
-        ) : (
-          <>
-        <div className="border-b border-white/8 px-5 pb-4 pt-5">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300 shadow-[0_12px_28px_rgba(16,185,129,0.12)]">
-              ⌘
-            </div>
-            <div className="min-w-0">
-              <h1 className="text-lg font-semibold tracking-tight text-white">WebTerminal</h1>
-              <p className="mt-1 truncate text-xs text-gray-500">{sidebarSubline}</p>
-            </div>
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
-            <span className="inline-flex items-center rounded-full border border-white/8 bg-white/5 px-2.5 py-1">
-              {tabs.length > 0 ? `${tabs.length} 个会话` : "等待连接"}
-            </span>
-            <span className="inline-flex items-center rounded-full border border-white/8 bg-white/5 px-2.5 py-1">
-              {connectedHostIds.size > 0 ? `${connectedHostIds.size} 已连接` : "尚无活跃连接"}
-            </span>
-          </div>
-
-          {/* 页面导航：工作台 / 控制台 两级 */}
-          <nav className="mt-4 flex flex-col gap-1 rounded-xl border border-white/8 bg-white/[0.03] p-1">
-            {/* 工作台（终端） */}
-            <button
-              type="button"
-              onClick={() => setCurrentPage("terminal")}
-              className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                currentPage === "terminal"
-                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
-                  : "text-gray-500 hover:text-gray-300 border border-transparent"
-              }`}
-            >
-              📡 工作台
-            </button>
-
-            {/* 控制台（主机 / 凭据） */}
-            <div className={`rounded-lg ${currentPage !== "terminal" ? "bg-white/[0.02]" : ""}`}>
-              <div className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-gray-400">
-                ⚙ 控制台
+      {/* ── 侧栏：主机列表 / 控制台 ── */}
+      {!sidebarCollapsed && (
+        <aside className="relative z-10 flex w-[280px] shrink-0 flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl">
+          {currentPage === "terminal" ? (
+            <>
+              <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
+                <span className="text-sm font-medium text-gray-200">主机</span>
+                <button
+                  type="button"
+                  onClick={() => setSidebarCollapsed(true)}
+                  title="折叠侧栏"
+                  aria-label="折叠侧栏"
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-xs text-gray-500 transition-colors hover:bg-white/5 hover:text-gray-300"
+                >
+                  «
+                </button>
               </div>
-              <div className="flex gap-1 px-1 pb-1">
+              <HostList
+                hosts={hosts}
+                selectedHost={activeTab?.host ?? null}
+                onSelect={handleHostSelect}
+                onEdit={(host) => {
+                  setEditTargetId(host.id);
+                  setCurrentPage("hosts");
+                }}
+                loading={hostsLoading}
+                error={hostsError}
+                onRetry={loadHosts}
+                connectedHostIds={connectedHostIds}
+              />
+            </>
+          ) : (
+            <>
+              <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
+                <span className="text-sm font-medium text-gray-200">控制台</span>
+                <button
+                  type="button"
+                  onClick={() => setSidebarCollapsed(true)}
+                  title="折叠侧栏"
+                  aria-label="折叠侧栏"
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-xs text-gray-500 transition-colors hover:bg-white/5 hover:text-gray-300"
+                >
+                  «
+                </button>
+              </div>
+              <div className="flex-1 flex flex-col px-3 py-3 gap-1">
                 <button
                   type="button"
                   onClick={() => setCurrentPage("hosts")}
-                  className={`flex-1 rounded-md px-2 py-1 text-[11px] transition-colors ${
+                  className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
                     currentPage === "hosts"
                       ? "bg-emerald-500/15 text-emerald-300"
-                      : "text-gray-500 hover:text-gray-300"
+                      : "text-gray-400 hover:bg-white/5 hover:text-gray-300"
                   }`}
                 >
-                  主机
+                  📋 主机管理
                 </button>
                 <button
                   type="button"
                   onClick={() => setCurrentPage("credentials")}
-                  className={`flex-1 rounded-md px-2 py-1 text-[11px] transition-colors ${
+                  className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
                     currentPage === "credentials"
                       ? "bg-emerald-500/15 text-emerald-300"
-                      : "text-gray-500 hover:text-gray-300"
+                      : "text-gray-400 hover:bg-white/5 hover:text-gray-300"
                   }`}
                 >
-                  凭据
+                  🔑 凭据管理
                 </button>
               </div>
-            </div>
-          </nav>
-        </div>
-
-        {/* 侧边栏内容区：终端模式显示主机列表，主机管理/凭据模式显示统计 */}
-        {currentPage === "terminal" ? (
-          <HostList
-            hosts={hosts}
-            selectedHost={activeTab?.host ?? null}
-            onSelect={handleHostSelect}
-            onEdit={(host) => {
-              setEditTargetId(host.id);
-              setCurrentPage("hosts");
-            }}
-            loading={hostsLoading}
-            error={hostsError}
-            onRetry={loadHosts}
-            connectedHostIds={connectedHostIds}
-          />
-        ) : (
-          <div className="flex-1 flex flex-col px-4 py-4 text-center justify-center">
-            <div className="text-2xl mb-2 text-emerald-300/60">⚙</div>
-            <p className="text-sm text-gray-300">控制台</p>
-            <p className="mt-1 text-[11px] text-gray-600 leading-relaxed">
-              在右侧管理主机、凭据与 YAML 配置
-            </p>
-          </div>
-        )}
-          </>
-        )}
-      </aside>
+            </>
+          )}
+        </aside>
+      )}
 
       <main className="relative z-10 flex min-w-0 flex-1 flex-col">
         {currentPage === "terminal" ? (
