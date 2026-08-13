@@ -53,14 +53,6 @@ function findHostByName(hosts: Host[], name: string): Host | undefined {
   return undefined;
 }
 
-function countByStatus(host: Host, status: string): number {
-  let count = host.status === status ? 1 : 0;
-  for (const child of host.children ?? []) {
-    count += countByStatus(child, status);
-  }
-  return count;
-}
-
 function targetNameFromInstance(instanceName: string): string {
   const parts = instanceName.split("--");
   return parts[parts.length - 1] || instanceName;
@@ -479,9 +471,9 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
               ⌘
             </div>
-            <button type="button" onClick={() => setCurrentPage("terminal")} title="终端" className="text-lg opacity-60 hover:opacity-100">📡</button>
-            <button type="button" onClick={() => setCurrentPage("hosts")} title="主机" className="text-lg opacity-60 hover:opacity-100">📋</button>
-            <button type="button" onClick={() => setCurrentPage("credentials")} title="凭据" className="text-lg opacity-60 hover:opacity-100">🔑</button>
+            <button type="button" onClick={() => setCurrentPage("terminal")} title="工作台" className={`text-lg transition-opacity ${currentPage === "terminal" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>📡</button>
+            <button type="button" onClick={() => setCurrentPage("hosts")} title="控制台·主机" className={`text-lg transition-opacity ${currentPage === "hosts" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>📋</button>
+            <button type="button" onClick={() => setCurrentPage("credentials")} title="控制台·凭据" className={`text-lg transition-opacity ${currentPage === "credentials" ? "opacity-100" : "opacity-60 hover:opacity-100"}`}>🔑</button>
           </div>
         ) : (
           <>
@@ -505,41 +497,51 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             </span>
           </div>
 
-          {/* 页面导航标签 */}
-          <nav className="mt-4 flex items-center gap-1 rounded-xl border border-white/8 bg-white/[0.03] p-1">
+          {/* 页面导航：工作台 / 控制台 两级 */}
+          <nav className="mt-4 flex flex-col gap-1 rounded-xl border border-white/8 bg-white/[0.03] p-1">
+            {/* 工作台（终端） */}
             <button
               type="button"
               onClick={() => setCurrentPage("terminal")}
-              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+              className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
                 currentPage === "terminal"
                   ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
                   : "text-gray-500 hover:text-gray-300 border border-transparent"
               }`}
             >
-              📡 终端
+              📡 工作台
             </button>
-            <button
-              type="button"
-              onClick={() => setCurrentPage("hosts")}
-              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                currentPage === "hosts"
-                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
-                  : "text-gray-500 hover:text-gray-300 border border-transparent"
-              }`}
-            >
-              📋 主机
-            </button>
-            <button
-              type="button"
-              onClick={() => setCurrentPage("credentials")}
-              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                currentPage === "credentials"
-                  ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
-                  : "text-gray-500 hover:text-gray-300 border border-transparent"
-              }`}
-            >
-              🔑 凭据
-            </button>
+
+            {/* 控制台（主机 / 凭据） */}
+            <div className={`rounded-lg ${currentPage !== "terminal" ? "bg-white/[0.02]" : ""}`}>
+              <div className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-gray-400">
+                ⚙ 控制台
+              </div>
+              <div className="flex gap-1 px-1 pb-1">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage("hosts")}
+                  className={`flex-1 rounded-md px-2 py-1 text-[11px] transition-colors ${
+                    currentPage === "hosts"
+                      ? "bg-emerald-500/15 text-emerald-300"
+                      : "text-gray-500 hover:text-gray-300"
+                  }`}
+                >
+                  主机
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage("credentials")}
+                  className={`flex-1 rounded-md px-2 py-1 text-[11px] transition-colors ${
+                    currentPage === "credentials"
+                      ? "bg-emerald-500/15 text-emerald-300"
+                      : "text-gray-500 hover:text-gray-300"
+                  }`}
+                >
+                  凭据
+                </button>
+              </div>
+            </div>
           </nav>
         </div>
 
@@ -559,43 +561,12 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             connectedHostIds={connectedHostIds}
           />
         ) : (
-          <div className="flex-1 flex flex-col px-4 py-4">
-            <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4">
-              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">节点概览</h3>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="flex items-center gap-2 text-gray-500">
-                    <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                    活跃节点
-                  </span>
-                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "active"), 0)}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="flex items-center gap-2 text-gray-500">
-                    <span className="h-2 w-2 rounded-full bg-amber-400" />
-                    待下线
-                  </span>
-                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "deprecated"), 0)}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="flex items-center gap-2 text-gray-500">
-                    <span className="h-2 w-2 rounded-full bg-red-400" />
-                    已禁用
-                  </span>
-                  <span className="text-gray-300">{hosts.reduce((n, h) => n + countByStatus(h, "disabled"), 0)}</span>
-                </div>
-              </div>
-            </div>
-            <div className="mt-4 rounded-xl border border-white/8 bg-white/[0.02] p-4">
-              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">快捷说明</h3>
-              <ul className="space-y-2 text-[11px] text-gray-500">
-                <li>• 点击节点行的「编辑」可修改配置</li>
-                <li>• 「交互步骤」支持多步 wait → send 自动化</li>
-                <li>• 批量操作 → YAML 编辑器可直接修改全局配置</li>
-                <li>• 🔑 凭据标签页可管理共享密码</li>
-                <li>• 密码字段支持 <code className="rounded bg-white/5 px-1 text-cyan-400">{"{{password}}"}</code> 变量</li>
-              </ul>
-            </div>
+          <div className="flex-1 flex flex-col px-4 py-4 text-center justify-center">
+            <div className="text-2xl mb-2 text-emerald-300/60">⚙</div>
+            <p className="text-sm text-gray-300">控制台</p>
+            <p className="mt-1 text-[11px] text-gray-600 leading-relaxed">
+              在右侧管理主机、凭据与 YAML 配置
+            </p>
           </div>
         )}
           </>

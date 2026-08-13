@@ -230,14 +230,32 @@ export default function HostManagePage({
         </div>
 
         <div className="flex items-center gap-2">
-          {/* 批量操作 dropdown */}
+          {/* 全局 YAML 导入/导出（主机库级别，顶层显眼位置） */}
+          <button
+            type="button"
+            onClick={() => setImportModalOpen(true)}
+            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:border-emerald-400/40 hover:bg-emerald-500/10 hover:text-emerald-300"
+            title="导入 YAML 覆盖/合并主机库"
+          >
+            📥 导入
+          </button>
+          <button
+            type="button"
+            onClick={handleExport}
+            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:border-emerald-400/40 hover:bg-emerald-500/10 hover:text-emerald-300"
+            title="导出主机库为 YAML"
+          >
+            📤 导出
+          </button>
+
+          {/* 高级操作 dropdown（YAML 编辑器等） */}
           <div className="relative">
             <button
               type="button"
               onClick={() => setDropdownOpen((p) => !p)}
               className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:border-white/20 hover:bg-white/8"
             >
-              ⚙ 批量操作
+              ⚙ 高级
             </button>
             {dropdownOpen && (
               <>
@@ -254,20 +272,6 @@ export default function HostManagePage({
                     className="flex w-full items-center gap-2 px-3 py-2 text-xs text-gray-300 transition-colors hover:bg-white/5"
                   >
                     <span className="text-sm">✏️</span> YAML 编辑器
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setImportModalOpen(true); setDropdownOpen(false); }}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-xs text-gray-300 transition-colors hover:bg-white/5"
-                  >
-                    <span className="text-sm">📥</span> 导入 YAML
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { handleExport(); setDropdownOpen(false); }}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-xs text-gray-300 transition-colors hover:bg-white/5"
-                  >
-                    <span className="text-sm">📤</span> 导出 YAML
                   </button>
                 </div>
               </>
