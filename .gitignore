@@ -57,3 +57,7 @@ htmlcov/
 .playwright-mcpfrontend/tsconfig.tsbuildinfo
 .playwright-mcp/
 frontend/tsconfig.tsbuildinfo
+
+# OpenSpec & Claude Code (local metadata, not committed)
+.claude/
+openspec/
