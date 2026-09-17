@@ -89,17 +89,22 @@ def _mock_pty_session() -> AsyncMock:
 
 class TestResolveVariables:
     def test_replaces_password_variable(self):
-        text, needs_manual = _resolve_variables("{{password}}", password="s3cret")
+        text, needs_manual = _resolve_variables("{{password}}", {"password": "s3cret"})
         assert text == "s3cret"
         assert needs_manual is False
 
+    def test_replaces_user_id_variable(self):
+        text, needs_manual = _resolve_variables("{{user_id}}", {"user_id": "1"})
+        assert text == "1"
+        assert needs_manual is False
+
     def test_manual_variable_sets_flag(self):
-        text, needs_manual = _resolve_variables("{{manual}}", password=None)
+        text, needs_manual = _resolve_variables("{{manual}}", {})
         assert text == ""
         assert needs_manual is True
 
     def test_unknown_variable_preserved(self):
-        text, needs_manual = _resolve_variables("hello {{unknown}} world", password=None)
+        text, needs_manual = _resolve_variables("hello {{unknown}} world", {})
         assert text == "hello {{unknown}} world"
         assert needs_manual is False
 

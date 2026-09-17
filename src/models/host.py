@@ -31,6 +31,17 @@ class EntryType(str, enum.Enum):
     SSH_COMMAND = "ssh_command"
 
 
+class InteractionMode(str, enum.Enum):
+    """入口交互模式。
+
+    - auto:   steps 非空 → 手动执行；steps 为空 → 规则引擎自动识别
+    - manual: 强制手动，即使 steps 为空也不自动识别
+    """
+
+    AUTO = "auto"
+    MANUAL = "manual"
+
+
 class HostStatus(str, enum.Enum):
     """节点生命周期状态。"""
 
@@ -120,6 +131,11 @@ class EntrySpecSchema(BaseModel):
     value: str | None = Field(default=None, description="入口动作内容（如 IP、ssh 命令）")
     success_pattern: str | None = Field(default=None, description="进入当前节点成功的匹配模式")
     steps: list[LoginStepSchema] = Field(default_factory=list, description="入口动作后的附加交互步骤")
+    interaction_mode: InteractionMode = Field(
+        default=InteractionMode.AUTO, description="交互模式: auto=steps 空时自动识别, manual=强制手动"
+    )
+    rules: list[str] | None = Field(default=None, description="启用的规则 ID 列表（None=使用全部规则）")
+    rule_vars: dict[str, str] = Field(default_factory=dict, description="规则变量覆盖，如 {'user_id': '1'}")
 
 
 class HostBase(BaseModel):

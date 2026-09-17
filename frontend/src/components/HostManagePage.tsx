@@ -14,6 +14,7 @@ import type {
   HostType,
   HostStatus,
   EntryType,
+  InteractionMode,
   LoginStep,
   CreateHostRequest,
   CredentialNameItem,
@@ -51,6 +52,8 @@ interface HostFormData {
   entry_type: EntryType;
   entry_value: string;
   entry_success_pattern: string;
+  entry_interaction_mode: InteractionMode;
+  entry_rule_vars: string;
   entry_steps: LoginStep[];
 }
 
@@ -73,6 +76,8 @@ const EMPTY_FORM: HostFormData = {
   entry_type: "none",
   entry_value: "",
   entry_success_pattern: "",
+  entry_interaction_mode: "auto",
+  entry_rule_vars: "",
   entry_steps: [],
 };
 
@@ -572,6 +577,8 @@ function HostEditDrawer({ mode, host, parentId, hosts: _hosts, onSubmit, onClose
         entry_type: host.entry.type,
         entry_value: host.entry.value ?? "",
         entry_success_pattern: host.entry.success_pattern ?? "",
+        entry_interaction_mode: host.entry.interaction_mode ?? "auto",
+        entry_rule_vars: host.entry.rule_vars ? JSON.stringify(host.entry.rule_vars) : "",
         entry_steps: host.entry.steps ?? [],
       }
     : {
@@ -614,7 +621,17 @@ function HostEditDrawer({ mode, host, parentId, hosts: _hosts, onSubmit, onClose
           value: form.entry_value.trim() || null,
           success_pattern: form.entry_success_pattern.trim() || null,
           steps: form.entry_steps,
+          interaction_mode: form.entry_interaction_mode,
         };
+        // 解析 rule_vars（JSON 字符串 → 对象）
+        const ruleVarsText = form.entry_rule_vars.trim();
+        if (ruleVarsText) {
+          try {
+            data.entry.rule_vars = JSON.parse(ruleVarsText);
+          } catch {
+            // 非法 JSON：忽略（可在 UI 层提示）
+          }
+        }
       }
 
       onSubmit(data);
@@ -731,6 +748,21 @@ function HostEditDrawer({ mode, host, parentId, hosts: _hosts, onSubmit, onClose
                       value={form.entry_success_pattern}
                       onChange={(v) => handleChange("entry_success_pattern", v)}
                       placeholder="正则表达式，如 [$#>%]\\s*$"
+                    />
+                    <SelectField
+                      label="交互模式"
+                      value={form.entry_interaction_mode}
+                      options={[
+                        { value: "auto", label: "自动识别（steps 为空时应用交互规则）" },
+                        { value: "manual", label: "手动（仅执行下方步骤）" },
+                      ]}
+                      onChange={(v) => handleChange("entry_interaction_mode", v)}
+                    />
+                    <Field
+                      label="规则变量（JSON，可选）"
+                      value={form.entry_rule_vars}
+                      onChange={(v) => handleChange("entry_rule_vars", v)}
+                      placeholder='如 {"user_id": "1"}，供 {{user_id}} 等变量替换'
                     />
                     {/* 交互步骤编辑器 */}
                     <StepsEditor
@@ -1233,9 +1265,9 @@ function StepsEditor({ steps, onChange }: StepsEditorProps) {
 
       {steps.length === 0 ? (
         <div className="rounded-lg border border-dashed border-white/10 bg-white/[0.02] px-3 py-4 text-center">
-          <p className="text-[11px] text-gray-600">暂无交互步骤</p>
+          <p className="text-[11px] text-gray-600">暂无交互步骤（自动识别）</p>
           <p className="mt-1 text-[10px] text-gray-700">
-            适用于需要依次等待提示并发送响应的场景（如密码输入、菜单选择）
+            连接时将自动应用交互规则（密码输入、菜单选择等）。如需精确控制可添加步骤，或切换交互模式为「手动」。
           </p>
         </div>
       ) : (

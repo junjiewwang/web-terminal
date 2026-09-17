@@ -5,6 +5,7 @@ import AgentPanel from "./components/AgentPanel";
 import TerminalView from "./components/TerminalView";
 import HostManagePage from "./components/HostManagePage";
 import CredentialManagePanel from "./components/CredentialManagePanel";
+import InteractionRulePanel from "./components/InteractionRulePanel";
 import TerminalTabs, {
   tabIdForHost,
   createTabForHost,
@@ -30,7 +31,7 @@ import {
   logout,
 } from "./services/auth";
 
-type Page = "terminal" | "hosts" | "credentials";
+type Page = "terminal" | "hosts" | "credentials" | "interaction-rules";
 
 const EVENT_LABELS: Record<string, string> = {
   command_start: "执行命令",
@@ -70,7 +71,12 @@ function eventSummary(event: AgentEvent | null): string | null {
   if (!event) return null;
   const label = EVENT_LABELS[event.event_type] ?? event.event_type;
   if (event.data.command != null) {
-    return `${label} · ${String(event.data.command)}`;
+    const cmd = String(event.data.command);
+    // 自动识别事件：直接展示「[自动识别] 应用规则 X」，不再叠加「执行命令」前缀
+    if (cmd.startsWith("[自动识别]")) {
+      return cmd;
+    }
+    return `${label} · ${cmd}`;
   }
   return `${label} · ${event.host_name}`;
 }
@@ -410,6 +416,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
       { id: "page-terminal", title: "终端", group: "页面", icon: "📡", action: () => setCurrentPage("terminal") },
       { id: "page-hosts", title: "主机管理", group: "页面", icon: "📋", action: () => setCurrentPage("hosts") },
       { id: "page-credentials", title: "凭据管理", group: "页面", icon: "🔑", action: () => setCurrentPage("credentials") },
+      { id: "page-interaction-rules", title: "交互规则", group: "页面", icon: "🧩", action: () => setCurrentPage("interaction-rules") },
       { id: "toggle-sidebar", title: sidebarCollapsed ? "展开侧栏" : "折叠侧栏", group: "界面", action: () => setSidebarCollapsed((p) => !p) },
     ];
     // 主机（连接）
@@ -561,6 +568,17 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
                 >
                   🔑 凭据管理
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage("interaction-rules")}
+                  className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
+                    currentPage === "interaction-rules"
+                      ? "bg-emerald-500/15 text-emerald-300"
+                      : "text-gray-400 hover:bg-white/5 hover:text-gray-300"
+                  }`}
+                >
+                  🧩 交互规则
+                </button>
               </div>
             </>
           )}
@@ -699,8 +717,10 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             editTargetId={editTargetId}
             onEditTargetConsumed={() => setEditTargetId(null)}
           />
-        ) : (
+        ) : currentPage === "credentials" ? (
           <CredentialManagePanel />
+        ) : (
+          <InteractionRulePanel />
         )}
       </main>
 

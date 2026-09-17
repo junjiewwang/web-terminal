@@ -98,6 +98,33 @@ _MOUSE_EVENT_RE = re.compile(
 )
 
 
+def _merge_fragment_lines(lines: list[str]) -> str:
+    """合并连续的碎片行，用于应对 PTY 逐字符回显。
+
+    某些交互场景（如 JumpServer 菜单的 "ID>" 提示、输入回显）会逐字符输出，
+    每个字符后跟换行，导致缓冲区里 "I"、"D"、">" 成为独立行，
+    多字符正则（如 ``^\\s*ID\\s*>\\s*$``）无法匹配。
+
+    这里将连续的、去除 ANSI 后长度 ≤ 1 的行合并为一行，
+    遇到多字符行则切分，避免误合并正常输出。
+    """
+    parts: list[str] = []
+    fragment: list[str] = []
+    for line in lines:
+        # 去除行尾的 \r（PTY 常为 CRLF 输出），避免干扰单字符判断
+        line = line.rstrip("\r")
+        if len(line) <= 1:
+            fragment.append(line)
+        else:
+            if fragment:
+                parts.append("".join(fragment))
+                fragment = []
+            parts.append(line)
+    if fragment:
+        parts.append("".join(fragment))
+    return "\n".join(parts)
+
+
 class SessionExitReason(str, enum.Enum):
     """会话退出原因枚举。
 
@@ -797,6 +824,19 @@ class TerminalSession:
         for cid in dead_client_ids:
             self._ws_clients.pop(cid, None)
 
+    def broadcast_notice(self, text: str) -> None:
+        """向浏览器终端广播一条系统提示（不经过 PTY，不影响远端交互）。
+
+        用于在终端屏幕上实时展示自动识别等系统动作。
+        提示使用 ANSI 颜色 + 独立换行，与远端输出区分，且不写入远端终端。
+
+        同时写入 scrollback：MCP 触发连接时浏览器可能尚未建立 WebSocket，
+        写入 scrollback 可保证后连接的浏览器通过历史回放也能看到提示。
+        """
+        notice = f"\r\n\x1b[33m[自动识别] {text}\x1b[0m\r\n"
+        self._append_scrollback(notice.encode())
+        self._broadcast_output(notice)
+
     @staticmethod
     async def _safe_ws_send(ws: WebSocket, text: str) -> None:
         """安全发送 WebSocket output 消息（忽略发送错误）"""
@@ -1004,7 +1044,7 @@ class TerminalSession:
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed >= timeout:
-                collected = strip_ansi("\n".join(collected_lines))
+                collected = strip_ansi(_merge_fragment_lines(collected_lines))
                 raise TimeoutError(
                     f"等待模式 '{pattern}' 超时（{timeout}s）。"
                     f"最近输出:\n{collected[-500:]}"
@@ -1035,7 +1075,7 @@ class TerminalSession:
                             continue
                         collected_lines.append(clean_line)
 
-                    full_text = "\n".join(collected_lines)
+                    full_text = _merge_fragment_lines(collected_lines)
                     if regex.search(full_text):
                         return full_text
 

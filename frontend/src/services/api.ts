@@ -111,6 +111,9 @@ export type TerminalBackend = "tmux" | "broker";
 /** 入口动作类型 */
 export type EntryType = "none" | "menu_send" | "ssh_command";
 
+/** 交互模式：auto=steps 空时自动识别，manual=强制手动 */
+export type InteractionMode = "auto" | "manual";
+
 /** 登录交互步骤（wait → send 原子操作） */
 export interface LoginStep {
   wait: string;
@@ -124,6 +127,9 @@ export interface EntrySpec {
   value?: string | null;
   success_pattern?: string | null;
   steps: LoginStep[];
+  interaction_mode?: InteractionMode;
+  rules?: string[] | null;
+  rule_vars?: Record<string, string>;
 }
 
 /** 节点生命周期状态 */
@@ -398,6 +404,79 @@ export async function updateCredential(id: number, data: { password?: string; de
 
 export async function deleteCredential(id: number): Promise<void> {
   const res = await _authedFetch(`${API_BASE}/credentials/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `删除失败: ${res.statusText}`);
+  }
+}
+
+// ── 交互规则管理 ──────────────────────────────
+
+export interface InteractionRuleItem {
+  id: number;
+  name: string;
+  description: string | null;
+  priority: number;
+  wait_pattern: string;
+  send_text: string;
+  timeout: number;
+  max_retries: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InteractionRuleExample {
+  name: string;
+  description: string;
+  priority: number;
+  wait_pattern: string;
+  send_text: string;
+  timeout: number;
+  max_retries: number;
+}
+
+export async function listInteractionRules(): Promise<InteractionRuleItem[]> {
+  const res = await _authedFetch(`${API_BASE}/interaction-rules`);
+  if (!res.ok) throw new Error(`获取交互规则列表失败: ${res.statusText}`);
+  return res.json();
+}
+
+export async function listInteractionRuleExamples(): Promise<InteractionRuleExample[]> {
+  const res = await _authedFetch(`${API_BASE}/interaction-rules/examples`);
+  if (!res.ok) throw new Error(`获取示例规则失败: ${res.statusText}`);
+  return res.json();
+}
+
+export async function createInteractionRule(data: Omit<InteractionRuleItem, "id" | "created_at" | "updated_at">): Promise<InteractionRuleItem> {
+  const res = await _authedFetch(`${API_BASE}/interaction-rules`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `创建失败: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function updateInteractionRule(id: number, data: Partial<Omit<InteractionRuleItem, "id" | "created_at" | "updated_at">>): Promise<void> {
+  const res = await _authedFetch(`${API_BASE}/interaction-rules/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(typeof err.detail === "string" ? err.detail : `更新失败: ${res.statusText}`);
+  }
+}
+
+export async function deleteInteractionRule(id: number): Promise<void> {
+  const res = await _authedFetch(`${API_BASE}/interaction-rules/${id}`, {
     method: "DELETE",
   });
   if (!res.ok) {

@@ -310,6 +310,15 @@ def _host_to_dict(host: HostResponse) -> dict[str, Any]:
                 {"wait": s.wait, "send": s.send, "timeout": s.timeout}
                 for s in host.entry.steps
             ]
+        # 交互模式（仅非默认 auto 时输出）
+        if host.entry.interaction_mode.value != "auto":
+            entry_dict["interaction_mode"] = host.entry.interaction_mode.value
+        # 启用的规则 ID 列表
+        if host.entry.rules:
+            entry_dict["rules"] = host.entry.rules
+        # 规则变量（如 user_id）
+        if host.entry.rule_vars:
+            entry_dict["rule_vars"] = host.entry.rule_vars
         node["entry"] = entry_dict
 
     # 递归子节点

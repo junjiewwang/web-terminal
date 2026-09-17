@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import (
 from src.models.host import AuthType, Base, HostType
 from src.models.auth import AuthConfigModel, RefreshTokenModel  # noqa: F401 — 注册到 Base.metadata
 from src.models.credential import Credential  # noqa: F401 — 注册到 Base.metadata
+from src.models.interaction_rule import InteractionRule  # noqa: F401 — 注册到 Base.metadata
 
 logger = logging.getLogger(__name__)
 

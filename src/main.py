@@ -24,6 +24,7 @@ from src.api import file_transfer as file_transfer_api
 from src.api import auth as auth_api
 from src.api import settings as settings_api
 from src.api import credentials as credentials_api
+from src.api import interaction_rules as interaction_rules_api
 from src.mcp_server.server import get_pty_manager, init_mcp_server, mcp
 from src.models.database import async_session_factory, get_db_info, init_db
 from src.services.auth_service import AuthService
@@ -424,6 +425,7 @@ async def auth_middleware(request: Request, call_next):
 app.include_router(auth_api.router)
 app.include_router(settings_api.router)
 app.include_router(credentials_api.router)
+app.include_router(interaction_rules_api.router)
 app.include_router(hosts.router)
 app.include_router(sessions.router)
 app.include_router(events.router)
