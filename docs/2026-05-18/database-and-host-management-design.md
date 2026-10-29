@@ -492,12 +492,12 @@ async def export_hosts(session: AsyncSession = Depends(get_db)):
 │  ┌─ 🌳 主机树 ─────────────────────────────────────────┐    │
 │  │                                                      │    │
 │  │  📂 dev-cloud                                        │    │
-│  │  │  hostname: 9.134.114.82:36000                     │    │
+│  │  │  hostname: <IP>:36000                     │    │
 │  │  │  auth: key | status: active                       │    │
 │  │  │  [编辑] [添加子节点] [删除]                        │    │
 │  │  │                                                   │    │
 │  │  📂 tce-server                           [展开/折叠]  │    │
-│  │  │  hostname: 118.24.225.114:36000                   │    │
+│  │  │  hostname: <IP>:36000                   │    │
 │  │  │  auth: password | status: active                  │    │
 │  │  │  [编辑] [添加子节点] [删除]                        │    │
 │  │  │                                                   │    │
@@ -529,7 +529,7 @@ async def export_hosts(session: AsyncSession = Depends(get_db)):
 │                                                  │
 │  基本信息                                        │
 │  ├─ 名称:     [dev-cloud          ]             │
-│  ├─ 地址:     [9.134.114.82       ]             │
+│  ├─ 地址:     [<IP>       ]             │
 │  ├─ 端口:     [36000              ]             │
 │  ├─ 用户名:   [root               ]             │
 │  ├─ 描述:     [开发环境服务器       ]             │
@@ -759,7 +759,7 @@ const [currentPage, setCurrentPage] = useState<Page>("terminal");
 
 | 项目 | 值 |
 |------|---|
-| 远程 MySQL | `9.135.251.193:3306` |
+| 远程 MySQL | `<IP>:3306` |
 | 用户 | `test123` |
 | 数据库 | `wetty_terminal`（测试前需手动创建） |
 | 连接方式 | `DATABASE_URL=mysql+aiomysql://...` 环境变量注入 |
@@ -768,7 +768,7 @@ const [currentPage, setCurrentPage] = useState<Page>("terminal");
 
 | 步骤 | 命令 | 结果 |
 |------|------|------|
-| 1. 检查 MySQL 可达性 | `nc -z 9.135.251.193 3306` | ✅ 连接成功 |
+| 1. 检查 MySQL 可达性 | `nc -z <IP> 3306` | ✅ 连接成功 |
 | 2. 创建数据库 | `CREATE DATABASE wetty_terminal ...` | ✅ |
 | 3. 构建 + 启动 | `make up-external` | ✅ 容器正常启动 |
 | 4. 数据库初始化 | 自动 `init_db()` → `CREATE TABLE` | ✅ hosts 表已创建 |

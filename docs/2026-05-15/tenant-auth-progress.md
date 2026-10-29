@@ -27,7 +27,7 @@
 | `src/services/tenant_registry.py` | 核心注册表：YAML 加载、bcrypt 认证、JWT 签发/验证、Refresh Token 管理、并发登录限制、ContextVar 租户传播 |
 | `src/api/auth.py` | 4 个认证端点：login、refresh、logout、password |
 | `src/utils/password_hash.py` | CLI 工具：`python -m src.utils.password_hash "password"` |
-| `config/tenants.yaml` | 默认配置：admin 账号（admin123, super_admin 角色） |
+| `config/tenants.yaml` | 默认配置：admin 账号（<密码>, super_admin 角色） |
 
 ### 修改文件清单
 
@@ -56,7 +56,7 @@
 
 | 租户 ID | 密码 | 角色 | 说明 |
 |---------|------|------|------|
-| admin | admin123 | super_admin | 初始管理员账号，请在生产环境中修改密码 |
+| admin | <密码> | super_admin | 初始管理员账号，请在生产环境中修改密码 |
 
 ---
 

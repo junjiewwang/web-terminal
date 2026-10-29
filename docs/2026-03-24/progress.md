@@ -805,7 +805,7 @@ _run_jump_orchestration():
 | 点击 tce-server → 显示堡垒机终端 | ✅ `Terminal: tce-server (socket.io ✓) ● 已连接` |
 | 点击 m12 → 打开新 Tab + 显示 m12 终端 | ✅ `🔗 tce-server/m12` Tab 出现 |
 | 切换回 tce-server Tab → 显示堡垒机原始终端 | ✅ header 显示 `junjiewwang@...:36000`，不是 m12 |
-| 切换回 m12 Tab → 显示 m12 终端 | ✅ header 显示 `tce-server → m12 (10.202.16.3)` |
+| 切换回 m12 Tab → 显示 m12 终端 | ✅ header 显示 `tce-server → m12 (<IP>)` |
 | tce-server Tab 连接未断开 | ✅ 两个 Tab 都保持 `已连接` |
 | 后台编排 per-client switch | ✅ 日志 `tmux switch-client`（不影响浏览器 client） |
 | 跳板编排成功 | ✅ `跳板编排成功: tce-server → m12` |
@@ -918,12 +918,12 @@ _run_jump_orchestration():
   ```
   12:10:38 - PTY 终端就绪: c8d57c3e (0.0s, buffer=59 lines)  ← 已有历史输出！
   12:10:38 - 开始跳板编排: tce-server → m12 (steps=0, skip_create=True)
-  12:10:39 - 已发送目标 IP: 10.202.16.3  ← 在已登录 m12 的终端里再次发送 IP！
+  12:10:39 - 已发送目标 IP: <IP>  ← 在已登录 m12 的终端里再次发送 IP！
   ```
 
   PTY 连接后立刻发现 buffer 有 59 行数据（来自残留 session 中已有的 m12 输出），
   然后 `execute_jump` 仍然执行跳板编排（发送 target_ip），在已经登录 m12 的 shell 里
-  执行了 `10.202.16.3` 命令（被当作 shell 命令执行），导致终端混乱。
+  执行了 `<IP>` 命令（被当作 shell 命令执行），导致终端混乱。
 
   **Bug 3: tce-server WeTTY 也 attach 到残留的 tmux session**
 

@@ -9,7 +9,7 @@
 清华镜像源 `mirrors.tuna.tsinghua.edu.cn` 对 Debian trixie 的包返回 403 Forbidden，导致 `apt-get install` 阶段全部失败。
 
 - 受影响阶段：`Dockerfile` Stage 2（`python:3.12-slim`）的系统包安装
-- 错误节点 IP：`101.6.15.130`
+- 错误节点 IP：`<IP>`
 - 镜像源 URL 中 `debian-security` 和 `debian` 路径均返回 403
 
 ## 解决方案
