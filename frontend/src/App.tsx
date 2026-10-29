@@ -453,7 +453,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
     <div className="relative flex h-screen overflow-hidden bg-[#050816] text-gray-100">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
 
-      {/* ── Activity Bar：最左窄栏（工作台/控制台导航） ── */}
+      {/* ── Activity Bar：最左窄栏（工作台/管理导航） ── */}
       <div className="relative z-10 flex w-12 shrink-0 flex-col items-center border-r border-white/8 bg-gray-950/90 py-4">
         <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-sm font-semibold text-emerald-300">
           ⌘
@@ -475,8 +475,8 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
           <button
             type="button"
             onClick={() => { setCurrentPage("hosts"); setSidebarCollapsed(false); }}
-            title="控制台"
-            aria-label="控制台"
+            title="管理"
+            aria-label="管理"
             className={`flex h-9 w-9 items-center justify-center rounded-lg text-lg transition-colors ${
               currentPage !== "terminal"
                 ? "bg-emerald-500/15 text-emerald-300"
@@ -500,7 +500,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
         )}
       </div>
 
-      {/* ── 侧栏：主机列表 / 控制台 ── */}
+      {/* ── 侧栏：主机列表 / 管理 ── */}
       {!sidebarCollapsed && (
         <aside className="relative z-10 flex w-[280px] shrink-0 flex-col border-r border-white/8 bg-gray-950/82 backdrop-blur-xl">
           {currentPage === "terminal" ? (
@@ -534,7 +534,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
           ) : (
             <>
               <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
-                <span className="text-sm font-medium text-gray-200">控制台</span>
+                <span className="text-sm font-medium text-gray-200">管理</span>
                 <button
                   type="button"
                   onClick={() => setSidebarCollapsed(true)}
@@ -591,13 +591,19 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
             <header className="h-14 shrink-0 border-b border-white/8 bg-gray-950/60 px-5 backdrop-blur-xl">
               <div className="flex h-full items-center justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="text-[11px] font-medium uppercase tracking-[0.28em] text-emerald-300/70">
-                    WebTerminal
+                  <p className="font-mono text-xs font-semibold tracking-tight text-emerald-300">
+                    <span className="mr-1.5 text-emerald-500/60">▍</span>WebTerminal
                   </p>
                   <div className="mt-1 flex items-center gap-2">
                     <span className="truncate text-sm font-medium text-gray-200">{headerText}</span>
                     {activeTab && (
-                      <span className="hidden rounded-full border border-white/8 bg-white/5 px-2 py-0.5 text-[10px] text-gray-400 sm:inline-flex">
+                      <span
+                        className={`hidden rounded-full border px-2 py-0.5 text-[10px] sm:inline-flex ${
+                          activeTab.host.host_type === "nested"
+                            ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-300"
+                            : "border-white/8 bg-white/5 text-gray-400"
+                        }`}
+                      >
                         {activeTab.host.host_type === "nested" ? "多跳节点" : "首跳节点"}
                       </span>
                     )}
@@ -664,7 +670,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
               onCloseTab={handleTabClose}
             />
 
-            <div className="relative min-h-0 flex-1 bg-[#040712]">
+            <div className="relative min-h-0 flex-1 bg-[#020409] ring-1 ring-inset ring-white/[0.04]">
               {tabs.length === 0 ? (
                 <div className="absolute inset-0 flex items-center justify-center text-gray-600">
                   <div className="max-w-md text-center">

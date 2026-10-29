@@ -42,6 +42,35 @@ function countHosts(hosts: Host[]): number {
   return hosts.reduce((sum, host) => sum + 1 + countHosts(host.children ?? []), 0);
 }
 
+/** 拆分节点名：识别「环境-版本」前缀（如 tce-3.10.12.1），返回前缀与主体。
+ *
+ * 命名规范为 `<环境>-<版本>-<架构>-<用途>-<机器编号>`，
+ * 前缀段（环境-版本）在侧栏弱化显示，主体段（架构-用途-机器编号）突出显示。
+ */
+function splitNodeName(name: string): { prefix: string; main: string } {
+  const m = name.match(/^([a-z][a-z0-9]*-[0-9]+(?:\.[0-9]+)*)-(.*)$/);
+  if (m && m[1] && m[2]) {
+    return { prefix: m[1], main: m[2] };
+  }
+  return { prefix: "", main: name };
+}
+
+/** 节点或其子树是否包含指定 tag（用于 tag 筛选，保留祖先路径）。 */
+function hostMatchesTag(host: Host, tag: string): boolean {
+  if (host.tags?.some((t) => t === tag)) return true;
+  return host.children?.some((child) => hostMatchesTag(child, tag)) ?? false;
+}
+
+/** 架构 tag 配色：arm/x86 用不同 accent 色，让架构维度一眼可辨。 */
+const ARCH_TAG_STYLES: Record<string, string> = {
+  arm: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300",
+  x86: "border-sky-400/40 bg-sky-400/10 text-sky-300",
+};
+
+function archTagStyle(tag: string): string {
+  return ARCH_TAG_STYLES[tag.toLowerCase()] ?? "";
+}
+
 export default function HostList({
   hosts,
   selectedHost,
@@ -53,6 +82,7 @@ export default function HostList({
   connectedHostIds,
 }: HostListProps) {
   const [query, setQuery] = useState("");
+  const [activeTag, setActiveTag] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -67,9 +97,12 @@ export default function HostList({
   }, []);
 
   const filteredHosts = useMemo(() => {
-    if (!query.trim()) return hosts;
-    return hosts.filter((host) => hostMatchesQuery(host, query));
-  }, [hosts, query]);
+    return hosts.filter((host) => {
+      if (activeTag && !hostMatchesTag(host, activeTag)) return false;
+      if (query.trim() && !hostMatchesQuery(host, query)) return false;
+      return true;
+    });
+  }, [hosts, query, activeTag]);
 
   const totalCount = useMemo(() => countHosts(hosts), [hosts]);
   const connectedCount = connectedHostIds?.size ?? 0;
@@ -154,13 +187,25 @@ export default function HostList({
             </span>
           )}
         </div>
+        {activeTag && (
+          <div className="flex items-center gap-1.5 mt-1.5">
+            <span className="text-[10px] text-gray-600">筛选:</span>
+            <button
+              onClick={() => setActiveTag(null)}
+              className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-300 hover:bg-emerald-500/20 transition-colors"
+            >
+              {activeTag}
+              <span className="text-emerald-400">✕</span>
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto host-list-scroll">
-        {filteredHosts.length === 0 && query ? (
+        {filteredHosts.length === 0 && (query || activeTag) ? (
           <div className="p-4 text-center text-sm text-gray-600">
             <div className="text-2xl mb-2">🔍</div>
-            未找到匹配「{query}」的主机
+            {activeTag ? `未找到标签「${activeTag}」的主机` : `未找到匹配「${query}」的主机`}
           </div>
         ) : (
           filteredHosts.map((host) => (
@@ -173,6 +218,8 @@ export default function HostList({
               depth={0}
               connectedHostIds={connectedHostIds}
               searchQuery={query}
+              activeTag={activeTag}
+              onTagClick={setActiveTag}
             />
           ))
         )}
@@ -189,6 +236,8 @@ interface _HostItemProps {
   depth: number;
   connectedHostIds?: Set<number>;
   searchQuery?: string;
+  activeTag?: string | null;
+  onTagClick?: (tag: string | null) => void;
 }
 
 function _HostItem({
@@ -199,6 +248,8 @@ function _HostItem({
   depth,
   connectedHostIds,
   searchQuery,
+  activeTag,
+  onTagClick,
 }: _HostItemProps) {
   const [expanded, setExpanded] = useState(true);
 
@@ -207,15 +258,20 @@ function _HostItem({
   const typeConfig = HOST_TYPE_CONFIG[host.host_type] ?? HOST_TYPE_CONFIG.root;
   const isConnected = connectedHostIds?.has(host.id) ?? false;
   const isDeprecated = host.status === "deprecated";
+  const nameParts = splitNodeName(host.name);
   const rowIndent = depth * 14;
   const secondaryText = host.description
     ? `${entryDisplay(host)} · ${host.description}`
     : entryDisplay(host);
 
   const filteredChildren = useMemo(() => {
-    if (!searchQuery?.trim() || !hasChildren) return host.children ?? [];
-    return (host.children ?? []).filter((child) => hostMatchesQuery(child, searchQuery));
-  }, [host.children, hasChildren, searchQuery]);
+    if (!hasChildren) return host.children ?? [];
+    return (host.children ?? []).filter((child) => {
+      if (activeTag && !hostMatchesTag(child, activeTag)) return false;
+      if (searchQuery?.trim() && !hostMatchesQuery(child, searchQuery)) return false;
+      return true;
+    });
+  }, [host.children, hasChildren, searchQuery, activeTag]);
 
   const toggleExpand = useCallback(
     (e: React.MouseEvent) => {
@@ -227,17 +283,17 @@ function _HostItem({
 
   return (
     <>
-      <div className="py-1" style={{ paddingLeft: `${rowIndent}px` }}>
+      <div className="py-0.5" style={{ paddingLeft: `${rowIndent}px` }}>
         <button
           onClick={() => onSelect(host)}
-          className={`group relative w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${
+          className={`group relative w-full rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
             isSelected
               ? "border-white/10 bg-white/[0.07]"
               : "border-transparent bg-transparent hover:border-white/8 hover:bg-white/[0.04]"
           } ${isDeprecated ? "opacity-60" : ""}`}
         >
           <span
-            className={`absolute bottom-2 left-1.5 top-2 w-0.5 rounded-full transition-colors ${
+            className={`absolute bottom-1.5 left-1.5 top-1.5 w-0.5 rounded-full transition-colors ${
               isSelected ? "bg-emerald-400" : "bg-transparent group-hover:bg-white/10"
             }`}
           />
@@ -262,7 +318,7 @@ function _HostItem({
             )}
 
             <span
-              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-sm transition-colors ${
+              className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md border text-xs transition-colors ${
                 isSelected
                   ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-100"
                   : "border-white/8 bg-white/[0.05] text-gray-300"
@@ -273,13 +329,51 @@ function _HostItem({
             </span>
 
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className={`truncate text-sm font-medium ${isSelected ? "text-white" : "text-gray-100"}`}>
-                  <_Highlight text={host.name} query={searchQuery} />
-                </span>
+              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                {nameParts.prefix ? (
+                  <span className="flex min-w-0 flex-col leading-tight">
+                    <span className={`truncate text-[10px] ${isSelected ? "text-gray-500" : "text-gray-600"}`}>
+                      <_Highlight text={nameParts.prefix} query={searchQuery} />
+                    </span>
+                    <span className={`break-words text-sm font-medium ${isSelected ? "text-white" : "text-gray-100"}`}>
+                      <_Highlight text={nameParts.main} query={searchQuery} />
+                    </span>
+                  </span>
+                ) : (
+                  <span className={`text-sm font-medium leading-tight ${isSelected ? "text-white" : "text-gray-100"}`}>
+                    <_Highlight text={host.name} query={searchQuery} />
+                  </span>
+                )}
+                {host.tags?.map((tag) => {
+                  const isActive = activeTag === tag;
+                  return (
+                    <span
+                      key={tag}
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTagClick?.(isActive ? null : tag);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.stopPropagation();
+                          onTagClick?.(isActive ? null : tag);
+                        }
+                      }}
+                      className={`inline-flex items-center rounded-full border px-1.5 py-px text-[10px] transition-colors ${
+                        isActive
+                          ? "border-emerald-400/40 bg-emerald-400/15 text-emerald-300"
+                          : archTagStyle(tag) || "border-white/8 bg-white/[0.03] text-gray-500 hover:bg-white/10 hover:text-gray-300"
+                      }`}
+                    >
+                      {tag}
+                    </span>
+                  );
+                })}
                 {isDeprecated && (
                   <span
-                    className="shrink-0 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400"
+                    className="shrink-0 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-[10px] text-amber-400"
                     title="待下线节点"
                   >
                     ⚠ 待下线
@@ -296,8 +390,11 @@ function _HostItem({
                   />
                 )}
               </div>
-              <div className={`mt-1 truncate text-[11px] ${isSelected ? "text-gray-400" : "text-gray-500"}`}>
-                <_Highlight text={secondaryText} query={searchQuery} />
+              <div
+                className={`mt-0.5 truncate text-[11px] ${isSelected ? "text-gray-400" : "text-gray-500"}`}
+                title={secondaryText}
+              >
+                <_Highlight text={entryDisplay(host)} query={searchQuery} />
               </div>
             </div>
 
@@ -338,18 +435,6 @@ function _HostItem({
             )}
           </div>
 
-          {Boolean(searchQuery) && host.tags.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5 pl-8">
-              {host.tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="rounded-full border border-white/8 bg-white/[0.03] px-2 py-0.5 text-[10px] text-gray-400"
-                >
-                  <_Highlight text={tag} query={searchQuery} />
-                </span>
-              ))}
-            </div>
-          )}
         </button>
       </div>
 
@@ -365,6 +450,8 @@ function _HostItem({
               depth={depth + 1}
               connectedHostIds={connectedHostIds}
               searchQuery={searchQuery}
+              activeTag={activeTag}
+              onTagClick={onTagClick}
             />
           ))}
         </div>

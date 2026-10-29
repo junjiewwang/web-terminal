@@ -247,11 +247,15 @@ async def list_hosts(tag: str | None = None, verbose: bool = False) -> str:
         }
 
     def _to_compact(host: HostResponse) -> JsonDict:
-        """精简输出：仅返回 Agent 做路由决策所需的核心字段，避免客户端截断。"""
+        """精简输出：仅返回 Agent 做路由决策所需的核心字段，避免客户端截断。
+
+        tags 承载架构/用途/版本等关键属性，纳入默认输出供 Agent 理解与筛选。
+        """
         return {
             "name": host.name,
             "hostname": host.hostname,
             "description": host.description or "",
+            "tags": host.tags or [],
             "type": host.host_type.value,
             "children": [_to_compact(child) for child in host.children],
         }
@@ -267,7 +271,7 @@ async def connect_host(host_name: str, backend: str | None = None) -> str:
     """连接到指定的 SSH 主机节点。
 
     Args:
-        host_name: 目标主机名
+        host_name: 目标主机名（短标识，如 tce-m7；可用 list_hosts 查看完整列表）
         backend: 可选终端后端，支持 tmux / broker；不传则使用服务默认值
     """
     async with async_session_factory() as session:
