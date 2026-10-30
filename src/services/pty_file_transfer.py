@@ -38,6 +38,8 @@ import gzip
 import hashlib
 import logging
 import re
+import secrets
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -119,6 +121,9 @@ class TransferProgress:
     compressed: bool = False       # 是否启用了 gzip 压缩传输
     original_bytes: int = 0        # 原始文件大小（未压缩）
     compressed_bytes: int = 0      # 压缩后大小（0 表示未压缩）
+    # ★ 透明分片信息（大文件分片传输时使用）
+    part_index: int = 0            # 当前分片索引（0-based），单片传输为 0
+    total_parts: int = 0           # 总分片数，单片传输为 0
 
     @property
     def percentage(self) -> float:
@@ -303,6 +308,8 @@ _SPEEDUP_THRESHOLD = 20        # 连续成功 20 个 chunk 后尝试减半（大
 # 压缩后 <= 10MB 即可通过 PTY 传输。
 _MAX_RECOMMENDED_SIZE = 10 * 1024 * 1024  # 10MB：压缩后传输推荐上限（软警告）
 _MAX_RAW_SIZE = 50 * 1024 * 1024          # 50MB：原始大小绝对上限
+_MAX_TRANSFER_SIZE = 10 * 1024 * 1024     # 10MB：单次 PTY 传输上限（压缩后）
+_PART_SIZE = 8 * 1024 * 1024              # 8MB：透明分片单片大小（留余量，压缩后 <10MB）
 
 # ── 智能压缩参数（O2 优化）──────────────────────
 # 传输前尝试 gzip 压缩，只有压缩率 > 阈值时才使用压缩传输。
@@ -435,6 +442,18 @@ class PtyFileTransfer:
         # 确定实际传输的数据
         transfer_data = compressed_data if use_compression else file_data
         transfer_size = len(transfer_data)  # 实际要通过 PTY 传输的字节数
+
+        # ★ 透明分片：压缩后仍超过单次 PTY 上限时，自动分片 + 远端合并 ★
+        if transfer_size > _MAX_TRANSFER_SIZE:
+            return await self._upload_via_parts(
+                remote_path=remote_path,
+                file_data=file_data,
+                file_size=file_size,
+                local_md5=local_md5,
+                timeout=timeout,
+                verify=verify,
+                on_progress=on_progress,
+            )
 
         # ★ Optimization #2: 基于压缩后大小的传输推荐上限软警告
         if transfer_size > _MAX_RECOMMENDED_SIZE:
@@ -792,6 +811,148 @@ class PtyFileTransfer:
         finally:
             # ★ Bugfix #22c: 恢复 WebSocket 广播（无论传输成功/失败/超时）★
             self._session.set_ws_muted(False)
+
+    # ── 透明分片上传 ──────────────────────────────
+
+    async def _upload_via_parts(
+        self,
+        remote_path: str,
+        file_data: bytes,
+        file_size: int,
+        local_md5: str,
+        timeout: int | None,
+        verify: bool,
+        on_progress: ProgressCallback | None,
+    ) -> TransferResult:
+        """透明分片上传：把大文件切成 8MB 片，逐片上传，远端 cat 合并 + MD5 校验。"""
+        parts = [
+            file_data[i:i + _PART_SIZE]
+            for i in range(0, file_size, _PART_SIZE)
+        ]
+        total_parts = len(parts)
+        upload_id = secrets.token_hex(6)
+        part_remote_paths: list[str] = []
+        tmp_files: list[Path] = []
+        tmp_dir = Path(tempfile.gettempdir()) / "wetty-sharded"
+
+        logger.info(
+            "透明分片上传: %s (%.1fMB, %d 片)",
+            remote_path, file_size / 1024 / 1024, total_parts,
+        )
+
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            transferred_total = 0
+
+            for i, part_data in enumerate(parts):
+                # 写本地临时分片
+                tmp = tmp_dir / f"__ftpart_{i}_{upload_id}.bin"
+                tmp.write_bytes(part_data)
+                tmp_files.append(tmp)
+
+                part_remote = f"/tmp/__ftpart_{i}_{upload_id}.bin"
+                part_remote_paths.append(part_remote)
+
+                # 单片进度包装：累积整体字节进度 + 标记分片信息
+                def _part_progress(p: TransferProgress, _i: int = i, _base: int = transferred_total) -> None:
+                    if on_progress:
+                        on_progress(TransferProgress(
+                            state=p.state,
+                            total_bytes=file_size,
+                            transferred_bytes=_base + p.transferred_bytes,
+                            chunks_sent=p.chunks_sent,
+                            chunks_total=p.chunks_total,
+                            sub_step=p.sub_step,
+                            compressed=p.compressed,
+                            original_bytes=p.original_bytes,
+                            compressed_bytes=p.compressed_bytes,
+                            part_index=_i,
+                            total_parts=total_parts,
+                        ))
+
+                # 单片上传（verify=False，整文件校验在合并后统一做）
+                result = await self.upload(
+                    local_path=str(tmp),
+                    remote_path=part_remote,
+                    timeout=timeout,
+                    verify=False,
+                    on_progress=_part_progress,
+                )
+                if not result.success:
+                    return TransferResult(
+                        success=False, remote_path=remote_path,
+                        file_size=file_size, md5=local_md5,
+                        message=f"分片 {i + 1}/{total_parts} 上传失败: {result.message}",
+                        state=TransferState.FAILED,
+                    )
+
+                transferred_total += len(part_data)
+
+            # 静默 WebSocket（合并/校验/清理命令不显示到浏览器终端）
+            self._session.set_ws_muted(True)
+
+            # 远端合并
+            merge_timeout = max(15.0, _compute_timeout(file_size, timeout) * 0.3)
+            cat_cmd = "cat " + " ".join(part_remote_paths) + f" > '{remote_path}'"
+            await self._session.send_command(cat_cmd, timeout=merge_timeout)
+
+            # 校验整文件 MD5
+            if verify:
+                if on_progress:
+                    on_progress(TransferProgress(
+                        state=TransferState.VERIFYING,
+                        total_bytes=file_size,
+                        transferred_bytes=file_size,
+                        sub_step="checksumming",
+                        part_index=total_parts - 1,
+                        total_parts=total_parts,
+                    ))
+                remote_md5 = await self._verify_checksum(
+                    remote_path, _compute_timeout(file_size, timeout)
+                )
+                if remote_md5 and remote_md5 != local_md5 and remote_md5 != "unavailable":
+                    return TransferResult(
+                        success=False, remote_path=remote_path,
+                        file_size=file_size, md5=local_md5,
+                        message=f"MD5 校验失败: local={local_md5}, remote={remote_md5}",
+                        state=TransferState.FAILED,
+                    )
+
+            # 清理远端分片（失败不影响主流程）
+            rm_cmd = "rm -f " + " ".join(part_remote_paths)
+            try:
+                await self._session.send_command(rm_cmd, timeout=30.0)
+            except Exception:
+                logger.warning("清理远端分片失败（不影响主流程）: %s", rm_cmd)
+
+            logger.info(
+                "透明分片上传完成: %s (%.1fMB, %d 片, md5=%s)",
+                remote_path, file_size / 1024 / 1024, total_parts, local_md5,
+            )
+
+            return TransferResult(
+                success=True, remote_path=remote_path,
+                file_size=file_size, md5=local_md5,
+                message=f"上传成功(分片 {total_parts} 片): {file_size} 字节, MD5={local_md5}",
+            )
+        except TimeoutError as e:
+            return TransferResult(
+                success=False, remote_path=remote_path,
+                file_size=file_size, md5=local_md5,
+                message=f"分片上传超时: {e}",
+                state=TransferState.FAILED,
+            )
+        except ConnectionError as e:
+            return TransferResult(
+                success=False, remote_path=remote_path,
+                file_size=file_size, md5=local_md5,
+                message=f"分片上传连接异常: {e}",
+                state=TransferState.FAILED,
+            )
+        finally:
+            self._session.set_ws_muted(False)
+            for tmp in tmp_files:
+                tmp.unlink(missing_ok=True)
 
     # ── 远端环境探测 ──────────────────────────────
 

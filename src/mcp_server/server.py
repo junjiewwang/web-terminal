@@ -20,6 +20,7 @@ PTY 模式工具：
 
 from __future__ import annotations
 
+import base64
 import contextvars
 import json
 import logging
@@ -37,7 +38,7 @@ from src.models.host import Host, HostResponse
 from src.services.event_service import AgentEvent, EventType, event_bus
 from src.services.host_manager import HostManager
 from src.services.jump_orchestrator import ConnectionOrchestrator
-from src.services.pty_file_transfer import PtyFileTransfer, TransferResult
+from src.services.pty_file_transfer import PtyFileTransfer, TransferResult, _MAX_RAW_SIZE
 from src.services.snippet_registry import SnippetRegistry
 from src.services.terminal_manager import TerminalManager
 from src.services.tmux_manager import TmuxWindowManager
@@ -816,31 +817,40 @@ async def _ensure_ft_snippet_loaded(session: "TerminalSession") -> str | None:
 @mcp.tool()
 async def upload_file(
     session_id: str,
-    local_path: str,
     remote_path: str,
+    local_path: str | None = None,
+    content_base64: str | None = None,
     timeout: int | None = None,
     verify: bool = True,
 ) -> str:
-    """上传本地文件到远端节点
+    """上传文件到远端节点
 
     通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
     文件通过 base64 编码分块传输，自动进行 MD5 完整性校验。
+
+    三种模式（按优先级）：
+    1. content_base64：文件内容 base64 编码，直接解码上传（适合小文件，全程无 HTTP）
+    2. local_path：容器内已有文件路径，上传该文件
+    3. 两者都不提供：返回 HTTP 上传端点（适合大文件，用 multipart 上传）
 
     前提条件：终端会话已连接到目标节点。
 
     性能参考：
     - 传输速率约 50-200 KB/s
     - 推荐文件大小 ≤ 10MB，超过 10MB 建议使用其他方式传输
+    - content_base64 直传受服务端请求体上限（约 1MB）限制，仅适合 ≤~750KB 的小文件；
+      更大的文件请用 local_path 或返回的 HTTP 上传端点
 
     Args:
         session_id: 终端会话 ID（由 connect_host 返回）
-        local_path: 本地文件路径
         remote_path: 远端目标路径（如 /tmp/app.tar.gz）
+        local_path: 容器内本地文件路径（可选）
+        content_base64: 文件内容的 base64 编码（可选，适合 ≤~750KB 的小文件）
         timeout: 超时秒数（不传则根据文件大小自动计算）
         verify: 传输后是否 MD5 校验（默认 True）
 
     Returns:
-        传输结果（包含文件大小、MD5 等信息）
+        传输结果；未提供文件来源时返回 HTTP 上传端点说明
     """
     session = _get_session(session_id)
     if not session:
@@ -853,17 +863,64 @@ async def upload_file(
     if load_err:
         return load_err
 
+    # 模式 3：未提供文件来源，返回一次性上传 token + 完整 curl 指令（大文件兜底）
+    if content_base64 is None and not local_path:
+        from src.api.file_transfer import _register_upload_token
+
+        upload_token = _register_upload_token(session_id, remote_path)
+        upload_url = f"{_get_download_base_url()}/api/terminal/{session_id}/upload?token={upload_token}"
+        filename = Path(remote_path).name or "upload.bin"
+        return (
+            f"未提供文件内容（content_base64 或 local_path 至少提供其一）。\n\n"
+            f"大文件请在客户端执行以下命令（文件从本地磁盘直发，不消耗 token）:\n\n"
+            f"curl -X POST '{upload_url}' \\\n"
+            f"  -F 'file=@/path/to/{filename}' \\\n"
+            f"  -F 'remote_path={remote_path}'\n\n"
+            f"说明：上传 token 一次性有效（120 秒），已绑定本会话和远端路径 {remote_path}。\n"
+            f"小文件（≤750KB）建议直接用 content_base64 参数，一次调用完成。"
+        )
+
+    # 模式 1：content_base64 直传（小文件）
+    tmp_file: Path | None = None
+    if content_base64 is not None:
+        try:
+            cleaned = "".join(content_base64.split())
+            file_data = base64.b64decode(cleaned, validate=True)
+        except Exception as e:
+            return f"错误：content_base64 不是有效的 base64 编码：{e}"
+        if not file_data:
+            return "错误：content_base64 解码后为空"
+
+        if len(file_data) > _MAX_RAW_SIZE:
+            return (
+                f"错误：文件大小 {len(file_data) / 1024 / 1024:.1f}MB 超过绝对上限 "
+                f"{_MAX_RAW_SIZE / 1024 / 1024:.0f}MB，建议用 HTTP 上传端点或 SCP/SFTP"
+            )
+
+        filename = Path(remote_path).name or "upload.bin"
+        tmp_file = Path("/app/data") / f"upload_{session_id}_{filename}"
+        try:
+            tmp_file.write_bytes(file_data)
+        except OSError as e:
+            return f"错误：写入临时文件失败：{e}"
+        local_path = str(tmp_file)
+
+    # 模式 1/2：PTY 上传（local_path 指向容器内文件或临时文件）
     await _publish_event("command_start", session_id, session.instance_name, {
         "command": f"[upload] {local_path} → {remote_path}",
     })
 
     transfer = PtyFileTransfer(session)
-    result: TransferResult = await transfer.upload(
-        local_path=local_path,
-        remote_path=remote_path,
-        timeout=timeout,
-        verify=verify,
-    )
+    try:
+        result: TransferResult = await transfer.upload(
+            local_path=local_path,
+            remote_path=remote_path,
+            timeout=timeout,
+            verify=verify,
+        )
+    finally:
+        if tmp_file is not None:
+            tmp_file.unlink(missing_ok=True)
 
     event_type = "command_complete" if result.success else "command_error"
     await _publish_event(event_type, session_id, session.instance_name, {

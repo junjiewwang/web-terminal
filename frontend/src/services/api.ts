@@ -969,6 +969,9 @@ export interface PtyTransferProgress {
   original_bytes: number; // 原始文件大小（未压缩）
   compressed_bytes: number; // 压缩后大小（0 表示未压缩）
   compression_ratio: number; // 压缩率百分比（如 62.5 = 节省 62.5%）
+  // ★ 透明分片信息（单片传输时为 0）
+  part_index?: number;    // 当前分片索引（0-based）
+  total_parts?: number;   // 总分片数（0 表示未分片）
 }
 
 /** PTY 传输进度回调 */

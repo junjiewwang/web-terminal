@@ -109,6 +109,7 @@ async def upload_file(
         default="",
         description="远端目标路径（为空时使用 /tmp/<filename>）",
     ),
+    token: str = Query(default="", description="一次性上传 token（可选，来自 MCP 工具返回）"),
 ):
     """接收浏览器上传的文件，通过 PTY 通道传输到远端节点。
 
@@ -122,6 +123,29 @@ async def upload_file(
 
     取消机制：前端 abort fetch 或调用 cancel API → 后端 cancel task + Ctrl+C PTY。
     """
+    # 一次性上传 token 认证（可选）：带 token 时，验证绑定关系并一次性使用
+    if token:
+        entry = _upload_tokens.pop(token, None)
+        if not entry:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="上传 token 无效或已过期",
+            )
+        tok_session_id, tok_remote_path, expires_at = entry
+        if time.time() > expires_at:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="上传 token 已过期",
+            )
+        if tok_session_id != session_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="上传 token 与会话不匹配",
+            )
+        # token 预填的 remote_path 优先（请求未显式传时）
+        if not remote_path and tok_remote_path:
+            remote_path = tok_remote_path
+
     mgr = _get_terminal_manager()
 
     # 查找会话
@@ -146,30 +170,8 @@ async def upload_file(
             ),
         )
 
-    # 阈值2：评估压缩后传输大小
-    # 如果原始大小已 <= 传输上限，直接放行
-    # 如果原始大小 > 传输上限，尝试 gzip 压缩，压缩后 <= 传输上限则放行
-    if len(content) > _MAX_TRANSFER_SIZE:
-        try:
-            compressed = gzip.compress(content, compresslevel=_GZIP_COMPRESS_LEVEL)
-            compressed_size = len(compressed)
-        except Exception:
-            compressed_size = len(content)  # 压缩失败，用原始大小评估
-
-        if compressed_size > _MAX_TRANSFER_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=(
-                    f"文件大小 {len(content) / 1024 / 1024:.1f}MB，"
-                    f"压缩后 {compressed_size / 1024 / 1024:.1f}MB，"
-                    f"仍超过传输上限 {_MAX_TRANSFER_SIZE / 1024 / 1024:.0f}MB。"
-                    f"建议使用 SCP/SFTP 传输大文件。"
-                ),
-            )
-        logger.info(
-            "文件大小 %.1fMB 超过传输上限但压缩后 %.1fMB 可接受，允许上传",
-            len(content) / 1024 / 1024, compressed_size / 1024 / 1024,
-        )
+    # 说明：压缩后大小超限（>10MB）时，由 PtyFileTransfer 内部透明分片处理，
+    # 此处不再拒绝，仅保留原始大小绝对上限（50MB）。
 
     if not content:
         raise HTTPException(
@@ -250,6 +252,9 @@ async def upload_file(
                 "original_bytes": p.original_bytes,
                 "compressed_bytes": p.compressed_bytes,
                 "compression_ratio": round(p.compression_ratio, 1),
+                # ★ 透明分片信息（单片传输时为 0）
+                "part_index": p.part_index,
+                "total_parts": p.total_parts,
             }
             return f"event: progress\ndata: {json.dumps(event_data)}\n\n"
 
@@ -408,6 +413,25 @@ def _register_download_token(file_path: Path, filename: str) -> str:
         p, _, _ = _download_tokens.pop(k)
         if p.exists():
             p.unlink()
+    return token
+
+
+# ── 一次性上传 token ─────────────────────────────
+
+# 一次性上传 token 注册表：token → (session_id, remote_path, expires_at)
+_upload_tokens: dict[str, tuple[str, str, float]] = {}
+_UPLOAD_TOKEN_TTL = 120  # token 有效期 120 秒
+
+
+def _register_upload_token(session_id: str, remote_path: str) -> str:
+    """注册一次性上传 token，绑定 session_id + remote_path，返回 token。"""
+    token = secrets.token_urlsafe(16)
+    _upload_tokens[token] = (session_id, remote_path, time.time() + _UPLOAD_TOKEN_TTL)
+    # 清理过期 token
+    now = time.time()
+    expired = [k for k, (_, _, exp) in _upload_tokens.items() if exp < now]
+    for k in expired:
+        _upload_tokens.pop(k)
     return token
 
 

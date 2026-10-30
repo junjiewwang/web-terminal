@@ -379,6 +379,10 @@ async def auth_middleware(request: Request, call_next):
     if not path.startswith("/api/") and not path.startswith("/mcp/"):
         return await call_next(request)
 
+    # 带一次性上传 token 的上传请求，免 Bearer Token（token 在端点内验证）
+    if path.startswith("/api/terminal/") and path.endswith("/upload") and "token" in request.query_params:
+        return await call_next(request)
+
     # 检查 Bearer Token
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):

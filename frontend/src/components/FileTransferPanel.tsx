@@ -66,6 +66,10 @@ interface UploadProgressInfo {
   compressedBytes: number;
   /** 压缩率百分比（如 62.5 = 节省 62.5%） */
   compressionRatio: number;
+  /** ★ 透明分片：当前分片索引（0-based，0 表示未分片） */
+  partIndex: number;
+  /** ★ 透明分片：总分片数（0 表示未分片） */
+  totalParts: number;
 }
 
 interface TransferRecord {
@@ -305,6 +309,8 @@ export default function FileTransferPanel({
       originalBytes: 0,
       compressedBytes: 0,
       compressionRatio: 0,
+      partIndex: 0,
+      totalParts: 0,
     });
     dismissToast();
     speedSampleRef.current = { time: now, loaded: 0 };
@@ -357,6 +363,8 @@ export default function FileTransferPanel({
               originalBytes: progress.original_bytes ?? 0,
               compressedBytes: progress.compressed_bytes ?? 0,
               compressionRatio: progress.compression_ratio ?? 0,
+              partIndex: progress.part_index ?? 0,
+              totalParts: progress.total_parts ?? 0,
             };
           });
         },
@@ -684,7 +692,7 @@ export default function FileTransferPanel({
           message={
             <div className="space-y-1.5">
               <p>文件大小 {formatSize(pendingLargeFile.size)} 超过推荐上限 {formatSize(SOFT_WARN_SIZE)}。</p>
-              <p>若文件可压缩（文本/日志等），后端会先 gzip 再传输；压缩后仍超限则上传会被拒绝。</p>
+              <p>后端会自动压缩或分片传输，无需担心；最大支持 {formatSize(MAX_RAW_SIZE)}。</p>
             </div>
           }
           confirmText="继续上传"
@@ -972,6 +980,11 @@ function _UploadProgress({
         {info.compressed && (
           <span className="ml-1.5 text-emerald-500/80" title={`gzip: ${formatSize(info.originalBytes)} → ${formatSize(info.compressedBytes)}`}>
             🗜️ -{info.compressionRatio.toFixed(0)}%
+          </span>
+        )}
+        {info.totalParts > 1 && (
+          <span className="ml-1.5 text-amber-500/80">
+            分片 {info.partIndex + 1}/{info.totalParts}
           </span>
         )}
       </div>
