@@ -59,6 +59,18 @@ _MAX_RAW_SIZE = 50 * 1024 * 1024       # 50MB：原始文件绝对上限
 _MAX_TRANSFER_SIZE = 10 * 1024 * 1024  # 10MB：压缩后传输大小上限
 _GZIP_COMPRESS_LEVEL = 6               # gzip 压缩级别（与 pty_file_transfer 一致）
 
+
+def resolve_upload_target(cwd: str, filename: str) -> str:
+    """解析上传目标路径（纯函数、无 IO、可单测）。
+
+    健壮性：
+    - filename 取 basename，防御路径穿越（如 ../../etc/passwd）
+    - cwd 规范化（去首尾空白、去尾斜杠），空则回退根目录
+    """
+    safe_name = (Path(filename).name if filename else "") or "uploaded_file"
+    base = (cwd or "").strip().rstrip("/")
+    return f"{base}/{safe_name}" if base else f"/{safe_name}"
+
 # 活跃上传任务注册表：session_id → asyncio.Task
 # 用于取消 API 查找并 cancel 正在进行的上传
 _active_uploads: dict[str, asyncio.Task] = {}
@@ -179,10 +191,17 @@ async def upload_file(
             detail="上传文件为空",
         )
 
-    # 确定远端路径
+    # 确定远端路径：remote_path 留空时自动落到终端当前目录（失败回退 /tmp/）
     filename = file.filename or "uploaded_file"
+    target_source = "explicit"
     if not remote_path.strip():
-        remote_path = f"/tmp/{filename}"
+        cwd = await session.get_cwd()
+        if cwd:
+            target_source = "cwd"
+            remote_path = resolve_upload_target(cwd, filename)
+        else:
+            target_source = "fallback"
+            remote_path = resolve_upload_target("/tmp", filename)
 
     # 保存到临时文件
     temp_file = _TEMP_DIR / f"{session_id}_{filename}"
@@ -280,9 +299,31 @@ async def upload_file(
 
             # 获取最终结果
             result = await upload_task
+
+            # 向终端屏幕回显上传结果（不经过 PTY、不写远端；realign 已在传输 finally 中完成）
+            try:
+                session.broadcast_transfer_result(
+                    success=result.success,
+                    filename=filename,
+                    remote_path=result.remote_path,
+                    target_source=target_source,
+                    detail=result.message if not result.success else "",
+                )
+            except Exception:
+                logger.debug("回显上传结果失败（忽略）", exc_info=True)
+
+            # 成功后向 PTY 发空回车，触发 shell 重打提示符（muted 期间提示符被丢弃，
+            # 用户无需手动回车即可继续输入）
+            if result.success:
+                try:
+                    await session.send_input("\r")
+                except Exception:
+                    logger.debug("触发提示符失败（忽略）", exc_info=True)
+
             result_data = {
                 "success": result.success,
                 "remote_path": result.remote_path,
+                "target_source": target_source,
                 "file_size": result.file_size,
                 "md5": result.md5,
                 "message": result.message,

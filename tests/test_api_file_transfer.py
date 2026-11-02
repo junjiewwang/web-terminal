@@ -28,6 +28,7 @@ from src.api.file_transfer import (
     _cleanup_temp_file,
     _interrupt_pty,
     _register_download_token,
+    resolve_upload_target,
 )
 
 
@@ -46,6 +47,7 @@ def make_session(running: bool = True) -> SimpleNamespace:
         session_id="s1",
         running=running,
         send_input=AsyncMock(),
+        get_cwd=AsyncMock(return_value=None),  # 默认无 cwd → fallback /tmp/
     )
 
 
@@ -449,3 +451,115 @@ class TestSizeConstants:
     def test_temp_dir_exists(self):
         assert ft._TEMP_DIR.exists()
         assert ft._TEMP_DIR.is_dir()
+
+
+# ══════════════════════════════════════════════
+# resolve_upload_target 纯函数（上传落当前目录）
+# ══════════════════════════════════════════════
+
+
+class TestResolveUploadTarget:
+    def test_normal_join(self):
+        assert resolve_upload_target("/root/work", "app.sh") == "/root/work/app.sh"
+
+    def test_trailing_slash_cwd(self):
+        assert resolve_upload_target("/root/work/", "app.sh") == "/root/work/app.sh"
+
+    def test_empty_cwd_falls_back_to_root(self):
+        assert resolve_upload_target("", "app.sh") == "/app.sh"
+        assert resolve_upload_target("   ", "app.sh") == "/app.sh"
+
+    def test_none_cwd_falls_back_to_root(self):
+        assert resolve_upload_target(None, "app.sh") == "/app.sh"
+
+    def test_path_traversal_reduced_to_basename(self):
+        assert (
+            resolve_upload_target("/root/work", "../../etc/passwd")
+            == "/root/work/passwd"
+        )
+
+    def test_absolute_path_filename_reduced_to_basename(self):
+        assert resolve_upload_target("/root/work", "/tmp/x/y.sh") == "/root/work/y.sh"
+
+    def test_empty_filename_uses_default(self):
+        assert resolve_upload_target("/root/work", "") == "/root/work/uploaded_file"
+        assert resolve_upload_target("/root/work", None) == "/root/work/uploaded_file"
+
+
+# ══════════════════════════════════════════════
+# TerminalSession.get_cwd（mock 单测，duck-typing）
+# ══════════════════════════════════════════════
+
+
+class _FakeSessionForCwd:
+    def __init__(self, out=None, error=None):
+        self.out = out
+        self.error = error
+        self.muted: list[bool] = []
+
+    def set_ws_muted(self, muted: bool):
+        self.muted.append(muted)
+
+    async def send_command(self, command, wait_pattern=None, timeout=None):
+        if self.error:
+            raise self.error
+        return self.out
+
+
+class TestGetCwd:
+    @pytest.mark.asyncio
+    async def test_extracts_cwd_from_marker(self):
+        from src.services.terminal_manager import TerminalSession
+
+        s = _FakeSessionForCwd(out="...__CWD__/root/work__CWD__...")
+        assert await TerminalSession.get_cwd(s) == "/root/work"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_marker_absent(self):
+        from src.services.terminal_manager import TerminalSession
+
+        s = _FakeSessionForCwd(out="no marker here")
+        assert await TerminalSession.get_cwd(s) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_timeout(self):
+        from src.services.terminal_manager import TerminalSession
+
+        s = _FakeSessionForCwd(error=asyncio.TimeoutError())
+        assert await TerminalSession.get_cwd(s) is None
+
+    @pytest.mark.asyncio
+    async def test_mutes_ws_during_probe(self):
+        from src.services.terminal_manager import TerminalSession
+
+        s = _FakeSessionForCwd(out="__CWD__/x__CWD__")
+        await TerminalSession.get_cwd(s)
+        assert s.muted == [True, False], "探测期间应静默，结束后恢复"
+
+
+# ══════════════════════════════════════════════
+# 上传端点：remote_path 空 → 落到当前目录（编排验证）
+# ══════════════════════════════════════════════
+
+
+class TestUploadToCwd:
+    def test_blank_remote_path_calls_get_cwd(self, client, session, monkeypatch):
+        _stub_streaming(monkeypatch)
+        session.get_cwd.return_value = "/root/work"
+
+        resp = client.post("/api/terminal/s1/upload", files={"file": ("a.sh", b"x")})
+
+        assert resp.status_code == 200
+        session.get_cwd.assert_awaited_once()
+
+    def test_explicit_remote_path_skips_get_cwd(self, client, session, monkeypatch):
+        _stub_streaming(monkeypatch)
+
+        resp = client.post(
+            "/api/terminal/s1/upload",
+            files={"file": ("a.sh", b"x")},
+            data={"remote_path": "/opt/a.sh"},
+        )
+
+        assert resp.status_code == 200
+        session.get_cwd.assert_not_awaited()

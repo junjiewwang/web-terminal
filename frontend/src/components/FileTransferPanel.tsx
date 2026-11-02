@@ -134,7 +134,6 @@ const SOFT_WARN_SIZE = 10 * 1024 * 1024;  // 10MB: 超过此值弹确认框
 const MAX_RAW_SIZE = 50 * 1024 * 1024;    // 50MB: 原始大小绝对上限（硬拒绝）
 const MAX_HISTORY = 20;
 const TOAST_DURATION = 5000; // Toast 自动消失时间 (ms)
-const STORAGE_KEY_UPLOAD_PATH = "ft-upload-path";
 const STORAGE_KEY_DOWNLOAD_PATH = "ft-download-path";
 
 // ── 工具函数 ──────────────────────────────────
@@ -202,7 +201,6 @@ export default function FileTransferPanel({
   // ── 传输状态 ──
   const [status, setStatus] = useState<TransferStatus>("idle");
   const [progressInfo, setProgressInfo] = useState<UploadProgressInfo | null>(null);
-  const [remotePath, setRemotePath] = useState(() => readStoredPath(STORAGE_KEY_UPLOAD_PATH, "/tmp/"));
   const [downloadPath, setDownloadPath] = useState(() => readStoredPath(STORAGE_KEY_DOWNLOAD_PATH, ""));
   const [history, setHistory] = useState<TransferRecord[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -232,12 +230,6 @@ export default function FileTransferPanel({
   const dismissToast = useCallback(() => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast(null);
-  }, []);
-
-  // ── 上传路径持久化 ──
-  const updateRemotePath = useCallback((value: string) => {
-    setRemotePath(value);
-    storePathValue(STORAGE_KEY_UPLOAD_PATH, value);
   }, []);
 
   // ── 下载路径持久化 ──
@@ -315,10 +307,6 @@ export default function FileTransferPanel({
     dismissToast();
     speedSampleRef.current = { time: now, loaded: 0 };
 
-    const targetPath = remotePath.endsWith("/")
-      ? remotePath + file.name
-      : remotePath;
-
     abortRef.current = new AbortController();
 
     try {
@@ -331,10 +319,11 @@ export default function FileTransferPanel({
         speed: 0,
       } : prev);
 
+      // 不传 remote_path：后端自动落到终端当前目录（cwd）
       const result: FileUploadResponse = await uploadFile(
         sessionId,
         file,
-        targetPath,
+        undefined,
         (progress: PtyTransferProgress) => {
           const nowMs = Date.now();
           const sample = speedSampleRef.current;
@@ -374,7 +363,11 @@ export default function FileTransferPanel({
       if (result.success) {
         setStatus("success");
         const elapsed = formatElapsed(Date.now() - now);
-        showToast("success", `上传成功: ${file.name} → ${result.remote_path}（${formatSize(result.file_size)}，${elapsed}）`);
+        const sizeText = `${formatSize(result.file_size)}，${elapsed}`;
+        const toastMsg = result.target_source === "fallback"
+          ? `未获取到当前目录，已上传到 ${result.remote_path}（${sizeText}）`
+          : `上传成功: ${file.name} → ${result.remote_path}（${sizeText}）`;
+        showToast("success", toastMsg);
         addHistory({
           type: "upload",
           filename: file.name,
@@ -389,7 +382,7 @@ export default function FileTransferPanel({
         addHistory({
           type: "upload",
           filename: file.name,
-          remotePath: targetPath,
+          remotePath: result.remote_path || "",
           size: file.size,
           status: "error",
           message: result.message,
@@ -402,7 +395,7 @@ export default function FileTransferPanel({
       addHistory({
         type: "upload",
         filename: file.name,
-        remotePath: targetPath,
+        remotePath: "",
         size: file.size,
         status: "error",
         message: msg,
@@ -561,16 +554,14 @@ export default function FileTransferPanel({
   // ── 历史记录点击：按类型填充路径并跳转对应 Tab ──
   const fillFromHistory = useCallback((record: TransferRecord) => {
     if (record.type === "upload") {
-      // 上传记录 → 填充上传目标路径（取目录部分）
-      const dir = record.remotePath.replace(/\/[^/]*$/, "/");
-      updateRemotePath(dir);
+      // 上传记录 → 只跳转到上传 Tab（路径自动落到当前目录）
       setActiveTab("upload");
     } else {
       // 下载记录 → 填充下载文件路径
       updateDownloadPath(record.remotePath);
       setActiveTab("download");
     }
-  }, [updateRemotePath, updateDownloadPath]);
+  }, [updateDownloadPath]);
 
   if (!visible) return null;
 
@@ -626,8 +617,6 @@ export default function FileTransferPanel({
       <div className="flex-1 min-h-0 overflow-y-auto">
         {activeTab === "upload" && (
           <_UploadTab
-            remotePath={remotePath}
-            onRemotePathChange={updateRemotePath}
             dragOver={dragOver}
             status={status}
             progressInfo={progressInfo}
@@ -752,8 +741,6 @@ function _TabButton({
 // ── 上传 Tab ──────────────────────────────────
 
 function _UploadTab({
-  remotePath,
-  onRemotePathChange,
   dragOver,
   status,
   progressInfo,
@@ -765,8 +752,6 @@ function _UploadTab({
   onFileSelect,
   onCancel,
 }: {
-  remotePath: string;
-  onRemotePathChange: (v: string) => void;
   dragOver: boolean;
   status: TransferStatus;
   progressInfo: UploadProgressInfo | null;
@@ -780,16 +765,11 @@ function _UploadTab({
 }) {
   return (
     <div className="p-3 flex flex-col gap-2.5 h-full">
-      {/* 远端路径输入 */}
-      <div className="flex items-center gap-2">
-        <label className="text-[11px] text-gray-500 shrink-0 w-16">目标路径</label>
-        <input
-          type="text"
-          value={remotePath}
-          onChange={(e) => onRemotePathChange(e.target.value)}
-          placeholder="/tmp/"
-          className="flex-1 bg-white/5 border border-white/8 rounded-md px-2.5 py-1.5 text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20 min-w-0 transition-colors"
-        />
+      {/* 上传目标说明：自动落到终端当前目录 */}
+      <div className="flex items-center gap-2 rounded-md border border-white/8 bg-white/[0.03] px-2.5 py-1.5">
+        <span className="shrink-0 text-[11px] text-gray-500">上传到</span>
+        <span className="text-[11px] text-emerald-400/80">终端当前目录</span>
+        <span className="ml-auto text-[11px] text-gray-600">上传后提示最终路径</span>
       </div>
 
       {/* 拖拽上传区 + 进度区 */}

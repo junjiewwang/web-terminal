@@ -953,6 +953,8 @@ export interface FileUploadResponse {
   file_size: number;
   md5: string;
   message: string;
+  /** 目标路径来源：cwd（当前目录）/ fallback（回退 /tmp）/ explicit（显式指定） */
+  target_source?: string;
 }
 
 /** PTY 传输进度事件（SSE 推送） */

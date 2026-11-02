@@ -867,6 +867,32 @@ class TerminalSession:
         """
         self._broadcast_output("\r\n")
 
+    def broadcast_transfer_result(
+        self,
+        *,
+        success: bool,
+        filename: str,
+        remote_path: str,
+        target_source: str = "cwd",
+        detail: str = "",
+    ) -> None:
+        """向终端屏幕回显文件传输结果（不经过 PTY、不写远端终端）。
+
+        用于上传完成后在终端画面显示「xx 成功 → /path」等结果，写入
+        scrollback 可回看。颜色区分：成功绿 / 回退黄 / 失败红。
+
+        调用前提：必须在 broadcast_realign() 之后（先对齐光标再回显）。
+        """
+        if success:
+            if target_source == "fallback":
+                line = f"\r\n\x1b[33m[上传] {filename}：未获取到当前目录，已上传到 {remote_path}\x1b[0m\r\n"
+            else:
+                line = f"\r\n\x1b[32m[上传] {filename} 成功 → {remote_path}\x1b[0m\r\n"
+        else:
+            line = f"\r\n\x1b[31m[上传] {filename} 失败: {detail or '传输异常'}\x1b[0m\r\n"
+        self._append_scrollback(line.encode())
+        self._broadcast_output(line)
+
     @staticmethod
     async def _safe_ws_send(ws: WebSocket, text: str) -> None:
         """安全发送 WebSocket output 消息（忽略发送错误）"""
@@ -1138,6 +1164,29 @@ class TerminalSession:
         await asyncio.sleep(0.3)
 
         return await self.wait_for(wait_pattern, timeout=timeout, _start_pos=pre_pos)
+
+    async def get_cwd(self) -> str | None:
+        """获取远端当前工作目录。失败返回 None（由调用方回退）。
+
+        静默执行（muted），pwd 命令回显不广播到浏览器终端。
+        拆分 marker（__C''WD__）避免 wait_for 自匹配命令回显（Bugfix #25）。
+        """
+        import re
+
+        self.set_ws_muted(True)
+        try:
+            out = await self.send_command(
+                'printf \'__C\'\'WD__\'"%s"\'__C\'\'WD__\' "$(pwd)"',
+                wait_pattern=r"__CWD__.*__CWD__",
+                timeout=10.0,
+            )
+        except (TimeoutError, ConnectionError):
+            return None
+        finally:
+            self.set_ws_muted(False)
+
+        m = re.search(r"__CWD__(.*?)__CWD__", out)
+        return m.group(1).strip() if m else None
 
     def read_screen(self, lines: int = 50) -> str:
         """读取终端屏幕缓冲区（Agent 使用）"""
