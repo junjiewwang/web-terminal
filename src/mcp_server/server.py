@@ -853,34 +853,35 @@ async def upload_file(
     timeout: int | None = None,
     verify: bool = True,
 ) -> str:
-    """上传文件到远端节点
+    """上传【客户端本地】的文件到远端节点。
 
-    通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
-    文件通过 base64 编码分块传输，自动进行 MD5 完整性校验。
+    文件在客户端（agent 所在机器），不在服务端。按文件大小选择方式：
 
-    三种模式（按优先级）：
-    1. content_base64：文件内容 base64 编码，直接解码上传（适合小文件，全程无 HTTP）
-    2. local_path：容器内已有文件路径，上传该文件
-    3. 两者都不提供：返回 HTTP 上传端点（适合大文件，用 multipart 上传）
+    【小文件 ≤750KB】agent 在客户端读取文件内容并 base64 编码，通过
+    content_base64 参数直接上传 —— 一次工具调用完成。
 
-    前提条件：终端会话已连接到目标节点。
+    【大文件 750KB~50MB】只传 session_id + remote_path（不传文件内容），
+    工具会返回一条完整的 curl 上传指令（含一次性 token，120 秒有效），
+    agent 在客户端执行该 curl 即可 —— 文件从客户端磁盘直发服务端，不经过
+    LLM context、不耗 token。
 
-    性能参考：
-    - 传输速率约 50-200 KB/s
-    - 推荐文件大小 ≤ 10MB，超过 10MB 建议使用其他方式传输
-    - content_base64 直传受服务端请求体上限（约 1MB）限制，仅适合 ≤~750KB 的小文件；
-      更大的文件请用 local_path 或返回的 HTTP 上传端点
+    【注意】local_path 指「服务端容器内」已有文件路径，不是客户端路径；
+    agent 的客户端文件请用上面的 content_base64 或 curl 方式，不要传
+    local_path 期望服务端读客户端文件（跨机器读不到）。
+
+    通过 PTY 通道传输，适用于多跳 SSH 场景（无需 SCP 直连），自动 MD5 校验。
+    传输速率约 50-200 KB/s；压缩后超过 10MB 的大文件服务端会自动透明分片。
 
     Args:
         session_id: 终端会话 ID（由 connect_host 返回）
         remote_path: 远端目标路径（如 /tmp/app.tar.gz）
-        local_path: 容器内本地文件路径（可选）
-        content_base64: 文件内容的 base64 编码（可选，适合 ≤~750KB 的小文件）
+        content_base64: 文件内容的 base64 编码（小文件 ≤750KB 用；客户端读取文件后编码）
+        local_path: 服务端容器内已有文件路径（可选，一般 agent 用不到）
         timeout: 超时秒数（不传则根据文件大小自动计算）
         verify: 传输后是否 MD5 校验（默认 True）
 
     Returns:
-        传输结果；未提供文件来源时返回 HTTP 上传端点说明
+        传输结果；未提供文件来源时返回 curl 上传指令（agent 在客户端执行）
     """
     session = _get_session(session_id)
     if not session:
@@ -971,22 +972,18 @@ async def download_file(
     timeout: int | None = None,
     verify: bool = True,
 ) -> str:
-    """从远端节点下载文件到本地
+    """从远端节点下载文件，返回浏览器下载链接。
 
-    通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连）。
-    文件通过 base64 编码分块接收，自动进行 MD5 完整性校验。
-    下载完成后返回浏览器下载链接，可在浏览器中打开直接下载到本地电脑。
+    通过 PTY 通道传输文件，适用于多跳 SSH 场景（无需 SCP 直连），自动 MD5 校验。
+    下载完成后返回一个 120 秒内有效的浏览器下载链接 —— 用户（或 agent 若具备
+    HTTP 下载能力）打开该链接即可把文件保存到客户端本地。
 
-    前提条件：终端会话已连接到目标节点。
-
-    性能参考：
-    - 传输速率约 50-200 KB/s
-    - 推荐文件大小 ≤ 10MB，超过 10MB 建议使用其他方式传输
+    传输速率约 50-200 KB/s。
 
     Args:
         session_id: 终端会话 ID（由 connect_host 返回）
         remote_path: 远端文件路径（如 /var/log/app.log）
-        local_path: 本地保存路径（容器内临时路径）。不传则自动生成。
+        local_path: 服务端容器内临时保存路径（可选，一般不传，自动生成）
         timeout: 超时秒数（不传则根据文件大小自动计算）
         verify: 是否 MD5 校验（默认 True）
 
