@@ -579,54 +579,63 @@ async def ensure_snippet_loaded(
         domain_id, inject_reason, "compressed" if use_compressed_inject else "heredoc",
     )
 
-    inject_confirmed = False
+    # ★ Bugfix #24: 窄终端保护 —— 注入/探测期间关闭 TTY 输出后处理（stty -opost），
+    #   防止 __SNIPPET_INJECTED__ / __PROBE_YES__ 等标记被 TTY 按列宽折行切碎
+    #   （浏览器窗口过窄时 cols 很小，标记切成两行 → wait_for 匹配不到 → 假阴性 503）。
+    from src.services.pty_width import acquire_raw_output, release_raw_output
+
+    await acquire_raw_output(session)
     try:
-        # ★ Bugfix #22c: 静默 WebSocket 广播 ★
-        # 注入期间的 PTY 输出（loader base64 回显、source 输出等）不发送到浏览器。
-        # Agent 缓冲区不受影响，wait_for 仍能检测到 __SNIPPET_INJECTED__ 标记。
-        session.set_ws_muted(True)
+        inject_confirmed = False
+        try:
+            # ★ Bugfix #22c: 静默 WebSocket 广播 ★
+            # 注入期间的 PTY 输出（loader base64 回显、source 输出等）不发送到浏览器。
+            # Agent 缓冲区不受影响，wait_for 仍能检测到 __SNIPPET_INJECTED__ 标记。
+            session.set_ws_muted(True)
 
-        # ★ Bugfix #21d: 使用 _buffer_write_seq 替代 len(_raw_buffer)
-        pre_inject_pos = session._buffer_write_seq
-        await session.send_input(loader + "\n")
-        await session.wait_for(
-            pattern=_re.escape(SnippetRegistry.INJECT_DONE),
-            timeout=15.0,
-            _start_pos=pre_inject_pos,
-        )
-        logger.info("%s snippet 注入完成", domain_id)
-        inject_confirmed = True
-    except TimeoutError:
-        logger.warning(
-            "%s snippet 注入等待确认超时，进行 post-inject 探测验证", domain_id
-        )
-    except ConnectionError as e:
-        return f"脚本注入失败: {e}"
+            # ★ Bugfix #21d: 使用 _buffer_write_seq 替代 len(_raw_buffer)
+            pre_inject_pos = session._buffer_write_seq
+            await session.send_input(loader + "\n")
+            await session.wait_for(
+                pattern=_re.escape(SnippetRegistry.INJECT_DONE),
+                timeout=15.0,
+                _start_pos=pre_inject_pos,
+            )
+            logger.info("%s snippet 注入完成", domain_id)
+            inject_confirmed = True
+        except TimeoutError:
+            logger.warning(
+                "%s snippet 注入等待确认超时，进行 post-inject 探测验证", domain_id
+            )
+        except ConnectionError as e:
+            return f"脚本注入失败: {e}"
+        finally:
+            # ★ Bugfix #22c: 恢复 WebSocket 广播（无论注入成功/失败/超时）★
+            try:
+                session.set_ws_muted(False)
+            except Exception:
+                logger.debug("恢复 WebSocket 广播失败（会话可能已断开）")
+
+        # ★ Bugfix #21b: 注入超时时，做一次快速 probe 验证
+        if not inject_confirmed and probe:
+            try:
+                verify_output = await session.send_command(
+                    command=probe,
+                    wait_pattern=r"__PROBE_(?:YES|NO)__",
+                    timeout=5.0,
+                )
+                last_line = _extract_last_nonempty_line(verify_output)
+                if SnippetRegistry.PROBE_YES in last_line:
+                    logger.info("post-inject 探测确认: %s 函数可用", domain_id)
+                    inject_confirmed = True
+                else:
+                    logger.error("post-inject 探测确认: %s 函数不可用", domain_id)
+            except (TimeoutError, ConnectionError):
+                logger.error(
+                    "post-inject 探测超时，%s snippet 可能未成功加载", domain_id
+                )
     finally:
-        # ★ Bugfix #22c: 恢复 WebSocket 广播（无论注入成功/失败/超时）★
-        try:
-            session.set_ws_muted(False)
-        except Exception:
-            logger.debug("恢复 WebSocket 广播失败（会话可能已断开）")
-
-    # ★ Bugfix #21b: 注入超时时，做一次快速 probe 验证
-    if not inject_confirmed and probe:
-        try:
-            verify_output = await session.send_command(
-                command=probe,
-                wait_pattern=r"__PROBE_(?:YES|NO)__",
-                timeout=5.0,
-            )
-            last_line = _extract_last_nonempty_line(verify_output)
-            if SnippetRegistry.PROBE_YES in last_line:
-                logger.info("post-inject 探测确认: %s 函数可用", domain_id)
-                inject_confirmed = True
-            else:
-                logger.error("post-inject 探测确认: %s 函数不可用", domain_id)
-        except (TimeoutError, ConnectionError):
-            logger.error(
-                "post-inject 探测超时，%s snippet 可能未成功加载", domain_id
-            )
+        await release_raw_output(session)
 
     if not inject_confirmed:
         return (

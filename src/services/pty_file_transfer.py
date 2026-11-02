@@ -45,6 +45,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from src.services.pty_width import acquire_raw_output, release_raw_output
+
 logger = logging.getLogger(__name__)
 
 # ★ Bugfix #23b: 清洗 base64 数据中残留的非法字符 ★
@@ -475,6 +477,9 @@ class PtyFileTransfer:
         )
 
         try:
+            # ★ Bugfix #24: 关闭输出后处理，防止协议标记被窄终端折行切碎 ★
+            await acquire_raw_output(self._session)
+
             # ★ Bugfix #22c: 静默 WebSocket 广播 ★
             # upload 期间所有 PTY 输出（ft_recv 命令回显、__FT_CHUNK__ 数据回显、
             # ACK 确认、__FT_RECV_OK__ 标记等）不发送到浏览器终端。
@@ -811,6 +816,8 @@ class PtyFileTransfer:
         finally:
             # ★ Bugfix #22c: 恢复 WebSocket 广播（无论传输成功/失败/超时）★
             self._session.set_ws_muted(False)
+            # ★ Bugfix #24: 恢复输出后处理 ★
+            await release_raw_output(self._session)
 
     # ── 透明分片上传 ──────────────────────────────
 
@@ -1014,6 +1021,9 @@ class PtyFileTransfer:
         logger.info("开始下载: %s → %s", remote_path, local_path)
 
         try:
+            # ★ Bugfix #24: 关闭输出后处理，防止协议标记被窄终端折行切碎 ★
+            await acquire_raw_output(self._session)
+
             # ★ Bugfix #22c: 静默 WebSocket 广播 ★
             # download 期间所有 PTY 输出（ft_send 命令回显、__FT_SEND_BEGIN__、
             # __FT_CHUNK__ 数据、__FT_SEND_END__ 标记等）不发送到浏览器终端。
@@ -1266,6 +1276,8 @@ class PtyFileTransfer:
         finally:
             # ★ Bugfix #22c: 恢复 WebSocket 广播 ★
             self._session.set_ws_muted(False)
+            # ★ Bugfix #24: 恢复输出后处理 ★
+            await release_raw_output(self._session)
 
     # ── 内部方法 ──────────────────────────────────
 

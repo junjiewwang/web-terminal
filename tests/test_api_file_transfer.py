@@ -163,18 +163,20 @@ class TestUploadSizeLimits:
         assert resp.status_code != 413, "可压缩的大文件不应被拒绝"
         assert resp.status_code == 200
 
-    def test_incompressible_large_file_rejected_413(self, client):
-        """随机数据压不动，超过传输上限应拒绝并建议 SCP。"""
+    def test_incompressible_large_file_allowed_for_sharding(self, client, monkeypatch):
+        """随机数据压不动、超过单次传输上限（10MB）—— 不再拒绝，
+        由 PtyFileTransfer 透明分片处理（服务端透明分片特性）。"""
         import os
 
         payload = os.urandom(_MAX_TRANSFER_SIZE + 2 * 1024 * 1024)
+
+        _stub_streaming(monkeypatch)
 
         resp = client.post(
             "/api/terminal/s1/upload", files={"file": ("rand.bin", payload)}
         )
 
-        assert resp.status_code == 413
-        assert "SCP" in resp.json()["detail"]
+        assert resp.status_code == 200, "不可压缩大文件应放行（由透明分片兜底）"
 
 
 def _stub_streaming(monkeypatch) -> None:
