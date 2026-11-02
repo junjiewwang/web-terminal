@@ -497,6 +497,36 @@ async def read_terminal(session_id: str, lines: int = 50) -> str:
 
 
 @mcp.tool()
+async def sync_terminal_size(session_id: str) -> str:
+    """将前端真实终端尺寸同步到当前嵌套终端（如 virsh console 的 CVM）。
+
+    前端 resize 只作用到外层 PTY；ssh 会自动传递窗口大小，但 virsh console
+    是串口、不传递尺寸，导致 CVM 里 bash 行编辑光标错乱（输入字符跳行首、
+    字符错位）。本工具读取外层 PTY 的实际尺寸，向当前终端发送
+    ``stty cols <N> rows <M>`` 穿透同步到最内层 shell。
+
+    Args:
+        session_id: 终端会话 ID（由 connect_host 返回）
+
+    Returns:
+        同步命令及说明。
+    """
+    session = _get_session(session_id)
+    if not session:
+        return f"错误：会话 {session_id} 不存在。请先用 connect_host 建立连接。"
+    if not session.running:
+        return f"错误：会话 {session_id} 已断开。请重新连接。"
+
+    cols, rows = session.effective_size()
+    cmd = f"stty cols {cols} rows {rows}"
+    await session.send_input(cmd + "\n")
+    return (
+        f"已发送终端尺寸同步命令：{cmd}\n"
+        f"（外层终端有效尺寸 {cols}×{rows}，命令穿透到最内层 shell，如 CVM console）"
+    )
+
+
+@mcp.tool()
 async def get_session_status(session_id: str | None = None) -> str:
     """查询 SSH 会话状态
 

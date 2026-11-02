@@ -18,6 +18,7 @@ import pytest
 from src.services.snippet_registry import (
     SnippetRegistry,
     ensure_snippet_loaded,
+    split_echo_marker,
 )
 
 
@@ -112,8 +113,11 @@ class TestProbeCommands:
 
         assert probe is not None
         assert "type health" in probe
-        assert SnippetRegistry.PROBE_YES in probe
-        assert SnippetRegistry.PROBE_NO in probe
+        # ★ Bugfix #25: marker 必须以拆分拼接形式出现（防止 wait_for 自匹配命令回显）
+        assert SnippetRegistry.PROBE_YES not in probe, "完整 marker 不应连续出现在命令文本中"
+        assert SnippetRegistry.PROBE_NO not in probe, "完整 marker 不应连续出现在命令文本中"
+        assert split_echo_marker(SnippetRegistry.PROBE_YES) in probe
+        assert split_echo_marker(SnippetRegistry.PROBE_NO) in probe
 
     def test_get_probe_command_unknown_domain_returns_none(self, registry, tmp_path):
         registry.load_from_yaml(_write_config(tmp_path, _basic_config()))
@@ -150,7 +154,9 @@ class TestHeredocLoader:
         assert loader is not None
         assert "base64 -d" in loader
         assert "gunzip" in loader
-        assert SnippetRegistry.INJECT_DONE in loader
+        # ★ Bugfix #25: INJECT_DONE 以拆分形式出现（防回显自匹配）
+        assert SnippetRegistry.INJECT_DONE not in loader
+        assert split_echo_marker(SnippetRegistry.INJECT_DONE) in loader
 
     def test_compressed_false_uses_heredoc(self, registry, tmp_path):
         registry.load_from_yaml(_write_config(tmp_path, _basic_config()))
@@ -160,7 +166,9 @@ class TestHeredocLoader:
         assert "cat << 'SNIPPET_EOF'" in loader
         assert "SNIPPET_EOF" in loader
         assert "source /tmp/ts-es.sh" in loader
-        assert SnippetRegistry.INJECT_DONE in loader
+        # ★ Bugfix #25: INJECT_DONE 以拆分形式出现（防回显自匹配）
+        assert SnippetRegistry.INJECT_DONE not in loader
+        assert split_echo_marker(SnippetRegistry.INJECT_DONE) in loader
 
     def test_none_when_domain_missing(self, registry, tmp_path):
         registry.load_from_yaml(_write_config(tmp_path, _basic_config()))
@@ -176,7 +184,8 @@ class TestHeredocLoader:
 
         assert loader.startswith("cat << 'SNIPPET_EOF' > /tmp/ts-es.sh\n")
         assert SAFE_SCRIPT in loader
-        assert loader.strip().endswith(f"echo '{SnippetRegistry.INJECT_DONE}'")
+        # ★ Bugfix #25: 结尾 echo 使用拆分 marker（防回显自匹配）
+        assert loader.strip().endswith(f"echo {split_echo_marker(SnippetRegistry.INJECT_DONE)}")
 
 
 # ══════════════════════════════════════════════

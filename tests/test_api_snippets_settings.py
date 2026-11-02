@@ -24,7 +24,7 @@ from src.models.database import get_db
 from src.models.host import Base
 from src.services.auth_service import AuthService
 from src.services.event_service import AgentEvent, EventBus, EventType
-from src.services.snippet_registry import SnippetRegistry
+from src.services.snippet_registry import SnippetRegistry, split_echo_marker
 
 SCRIPT = "#!/bin/bash\nes() { curl -s localhost:9200/_cat/indices; }\n"
 
@@ -136,8 +136,10 @@ class TestGetSnippetScript:
         body = snippet_client.get("/api/snippets/es/script").json()
 
         assert body["domain_id"] == "es"
-        assert SnippetRegistry.PROBE_YES in body["probe_command"]
-        assert SnippetRegistry.PROBE_NO in body["probe_command"]
+        # ★ Bugfix #25: marker 以拆分形式出现（防 wait_for 自匹配命令回显）
+        assert SnippetRegistry.PROBE_YES not in body["probe_command"]
+        assert split_echo_marker(SnippetRegistry.PROBE_YES) in body["probe_command"]
+        assert split_echo_marker(SnippetRegistry.PROBE_NO) in body["probe_command"]
         assert "/tmp/ts-es.sh" in body["heredoc_loader"]
 
     def test_loader_payload_decodes_back_to_script(self, snippet_client):

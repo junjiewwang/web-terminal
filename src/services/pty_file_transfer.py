@@ -814,10 +814,13 @@ class PtyFileTransfer:
                 state=TransferState.FAILED,
             )
         finally:
-            # ★ Bugfix #22c: 恢复 WebSocket 广播（无论传输成功/失败/超时）★
-            self._session.set_ws_muted(False)
-            # ★ Bugfix #24: 恢复输出后处理 ★
+            # ★ Bugfix #24: 先恢复输出后处理（在 muted 期间执行，
+            #   stty opost 的阶梯式回显不会广播到浏览器终端）★
             await release_raw_output(self._session)
+            # ★ Bugfix #22c: 再恢复 WebSocket 广播（无论传输成功/失败/超时）★
+            self._session.set_ws_muted(False)
+            # ★ Bugfix #26: 推送换行对齐浏览器光标与远端新提示符行 ★
+            self._session.broadcast_realign()
 
     # ── 透明分片上传 ──────────────────────────────
 
@@ -973,8 +976,9 @@ class PtyFileTransfer:
         try:
             output = await self._session.send_command(
                 command=(
+                    # ★ Bugfix #25: marker 拆分，防止回显自匹配误判「无 gunzip」
                     "{ command -v gunzip >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1; } "
-                    "&& echo '__GZ_YES__' || echo '__GZ_NO__'"
+                    "&& echo '__G''Z_YES__' || echo '__G''Z_NO__'"
                 ),
                 wait_pattern=r"__GZ_(?:YES|NO)__",
                 timeout=5.0,
@@ -1274,10 +1278,12 @@ class PtyFileTransfer:
                 state=TransferState.FAILED,
             )
         finally:
-            # ★ Bugfix #22c: 恢复 WebSocket 广播 ★
-            self._session.set_ws_muted(False)
-            # ★ Bugfix #24: 恢复输出后处理 ★
+            # ★ Bugfix #24: 先恢复输出后处理（muted 期间执行，回显不广播）★
             await release_raw_output(self._session)
+            # ★ Bugfix #22c: 再恢复 WebSocket 广播 ★
+            self._session.set_ws_muted(False)
+            # ★ Bugfix #26: 推送换行对齐浏览器光标与远端新提示符行 ★
+            self._session.broadcast_realign()
 
     # ── 内部方法 ──────────────────────────────────
 

@@ -34,6 +34,26 @@ class ScriptAuditError(ValueError):
     """脚本安全审计失败"""
 
 
+def split_echo_marker(marker: str) -> str:
+    """把 marker 拆成相邻拼接形式 '前半''后半'，防止 wait_for 自匹配命令回显。
+
+    Bugfix #25（回显自匹配）：
+    PTY 会自动回显命令文本。若命令里直接 echo 完整 marker（如
+    ``echo '__PROBE_YES__'``），回显中就含有完整 marker，且**先于**执行
+    输出出现 —— wait_for 会匹配到回显并提前返回，读到的只是回显、
+    真正的执行结果还没出来，导致「已加载被误判为未加载」「有 gunzip 被
+    误判为无 gunzip」等假阴性。
+
+    拆分后回显形如 ``echo '__PROBE_R''ESULT_YES__'``（引号隔断，不构成
+    连续 marker），而 shell 相邻字符串拼接的执行输出是完整 marker，
+    wait_for 只能匹配到真实执行输出。
+
+    供 SnippetRegistry 与 PtyFileTransfer 共用。
+    """
+    mid = len(marker) // 2
+    return f"'{marker[:mid]}''{marker[mid:]}'"
+
+
 class SnippetRegistry:
     """Snippet 核心注册表
 
@@ -328,10 +348,11 @@ class SnippetRegistry:
         if not domain or not domain.commands:
             return None
         first_cmd = domain.commands[0].id
+        # ★ Bugfix #25: marker 拆分拼接，防止 wait_for 自匹配命令回显
         return (
             f"type {first_cmd} >/dev/null 2>&1 "
-            f"&& echo '{self.PROBE_YES}' "
-            f"|| echo '{self.PROBE_NO}'"
+            f"&& echo {split_echo_marker(self.PROBE_YES)} "
+            f"|| echo {split_echo_marker(self.PROBE_NO)}"
         )
 
     def get_version_probe_command(self, domain_id: str) -> str | None:
@@ -401,10 +422,11 @@ class SnippetRegistry:
         )
 
         # 单行 echo + pipeline 命令，避免 heredoc 的多行传输开销
+        # ★ Bugfix #25: INJECT_DONE 拆分拼接，防止回显自匹配导致假阳性
         return (
             f"echo '{b64_data}' | base64 -d 2>/dev/null | "
             f"gunzip -c > /tmp/{script_name} 2>/dev/null && "
-            f"source /tmp/{script_name} && echo '{self.INJECT_DONE}'"
+            f"source /tmp/{script_name} && echo {split_echo_marker(self.INJECT_DONE)}"
         )
 
     def _build_heredoc_loader(self, content: str, script_name: str) -> str:
@@ -413,7 +435,7 @@ class SnippetRegistry:
             f"cat << 'SNIPPET_EOF' > /tmp/{script_name}\n"
             f"{content}\n"
             f"SNIPPET_EOF\n"
-            f"source /tmp/{script_name} && echo '{self.INJECT_DONE}'"
+            f"source /tmp/{script_name} && echo {split_echo_marker(self.INJECT_DONE)}"
         )
 
     # ── 安全审计 ──────────────────────────────────
@@ -506,8 +528,11 @@ async def ensure_snippet_loaded(
                 wait_pattern=r"__PROBE_(?:YES|NO)__",
                 timeout=10.0,
             )
-            last_line = _extract_last_nonempty_line(probe_output)
-            if SnippetRegistry.PROBE_YES in last_line:
+            # ★ Bugfix #25b: 全文本搜索而非最后一行 ——
+            #   wait_for 返回到 buffer 末尾，marker 之后可能已跟提示符行，
+            #   「最后一行」时序性拿到提示符 → 误判函数不存在（概率性假阴性）。
+            #   回显已被 split_echo_marker 排除，全文本只会命中真实执行输出。
+            if SnippetRegistry.PROBE_YES in probe_output:
                 # 函数存在 → 步骤 2: 检查 MD5（Optimization #1）
                 need_inject = False
                 local_md5 = registry.get_script_md5(domain_id)
@@ -557,7 +582,8 @@ async def ensure_snippet_loaded(
     use_compressed_inject = True
     try:
         gunzip_probe_output = await session.send_command(
-            command="command -v gunzip >/dev/null 2>&1 && echo '__GZ_YES__' || echo '__GZ_NO__'",
+            # ★ Bugfix #25: marker 拆分，防止回显自匹配误判「无 gunzip」
+            command="command -v gunzip >/dev/null 2>&1 && echo '__G''Z_YES__' || echo '__G''Z_NO__'",
             wait_pattern=r"__GZ_(?:YES|NO)__",
             timeout=5.0,
         )
@@ -624,8 +650,8 @@ async def ensure_snippet_loaded(
                     wait_pattern=r"__PROBE_(?:YES|NO)__",
                     timeout=5.0,
                 )
-                last_line = _extract_last_nonempty_line(verify_output)
-                if SnippetRegistry.PROBE_YES in last_line:
+                # ★ Bugfix #25b: 全文本搜索而非最后一行（同上，防提示符时序干扰）
+                if SnippetRegistry.PROBE_YES in verify_output:
                     logger.info("post-inject 探测确认: %s 函数可用", domain_id)
                     inject_confirmed = True
                 else:

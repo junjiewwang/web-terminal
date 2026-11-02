@@ -692,6 +692,24 @@ class TerminalSession:
             except OSError as e:
                 logger.debug("PTY resize 失败: %s - %s", self.session_id[:8], e)
 
+    def effective_size(self) -> tuple[int, int]:
+        """返回当前外层 PTY 的实际尺寸 (cols, rows)。
+
+        读取 PTY 内核 winsize（由前端 resize 同步设置）。用于把真实终端
+        尺寸穿透到嵌套的串口终端（如 virsh console 的 CVM），解决串口
+        不传递尺寸导致的行编辑光标错乱。
+        """
+        if self._fd is not None:
+            try:
+                buf = struct.pack("HHHH", 0, 0, 0, 0)
+                res = fcntl.ioctl(self._fd, termios.TIOCGWINSZ, buf)
+                rows, cols, _, _ = struct.unpack("HHHH", res)
+                if cols > 0 and rows > 0:
+                    return (cols, rows)
+            except OSError:
+                pass
+        return self._compute_min_size()
+
     def _compute_min_size(self) -> tuple[int, int]:
         """计算所有活跃客户端的 min(cols) × min(rows)。
 
@@ -836,6 +854,18 @@ class TerminalSession:
         notice = f"\r\n\x1b[33m[自动识别] {text}\x1b[0m\r\n"
         self._append_scrollback(notice.encode())
         self._broadcast_output(notice)
+
+    def broadcast_realign(self) -> None:
+        """向浏览器终端推送换行，使 xterm 光标与远端新提示符行对齐。
+
+        Bugfix #26（muted 传输后光标脱节）：
+        ws_muted 传输期间浏览器未收到任何输出（含传输结束后远端打印的
+        新提示符），xterm 光标停留在传输前的旧行，而远端 shell 已在新行
+        等待输入 —— 用户后续输入的 echo/行编辑重绘会错乱（光标乱跳、
+        字符看似丢失）。推送 \\r\\n 把 xterm 光标推进到新行，恢复对齐。
+        纯光标移动无内容，不写入 scrollback。
+        """
+        self._broadcast_output("\r\n")
 
     @staticmethod
     async def _safe_ws_send(ws: WebSocket, text: str) -> None:
