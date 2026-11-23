@@ -20,8 +20,14 @@
  * 1. 设计 Token（单一数据源）
  * ══════════════════════════════════════════════════════════════ */
 :root {
+  /* 声明暗色配色，让原生控件 / 滚动条 / 表单 autofill 与页面一致
+     （Vercel Web Interface Guidelines: Set the appropriate color-scheme） */
+  color-scheme: dark;
+
   /* 字号下限：可读文本不得小于 13px（评审实测有 91 处 10/12px） */
   --ui-text-min: 13px;
+  /* 移动端输入框字号：≥16px 可避免 iOS Safari 聚焦时自动缩放 */
+  --ui-input-mobile-size: 16px;
 
   /* 圆角 family：控件 / 卡片 / 大容器；徽标另用 pill */
   --ui-radius-control: 8px;
@@ -38,6 +44,8 @@
   --ui-focus: #34d399; /* 与终端光标色一致，单一 accent */
   --ui-focus-width: 2px;
   --ui-tap-min: 44px; /* 移动端最小点击目标 */
+  /* 实心 accent 背景上的文字色（由组件显式声明 .ui-on-accent 使用） */
+  --ui-on-accent: #050816;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -71,17 +79,20 @@
  *  例外：紧凑的圆形计数徽标在 16~20px 容器内放不下 13px，用
  *  `.ui-micro` 显式声明（例外必须有名字，不散落魔法数字）。
  * ══════════════════════════════════════════════════════════════ */
+/* 纯 :where() 保持特异性为 0：让后文「移动端 input 16px」等
+   更具体的规则能按源码顺序覆盖，而不会被 :not() 意外抬高特异性。 */
 :where(
     [class*="text-[9px]"],
     [class*="text-[10px]"],
     [class*="text-[11px]"],
     [class*="text-[12px]"],
     .text-xs
-  ):not(.ui-micro) {
+  ) {
   font-size: var(--ui-text-min);
 }
 
-/* 显式例外：微型圆形计数徽标（如未读数气泡） */
+/* 显式例外：微型圆形计数徽标（如未读数气泡）。
+   单类选择器特异性 (0,1,0) 高于上面的 0，因此生效。 */
 .ui-micro {
   font-size: 11px;
 }
@@ -103,49 +114,63 @@
   opacity: 1;
 }
 
-/* 主操作按钮：绿底白字实测仅 2.48:1，改用深色文字约 8:1。
-   集中覆盖而非改散落的 JSX，保证所有同色按钮一致。 */
-:where(button, a)[class*="bg-emerald-500"]:not(.ui-on-accent-keep) {
-  color: #050816;
+/* 实心 accent 按钮上的文字：仅由组件显式加 `.ui-on-accent` 声明，
+   绝不用 `[class*="bg-emerald-500"]` 之类的类名子串反查——那会把
+   /5~/25 的半透明背景（深色底上近乎黑）一并改成深色文字，造成黑底黑字。
+
+   背景 #34d399 / emerald-500 上深色文字约 8:1（白字仅 2.48:1）。 */
+:where(.ui-on-accent) {
+  color: var(--ui-on-accent);
 }
 
-/* 深色文字下，按钮内的 loading 转圈也要跟着变深色 */
-:where(button, a)[class*="bg-emerald-500"] :where([class*="border-white"]) {
+/* 同一按钮内 loading 转圈跟随深色文字 */
+:where(.ui-on-accent) :where([class*="border-white"]) {
   border-color: rgba(5, 8, 22, 0.35);
-  border-top-color: #050816;
+  border-top-color: var(--ui-on-accent);
 }
 
 /* ══════════════════════════════════════════════════════════════
- * 5. P1 — 移动端点击热区
- *  桌面端保持工具型 UI 的紧凑密度，仅在粗指针/窄屏扩展热区，
- *  用透明伪元素，不改变视觉尺寸，也不影响布局。
+ * 5. P1 — 点击热区与移动端输入
+ *
+ *  设计取舍（工具型 UI）：
+ *  本应用工具栏是 gap-1 紧排的 24~36px 图标按钮。早先给所有
+ *  button/a 无差别加 44px 伪元素热区，会让相邻热区互相重叠
+ *  （interface-design: "Never let two hit areas overlap"），反而点错。
+ *
+ *  现改为 Vercel Web Interface Guidelines 的规则：
+ *   - 视觉目标 <24px 时才扩到 ≥24px；移动端最小 44px
+ *   - 仅对「孤立控件」显式加 .ui-tap-expand，密集工具栏不自动扩
+ *   - 表单控件（天然孤立）在移动端补齐 44px 高度与 16px 字号
  * ══════════════════════════════════════════════════════════════ */
-@media (pointer: coarse), (max-width: 640px) {
-  /* 排除 skip-link：它是 absolute 定位、脱离布局流的跳转链接，
-     若被这里改成 relative 会成为 flex 首个子项，把页面内容整体推偏。 */
-  :where(button, [role="button"], a):not(.ui-tap-none):not(.skip-link) {
-    position: relative;
-  }
+:where(.ui-tap-expand) {
+  position: relative;
+}
 
-  :where(button, [role="button"], a):not(.ui-tap-none):not(.skip-link)::after {
-    content: "";
-    position: absolute;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
+:where(.ui-tap-expand)::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  min-width: max(100%, 24px);
+  min-height: max(100%, 24px);
+  pointer-events: none;
+}
+
+@media (pointer: coarse), (max-width: 640px) {
+  :where(.ui-tap-expand)::after {
     min-width: max(100%, var(--ui-tap-min));
     min-height: max(100%, var(--ui-tap-min));
-    pointer-events: none;
   }
 
-  /* 明确保证 skip-link 不被热区规则改变定位方式 */
+  /* 表单控件：44px 高度 + 16px 字号（防 iOS Safari 聚焦自动缩放） */
+  :where(input, textarea, select) {
+    min-height: var(--ui-tap-min);
+    font-size: var(--ui-input-mobile-size);
+  }
+
+  /* skip-link 始终是 absolute，不参与布局流 */
   :where(.skip-link, .ui-skip-link) { position: absolute; }
-
-  /* 全屏遮罩 / 大面板按钮不需要扩展，避免遮挡其它控件 */
-  .ui-tap-none::after { content: none; }
-
-  /* 表单控件在手机上补齐 44px 高度 */
-  :where(input, textarea, select) { min-height: var(--ui-tap-min); }
 }
 
 /* 焦点环必须瞬时可见：带 transition 的控件在键盘导航时会有淡入延迟 */

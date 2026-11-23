@@ -102,7 +102,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
           <button
             type="submit"
             disabled={loading}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-500/90 px-4 py-2.5 text-sm font-medium text-white transition-all hover:bg-emerald-500 hover:shadow-[0_8px_24px_rgba(16,185,129,0.25)] active:scale-[0.98] disabled:cursor-wait disabled:opacity-60"
+            className="ui-on-accent flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-500/90 px-4 py-2.5 text-sm font-medium text-white transition-all hover:bg-emerald-500 hover:shadow-[0_8px_24px_rgba(16,185,129,0.25)] active:scale-[0.98] disabled:cursor-wait disabled:opacity-60"
           >
             {loading ? (
               <>
