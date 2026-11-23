@@ -92,6 +92,11 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
             />
           </div>
 
+          {/* 常驻状态行：把提交中 / 错误播报给读屏用户（不干扰视觉） */}
+          <span className="sr-only" role="status" aria-live="polite">
+            {loading ? "正在登录" : error ? `登录失败：${error}` : ""}
+          </span>
+
           {/* 错误提示 */}
           {error && (
             <div
