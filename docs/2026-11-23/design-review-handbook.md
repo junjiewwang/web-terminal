@@ -63,13 +63,14 @@ node skills/taste-skill/scripts/consistency.mjs \
 | 指标 | 整改前基线 | 当前 |
 |---|---|---|
 | FAIL（违规条数） | 17 | 12 |
-| WARN（违规条数） | 11 | 9 |
-| PASS 检查项 | — | 125 |
+| WARN（违规条数） | 11 | **8** |
+| PASS 检查项 | — | 126 |
 
 > `counts.FAIL/WARN` 是**违规条数**，`checks` 字典是**检查项种类**（去重）。
 > 例如当前 4 个 FAIL 检查项对应 12 条违规。对比时两者不要混用。
 
-**已修复**：`focus-visible`、`text-contrast`（FAIL）、`tap-size`（WARN）
+**已修复**：`focus-visible`、`text-contrast`（FAIL）；
+`tap-size`、`form-fields`（WARN）
 
 ## 四、豁免表（刻意不修，不是回归）
 
@@ -83,7 +84,7 @@ node skills/taste-skill/scripts/consistency.mjs \
 | `share-meta` / `page-meta` | WARN | 分享卡片元数据；内部运维工具无分享需求 |
 | `skip-link` | WARN | checker 按启发式判断首 Tab stop；实测首焦点**就是** skip-link，误报 |
 | `focus-ring` | FAIL（2 条） | checker **静态扫描 CSS 文本**，命中 xterm.js 自带与 Tailwind 生成的 `outline:none`；补偿规则紧随其后，真实 Tab 有可见 2px 焦点环，误报 |
-| `form-fields` | WARN | 已补 `role="alert"` / `aria-busy` / `sr-only` status；复跑后若仍报属检查器启发式 |
+| ~~`form-fields`~~ | ~~WARN~~ | **已修复**：补常驻 `role="status"` 状态行后复跑 PASS |
 
 ## 五、项目内规则断言
 

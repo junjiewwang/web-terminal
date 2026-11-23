@@ -1,9 +1,10 @@
 # P2 设计治理收尾 — 记录文档
 
 - 日期：2026-11-23
-- 状态：实施中
+- 状态：**已完成并部署验证**
 - 前置：`tool-app-design-skill-research.md` 与 `accent-palette-consolidation.md` 中列为 P2 的遗留项
 - 选型：**A**（零第三方依赖、项目内自持），不执行 `npx skills add`
+- 最终提交：`95b5a34`
 
 ## 一、需求
 
@@ -63,17 +64,72 @@ hover/active/disabled 视觉与改动前一致。
 ## 四、实施进展
 
 - [x] 调研与选型确认（A）
-- [ ] 创建本记录文档（进行中）
-- [ ] P2-1 transition 收敛
-- [ ] P2-2 ARIA 播报
-- [ ] P2-3 `.interface-design/system.md`
-- [ ] P2-4 评审手册
-- [ ] e2e 整理
-- [ ] 验证 + 推送部署 + 更新文档
+- [x] 创建本记录文档
+- [x] P2-1 transition 收敛
+- [x] P2-2 ARIA 播报
+- [x] P2-3 `.interface-design/system.md`
+- [x] P2-4 评审手册
+- [x] e2e 整理
+- [x] 验证 + 推送部署 + 更新文档
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `frontend/src/components/FileTransferPanel.tsx` | 拖拽区 + 5 个进度条显式命名过渡；`aria-busy` 容器 + 状态文本 live region |
+| `frontend/src/components/SnippetPanel.tsx` | 2 处过渡收敛；`sr-only` 独立状态播报 + 错误 `role="alert"` |
+| `frontend/src/components/LoginPage.tsx` | `aria-busy`、错误 `role="alert"`、常驻 `role="status"` 状态行 |
+| `frontend/src/App.tsx` | toast 动效 500 → 300ms |
+| `.interface-design/system.md` | **新建**：项目根设计契约（skill 硬编码读此路径） |
+| `docs/2026-11-23/design-review-handbook.md` | **新建**：评审手册 + 基线 + 豁免表 + 陷阱记录 |
+| `frontend/e2e/browser.mjs` | **新建**：公共浏览器启动器，优先复用系统 Chrome |
+| `frontend/e2e/run.mjs` | **新建**：`test:e2e` 串行入口 |
+| `frontend/e2e/verify-design-rules.mjs` | **新建**：设计规则回归断言 |
+| `frontend/e2e/verify-accent-contrast.mjs` | CDP 版 → Playwright + mock 版，支持 `BASE` 线上冒烟 |
+| `frontend/package.json` | 新增 `test:e2e` script |
+
+### 关键设计决策
+
+- **`system.md` 放项目根**，不是 docs/：`interface-design` skill 硬编码读
+  `.interface-design/system.md`，文件存在时「decisions are made」直接照做。
+  内容逐条对照 `design-system.css` 真实值写，不是填模板骨架。
+- **可交互子树不整体做 live region**：`SnippetPanel` 内容区、
+  `FileTransferPanel` 拖拽区都含可点击控件，若包成 `role="status"` 会让
+  读屏把子树当状态区。改为容器仅 `aria-busy` + 独立 `sr-only` status 播报。
+- **e2e 对齐既有约定**：Playwright + `page.route` mock + `localhost:5173`，
+  可离线跑；`BASE` 环境变量切线上冒烟。公共 `browser.mjs` 消除重复启动逻辑。
+
+### 验证结果
+
+| 项 | 结果 |
+|---|---|
+| `npm run build` | exit 0 |
+| `npm run test:e2e`（本地 mock） | **2/2 脚本全 PASS** |
+| `BASE=<线上> npm run test:e2e` | **2/2 脚本全 PASS** |
+| IDE lint | 0 错误 |
+| Playwright 真实 `hover()` | default `oklch(0.696)` → hover `oklch(0.765)`，前景恒深墨 |
+| checker 线上复跑 | `FAIL 17→12`、`WARN 11→8`；**新增 FAIL/WARN 均为 0** |
+| checker 明细 | `text-contrast: PASS`、`form-fields: PASS`、`focus-visible` 已修复 |
+
+### 部署
+
+- wetty-terminal MCP 在 `dev-cloud:/root/go/src/github.com/web-terminal` 执行
+  `git pull --ff-only` → `95b5a34`；`docker compose build` + `up -d`（后者由
+  宿主机直连 SSH 完成，避免 MCP 服务端随容器重建中断会话）
+- 服务 HTTP 200；最终 bundle 已加载
+
+### 实施中发现并修的两处
+
+1. **`form-fields` WARN 是真问题**：checker 明细显示「表单无 `role="status"`
+   状态行，sending/sent/errors 从不播报」。我们只加了 `role="alert"`（错误）
+   和 `aria-busy`（表单），缺常驻 status。补 `sr-only` 状态行后复跑 PASS。
+2. **CDP `forcePseudoState` 偶发失效**：曾读到 hover 背景仍是 default 色。
+   改用 Playwright 真实 `hover()` 复核，确认是伪状态强制时机问题而非代码回归。
 
 ## 五、未完成任务
 
-- 上述未勾选项
+- 本轮范围内无未完成项
+- 遗留待排期：见下节
 
 ## 六、遗留问题与风险
 
