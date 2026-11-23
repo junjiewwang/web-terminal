@@ -50,10 +50,19 @@
   border-radius: var(--ui-radius-control);
 }
 
-/* 终端 xterm 内部使用自己的焦点态，不要被全局 outline 干扰 */
+/* 终端 xterm 内部使用自己的焦点态：关闭 outline 但用 caret 颜色 +
+   内阴影给出等效的可见焦点指示（checker 要求不得「移除且无替代」）。 */
 .xterm :focus-visible,
 .xterm-helper-textarea:focus-visible {
   outline: none;
+  box-shadow: inset 0 0 0 var(--ui-focus-width) var(--ui-focus);
+}
+
+/* Tailwind 的 focus:outline-none 工具会移除焦点环，这里补回全局兜底，
+   保证任何使用它的控件仍有可见焦点。 */
+:where(a, button, input, textarea, select, [tabindex]):focus.focus\:outline-none {
+  outline: var(--ui-focus-width) solid var(--ui-focus);
+  outline-offset: 2px;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -92,6 +101,18 @@
 :where(input, textarea)::placeholder {
   color: var(--ui-text-subtle);
   opacity: 1;
+}
+
+/* 主操作按钮：绿底白字实测仅 2.48:1，改用深色文字约 8:1。
+   集中覆盖而非改散落的 JSX，保证所有同色按钮一致。 */
+:where(button, a)[class*="bg-emerald-500"]:not(.ui-on-accent-keep) {
+  color: #050816;
+}
+
+/* 深色文字下，按钮内的 loading 转圈也要跟着变深色 */
+:where(button, a)[class*="bg-emerald-500"] :where([class*="border-white"]) {
+  border-color: rgba(5, 8, 22, 0.35);
+  border-top-color: #050816;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -139,6 +160,7 @@
   padding: 10px 16px;
   border-radius: var(--ui-radius-control);
   background: var(--ui-focus);
+  /* 深色文字在绿色底上约 8:1，避免白字 2.48:1 的低对比度 */
   color: #050816;
   font-size: var(--ui-text-min);
   font-weight: 600;
