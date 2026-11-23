@@ -1,8 +1,9 @@
 # 工具型应用设计 Skill 调研与主题回归修复 — 记录文档
 
 - 日期：2026-11-23
-- 状态：实施中
+- 状态：**已完成并部署验证**
 - 触发：发现线上「broker 切换按钮黑底黑字」，并反思上一轮评审是否选对了 skill
+- 提交：`bbf3fa6`
 
 ## 一、问题：主题回归（P0）
 
@@ -84,22 +85,67 @@ taste-skill 的 `one-section`、`container-edges`、`copy-fact`、`moment-none`
 ## 四、实施进展
 
 - [x] 调研与影响面分析
-- [ ] 创建本记录文档（进行中）
-- [ ] P0 主题回归修复
-- [ ] P1 热区规则收敛
-- [ ] P1 暗色模式基础声明
-- [ ] P1 移动端输入框字号
-- [ ] 构建 + 浏览器实测（含 390px 与热区重叠检查）
-- [ ] 提交推送 + dev 部署 + 线上验证
+- [x] 创建本记录文档
+- [x] P0 主题回归修复
+- [x] P1 热区规则收敛
+- [x] P1 暗色模式基础声明
+- [x] P1 移动端输入框字号
+- [x] 构建 + 浏览器实测（含 390px 与热区重叠检查）
+- [x] 提交推送 + dev 部署 + 线上验证
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `frontend/src/styles/design-system.css` | 删除 2 条 `bg-emerald-500` 子串规则；新增 `--ui-on-accent` / `--ui-input-mobile-size` token；`.ui-on-accent` 显式语义类；`color-scheme: dark`；全局 44px `::after` 收敛为 `.ui-tap-expand` opt-in；字号主规则特异性降为 0；移动端 input 16px |
+| `frontend/src/components/LoginPage.tsx` | 唯一实心按钮显式加 `ui-on-accent` |
+| `frontend/index.html` | 新增 `<meta name="theme-color" content="#050816">` |
+
+其余 46 处半透明 accent 按钮、密集工具栏组件**未改动**。
+
+### 遇到的一个级联陷阱（已修）
+
+移动端 input 初测仍是 13px：字号下限规则带 `:not(.ui-micro)`，
+特异性被抬到 `(0,1,0)`，压过了移动端 `16px` 规则的 `(0,0,0)`。
+改为纯 `:where()`（特异性 0），并让 `.ui-micro` 靠自身 `(0,1,0)` 生效，
+桌面 13px / 移动端 16px / micro 11px 三者同时正确。
+
+### 验证结果
+
+**本地构建产物（真实浏览器 computed style）**
+- 半透明 `bg-emerald-500/15` → `oklch(0.845)` 亮绿、`/10` → `oklch(0.765)` 亮绿（黑底黑字消除）
+- 显式 `.ui-on-accent` 实心按钮 → `rgb(5,8,22)` 深色文字
+- 普通按钮 `::after` → `none`；`.ui-tap-expand` → `content:""` + 24px min（无全局重叠）
+- `.ui-micro` → 11px、普通最小字号 → 13px
+- `color-scheme: dark`、`theme-color: #050816`
+
+**390px 移动端**
+- input `16px` / `min-height 44px`
+- 普通按钮带热区伪元素数量：**0**
+- skip-link `position: absolute`、页面无横向溢出（`docOverflow = 0`）
+
+**线上部署后**
+- 用 wetty-terminal MCP 在 `dev-cloud:/root/go/src/github.com/web-terminal` 执行
+  `git pull --ff-only` → `bbf3fa6`；`docker compose build` + `up -d`（后者由宿主机
+  直连 SSH 完成，避免 MCP 服务端随容器重建中断会话）
+- 服务 HTTP 200，bundle `index-9dHBe7Zq.css`
+- 线上实测：`📡` = `oklch(0.845 0.143 164.978)`、`⇄ BROKER` =
+  `oklch(0.765 0.177 163.223)`，均恢复亮色可读；截图确认视觉正常
+- checker 复跑：`FAIL 17→12`、`WARN 11→9`，**新增 FAIL 0 / 新增 WARN 0**，
+  `text-contrast` 保持已修复
 
 ## 五、未完成任务
 
-- 上述未勾选项
+- 本轮范围内无未完成项
+- P2 待排期：见下节遗留问题 2
 
 ## 六、遗留问题与风险
 
 1. **集中式 CSS 覆盖的固有局限**：覆盖的是工具类选择器，内联样式不受约束；本轮已移除最脆弱的类名子串反查，但字号/灰阶/圆角覆盖仍是「覆盖框架」而非「语义 token」，属于技术债。
 2. **P2 未做**：`transition-all`、表单状态播报、system.md 契约、评审工具切换，需单独排期。
-3. **tap-size checker 结果可能回退**：移除无差别 44px 后，部分密集小按钮在 390px 仍会被报 WARN；这是工具型 UI 密度的有意取舍，应记录豁免而非强改布局。
+3. **tap-size 未按预期回退**：原以为移除无差别 44px 会让 390px 的小按钮重新被报 WARN，
+   但线上复跑 `WARN 11→9` 且无新增 WARN——因为表单控件已补 `min-height:44px`，
+   checker 主要命中的正是输入框。密集小图标按钮仍 <44px，属工具型 UI 密度的
+   有意取舍，不应为了过检查而撑爆布局。
 4. **营销页规则误报**：taste-skill 的 `one-section` / `container-edges` / `copy-fact` 等仍会 FAIL，属刻意豁免。
 5. **无视觉回归基线**：目前依赖人工截图 + checker，建议后续补基线截图对比。
