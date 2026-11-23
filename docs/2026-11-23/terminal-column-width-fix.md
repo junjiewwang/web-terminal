@@ -1,7 +1,8 @@
 # 终端列宽不一致导致 zsh 智能提示显示错乱 — 修复记录
 
 - 日期：2026-11-23
-- 状态：实施中
+- 状态：代码已实施、已推送、已部署；待浏览器交互验证
+- 提交：`78842e5`（`fix(terminal): align render columns with PTY to fix zsh-autosuggestions garbling`）
 - 关联组件：前端 xterm.js / useWebSocket / useTerminal；后端 terminal.py / terminal_manager.py
 
 ## 一、需求与背景
@@ -69,9 +70,9 @@ zsh 环境同时启用了 `zsh-autosuggestions`、`zsh-syntax-highlighting`、
 - [x] 后端尺寸协商改造
 - [x] 前端列宽对齐改造
 - [x] 本地构建 / lint / 测试
-- [ ] 提交并推送
-- [ ] dev 环境拉取更新并重新部署
-- [ ] 浏览器验证长提示显示
+- [x] 提交并推送（`78842e5`）
+- [x] dev 环境拉取更新并重新部署
+- [ ] 浏览器交互验证长提示显示（需登录页面后人工确认）
 
 ### 具体改动
 
@@ -92,11 +93,26 @@ zsh 环境同时启用了 `zsh-autosuggestions`、`zsh-syntax-highlighting`、
   `TerminalInfo` 构造参数、`bcrypt` 依赖缺失等），新增 4 个测试全部通过，**无回归**
 - IDE lint：0 错误
 
+### 部署记录
+
+- dev 环境目录 `/root/go/src/github.com/web-terminal`，`git pull --ff-only` → `33e2e33..78842e5`
+- `docker compose build wetty-mcp` 后台构建成功（Dockerfile 多阶段自带前端 `npm run build`）
+- 容器替换期间 MCP 会话随容器中断属预期；改用宿主机直连 SSH 完成 `docker compose up -d`，
+  服务恢复 HTTP 200，日志显示 `服务启动完成 ✓`
+- 部署后验证：
+  - 容器内后端含 `size_reported` / `_clamp_size`，WebSocket 端点签名为
+    `['websocket', 'session_id', 'token', 'cols', 'rows']`
+  - 前端 bundle `index-CKVig46m.js` 已加载，含握手尺寸、`resize_hint` 消费、状态栏徽标
+  - 运行时验证：200 列客户端 + 未上报客户端 → 有效尺寸 `(200, 50)`（不再被 80 钉死）；
+    全部未上报 → 回退 `(80, 24)`
+
 ## 六、未完成任务
 
-- 提交并推送
-- dev 环境拉取更新并重新部署
-- 浏览器验证长提示显示
+- **浏览器交互验证**：需登录 `http://web-term.devcloud:18008/` 后人工确认
+  1. 状态栏出现 `N×M` 有效尺寸徽标
+  2. 连接终端后 `stty size` / `echo $COLUMNS` 与徽标一致
+  3. 输入长命令前缀触发长历史提示，确认无逐字符散落、残留空白、光标乱跳
+  4. 缩放窗口，确认列宽仍一致且无来回震荡
 
 ## 七、遗留问题与风险
 
