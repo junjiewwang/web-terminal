@@ -237,8 +237,22 @@ export default function SnippetPanel({
         </button>
       </div>
 
-      {/* 内容区域 */}
-      <div className="flex-1 min-h-0 overflow-y-auto snippet-scroll">
+      {/* 屏幕阅读器专用状态播报（不干扰视觉与交互子树） */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {loading
+          ? "正在加载领域列表"
+          : error
+            ? `加载失败：${error}`
+            : scriptStatus === "loading"
+              ? "正在执行脚本"
+              : ""}
+      </span>
+
+      {/* 内容区域：可交互子树不做 live region，仅标记 busy */}
+      <div
+        className="flex-1 min-h-0 overflow-y-auto snippet-scroll"
+        aria-busy={loading || scriptStatus === "loading"}
+      >
         {loading ? (
           <_LoadingState />
         ) : error ? (
@@ -298,7 +312,7 @@ function _DomainList({
           key={domain.id}
           type="button"
           onClick={() => onSelect(domain.id)}
-          className="group flex flex-col items-start gap-1 rounded-lg border border-white/6 bg-white/3 p-2.5 text-left transition-all hover:border-emerald-500/30 hover:bg-emerald-500/5"
+          className="group flex flex-col items-start gap-1 rounded-lg border border-white/6 bg-white/3 p-2.5 text-left transition-colors duration-200 hover:border-emerald-500/30 hover:bg-emerald-500/5"
         >
           <div className="flex items-center gap-2 w-full">
             <span className="text-base">{domain.icon}</span>
@@ -398,7 +412,7 @@ function _CommandPanel({
               key={cmd.id}
               type="button"
               onClick={() => onSelectCommand(isSelected ? null : cmd)}
-              className={`w-full text-left rounded-md border px-2.5 py-2 transition-all ${
+              className={`w-full text-left rounded-md border px-2.5 py-2 transition-colors duration-200 ${
                 isSelected
                   ? "border-emerald-500/40 bg-emerald-500/8"
                   : "border-white/6 bg-white/2 hover:border-white/12 hover:bg-white/4"
@@ -577,7 +591,7 @@ function _ErrorState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center py-8 gap-2">
-      <span className="text-red-400 text-xs">{message}</span>
+      <span className="text-red-400 text-xs" role="alert">{message}</span>
       <button
         type="button"
         onClick={onRetry}

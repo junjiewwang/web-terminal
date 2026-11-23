@@ -68,6 +68,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
         <form
           id="login-form"
           onSubmit={handleSubmit}
+          aria-busy={loading}
           className="rounded-2xl border border-white/8 bg-gray-950/80 p-6 shadow-2xl backdrop-blur-xl"
         >
           {/* 密码 */}
@@ -93,7 +94,11 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
 
           {/* 错误提示 */}
           {error && (
-            <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+            <div
+              role="alert"
+              aria-live="assertive"
+              className="mb-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400"
+            >
               {error}
             </div>
           )}

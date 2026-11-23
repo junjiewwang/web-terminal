@@ -774,7 +774,8 @@ function _UploadTab({
 
       {/* 拖拽上传区 + 进度区 */}
       <div
-        className={`relative flex-1 min-h-[90px] rounded-lg border-2 border-dashed transition-all cursor-pointer flex items-center justify-center ${
+        aria-busy={status === "uploading" || status === "downloading"}
+        className={`relative flex-1 min-h-[90px] rounded-lg border-2 border-dashed transition-[border-color,background-color,transform] duration-200 cursor-pointer flex items-center justify-center ${
           dragOver
             ? "border-emerald-400/60 bg-emerald-500/8 scale-[1.005]"
             : status === "uploading"
@@ -800,7 +801,11 @@ function _UploadTab({
         ) : (
           <div className="text-center px-6 py-3">
             <div className="text-2xl mb-1.5 opacity-80">{dragOver ? "📥" : "📤"}</div>
-            <p className="text-[12px] text-gray-400 font-medium">
+            <p
+              className="text-[12px] text-gray-400 font-medium"
+              role="status"
+              aria-live="polite"
+            >
               {dragOver ? "释放文件开始上传" : isConnected ? "拖拽文件到此处上传" : "终端未连接"}
             </p>
             {isConnected && !dragOver && (
@@ -981,7 +986,7 @@ function _UploadProgress({
         <>
           <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
             <div
-              className="bg-blue-500 h-full rounded-full transition-all duration-300"
+              className="bg-blue-500 h-full rounded-full transition-[width] duration-300"
               style={{ width: `${info.percent}%` }}
             />
           </div>
@@ -994,7 +999,7 @@ function _UploadProgress({
       ) : info.ptyState === "verifying" ? (
         <>
           <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-            <div className="bg-emerald-500 h-full rounded-full transition-all duration-500" style={{ width: "100%" }} />
+            <div className="bg-emerald-500 h-full rounded-full transition-[width] duration-300" style={{ width: "100%" }} />
           </div>
           <div className="flex items-center justify-center gap-2 text-[11px] text-emerald-400/80">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -1012,7 +1017,7 @@ function _UploadProgress({
         <>
           <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
             <div
-              className="bg-blue-500 h-full rounded-full transition-all duration-300"
+              className="bg-blue-500 h-full rounded-full transition-[width] duration-300"
               style={{ width: `${Math.max(info.percent, 1)}%` }}
             />
           </div>
@@ -1093,7 +1098,7 @@ function _DownloadProgress({ info }: { info: DownloadProgressInfo }) {
       {isVerifying ? (
         <>
           <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-            <div className="bg-emerald-500 h-full rounded-full transition-all duration-500" style={{ width: "100%" }} />
+            <div className="bg-emerald-500 h-full rounded-full transition-[width] duration-300" style={{ width: "100%" }} />
           </div>
           <div className="flex items-center justify-center gap-2 text-[11px] text-emerald-400/80">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -1111,7 +1116,7 @@ function _DownloadProgress({ info }: { info: DownloadProgressInfo }) {
         <>
           <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
             <div
-              className="bg-blue-500 h-full rounded-full transition-all duration-300"
+              className="bg-blue-500 h-full rounded-full transition-[width] duration-300"
               style={{ width: `${Math.max(info.percentage, info.totalBytes > 0 ? 1 : 0)}%` }}
             />
           </div>

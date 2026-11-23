@@ -1,70 +1,30 @@
 /**
- * verify-accent-contrast.mjs
+ * 实心 accent 控件（.ui-accent-bright）四态 WCAG 对比度校验
  *
- * 校验实心 accent 控件（.ui-accent-bright）各交互态的 WCAG 对比度。
- * 用 CDP 连到已打开的页面，在真实浏览器里解析 oklch CSS 颜色，
- * 再按 #050816 画布合成计算对比度，避免理论值与实渲染不一致。
+ * 与项目内其它 e2e 脚本一致：Playwright + page.route mock 后端，可离线跑。
+ * 优先级：若设置 BASE 环境变量则直连该地址（用于线上冒烟，不做 mock）；
+ *         否则使用 http://localhost:5173 + mock（需先 npm run dev）。
  *
  * 用法：
- *   1. Chrome 以 --remote-debugging-port=9222 启动并打开目标页面
- *   2. node frontend/e2e/verify-accent-contrast.mjs [urlSubstring]
+ *   npm run dev                              # 终端 A
+ *   node frontend/e2e/verify-accent-contrast.mjs          # 终端 B
+ *   BASE=http://web-term.devcloud:18008/ node ...mjs      # 线上冒烟
  *
  * 退出码：全部通过 0，有 FAIL 则 1。
- * 依赖：Node 22+（内置 WebSocket），无 npm 依赖。
  */
-import { setTimeout as sleep } from "node:timers/promises";
+import { launchBrowser } from "./browser.mjs";
 
-const CDP = "http://localhost:9222";
-const TARGET = process.argv[2] ?? "web-term.devcloud";
+const BASE = process.env.BASE ?? "http://localhost:5173";
 const MIN_RATIO = 4.5;
 const CANVAS_BG = "#050816";
-
-async function findPage() {
-  const res = await fetch(`${CDP}/json/list`);
-  const pages = (await res.json()).filter(
-    (p) => p.type === "page" && p.url?.includes(TARGET)
-  );
-  if (!pages.length) throw new Error(`未找到包含 "${TARGET}" 的标签页`);
-
-  // 可能有多个同 URL 标签页（部分尚未加载完样式表）。逐个探测，
-  // 选出确实定义了 --ui-accent-surface 的那个。
-  for (const p of pages) {
-    try {
-      const ws = new WebSocket(p.webSocketDebuggerUrl);
-      await new Promise((resolve, reject) => {
-        ws.onopen = resolve;
-        ws.onerror = reject;
-        setTimeout(() => reject(new Error("connect timeout")), 3000);
-      });
-      const val = await new Promise((resolve) => {
-        ws.onmessage = (e) => {
-          const m = JSON.parse(e.data);
-          if (m.id === 1) resolve(m.result?.result?.value);
-        };
-        ws.send(JSON.stringify({
-          id: 1,
-          method: "Runtime.evaluate",
-          params: {
-            expression: "getComputedStyle(document.documentElement).getPropertyValue('--ui-accent-surface').trim()",
-            returnByValue: true,
-          },
-        }));
-        setTimeout(() => resolve(""), 3000);
-      });
-      ws.close();
-      if (val) return p.webSocketDebuggerUrl;
-    } catch { /* 试下一个 */ }
-  }
-  throw new Error(`包含 "${TARGET}" 的标签页都未加载设计系统 CSS`);
-}
+const USE_MOCK = !process.env.BASE;
 
 const EXPRESSION = `(() => {
   const cv = document.createElement("canvas");
   cv.width = cv.height = 1;
   const cx = cv.getContext("2d", { willReadFrequently: true });
-  const bgPage = [5, 8, 22]; // #050816
+  const bgPage = [5, 8, 22];
 
-  // 解析任意 CSS 颜色（含 oklch）为不透明 sRGB；支持 alpha 后缀
   const parse = (css) => {
     cx.clearRect(0, 0, 1, 1);
     cx.fillStyle = "${CANVAS_BG}"; cx.fillRect(0, 0, 1, 1);
@@ -80,8 +40,6 @@ const EXPRESSION = `(() => {
     const A = lum(a), B = lum(b);
     return +((Math.max(A, B) + 0.05) / (Math.min(A, B) + 0.05)).toFixed(2);
   };
-
-  // 把 var(--token) 解析成浏览器能识别的字面量
   const literal = (cssColor) => {
     const e = document.createElement("span");
     e.style.color = cssColor;
@@ -101,7 +59,7 @@ const EXPRESSION = `(() => {
     inkDisabled: root.getPropertyValue("--ui-accent-ink-disabled").trim(),
   };
 
-  const out = { tokens: vars, states: [], rules: {} };
+  const out = { tokens: vars, states: [], rules: {}, dom: {} };
   const inkRGB = parse(vars.ink || "#050816");
   const inkDisRGB = parse(literal(vars.inkDisabled) || "oklch(0.72 0.02 260)");
 
@@ -109,13 +67,9 @@ const EXPRESSION = `(() => {
     const css = literal(vars[state]);
     const bg = parse(css);
     const ink = state === "disabled" ? inkDisRGB : inkRGB;
-    out.states.push({
-      state, bgCss: css, bgRGB: bg, inkRGB: ink,
-      ratio: ratio(bg, ink),
-    });
+    out.states.push({ state, bgCss: css, ratio: ratio(bg, ink) });
   }
 
-  // 确认三态规则确实存在于样式表（防止 token 定义了但规则被删）
   const all = [];
   for (const sheet of document.styleSheets) {
     try { for (const r of sheet.cssRules) all.push(r.cssText); } catch (e) {}
@@ -128,64 +82,65 @@ const EXPRESSION = `(() => {
     noOpacityFade: !all.some((t) => t.includes("ui-accent-bright") && t.includes("opacity-40")),
   };
 
-  // 采样实际 DOM 上的控件，确认前景色不是白色
+  // 真实 DOM 采样（登录页在未登录态会有 1 个实心按钮）
   const els = [...document.querySelectorAll(".ui-accent-bright")];
-  out.domCount = els.length;
-  out.domSamples = els.slice(0, 6).map((e) => {
+  out.dom.count = els.length;
+  out.dom.samples = els.slice(0, 4).map((e) => {
     const s = getComputedStyle(e);
-    return { tag: e.tagName, bg: s.backgroundColor, color: s.color };
+    return { tag: e.tagName, bg: s.backgroundColor, color: s.color, opacity: s.opacity };
   });
-
   return JSON.stringify(out);
 })()`;
 
-async function main() {
-  const ws = new WebSocket(await findPage());
-  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
-
-  let id = 0;
-  const pending = new Map();
-  ws.onmessage = (e) => {
-    const m = JSON.parse(e.data);
-    if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
-  };
-  const send = (method, params = {}) => new Promise((resolve) => {
-    const n = ++id; pending.set(n, resolve);
-    ws.send(JSON.stringify({ id: n, method, params }));
-  });
-
-  await send("Page.enable");
-  await sleep(300);
-  const r = await send("Runtime.evaluate", { expression: EXPRESSION, returnByValue: true });
-  ws.close();
-
-  if (r.result?.exceptionDetails) {
-    console.error("页面脚本异常:", r.result.exceptionDetails.text);
-    process.exit(2);
-  }
-  const d = JSON.parse(r.result.result.value);
-
-  console.log("tokens:", JSON.stringify(d.tokens));
-  console.log("DOM .ui-accent-bright 数量:", d.domCount);
-  console.log("");
-  let failed = 0;
-  for (const s of d.states) {
-    const ok = s.ratio >= MIN_RATIO;
-    if (!ok) failed++;
-    console.log(
-      `${ok ? "PASS" : "FAIL"}  ${s.state.padEnd(10)} ${String(s.ratio).padStart(6)}:1  ` +
-      `bg=${s.bgCss} rgb=${s.bgRGB.join(",")} ink=${s.inkRGB.join(",")}`
-    );
-  }
-  console.log("");
-  for (const [k, v] of Object.entries(d.rules)) {
-    if (!v) failed++;
-    console.log(`${v ? "PASS" : "FAIL"}  rule:${k}`);
-  }
-  console.log("");
-  console.log("DOM 采样:", JSON.stringify(d.domSamples));
-  console.log(`阈值 ${MIN_RATIO}:1 — ${failed === 0 ? "全部通过" : failed + " 项未通过"}`);
-  process.exit(failed ? 1 : 0);
+async function mockBackend(page) {
+  await page.route("**/api/**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ auth_required: true }),
+    })
+  );
 }
 
-main().catch((e) => { console.error(e.message); process.exit(2); });
+async function main() {
+  const browser = await launchBrowser();
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  if (USE_MOCK) await mockBackend(page);
+
+  try {
+    await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForTimeout(800);
+    const data = JSON.parse(await page.evaluate(EXPRESSION));
+
+    console.log(`target: ${BASE}${USE_MOCK ? " (mock)" : " (live)"}`);
+    console.log("tokens:", JSON.stringify(data.tokens));
+    console.log("");
+    let failed = 0;
+    for (const s of data.states) {
+      const ok = s.ratio >= MIN_RATIO;
+      if (!ok) failed++;
+      console.log(
+        `${ok ? "PASS" : "FAIL"}  ${s.state.padEnd(10)} ${String(s.ratio).padStart(6)}:1  bg=${s.bgCss}`
+      );
+    }
+    console.log("");
+    for (const [k, v] of Object.entries(data.rules)) {
+      if (!v) failed++;
+      console.log(`${v ? "PASS" : "FAIL"}  rule:${k}`);
+    }
+    console.log("");
+    console.log(`DOM .ui-accent-bright: ${data.dom.count}`, JSON.stringify(data.dom.samples));
+    console.log(`阈值 ${MIN_RATIO}:1 — ${failed === 0 ? "全部通过" : failed + " 项未通过"}`);
+    await browser.close();
+    process.exit(failed ? 1 : 0);
+  } catch (e) {
+    await browser.close();
+    console.error("执行失败:", e.message);
+    console.error(USE_MOCK
+      ? "请确认已启动 dev server：npm run dev（默认 5173），或用 BASE 指定地址"
+      : "请确认 BASE 地址可访问");
+    process.exit(2);
+  }
+}
+
+main();

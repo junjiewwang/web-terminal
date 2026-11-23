@@ -705,7 +705,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
                   tabIndex={0}
                   onClick={() => setShowEventToast(false)}
                   onKeyDown={(e) => e.key === "Escape" && setShowEventToast(false)}
-                  className="absolute right-4 top-4 z-20 hidden max-w-sm cursor-pointer rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur transition-opacity duration-500 hover:border-emerald-400/30 md:block"
+                  className="absolute right-4 top-4 z-20 hidden max-w-sm cursor-pointer rounded-2xl border border-white/10 bg-gray-950/88 px-3 py-2 shadow-2xl backdrop-blur transition-opacity duration-300 hover:border-emerald-400/30 md:block"
                   title="点击关闭"
                 >
                   <div className="flex items-center gap-2 text-[11px] text-gray-500">
