@@ -644,7 +644,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
                     <span className={`inline-flex h-2 w-2 rounded-full ${latestEvent ? "bg-emerald-400 animate-pulse" : "bg-gray-600"}`} />
                     <span>{isAgentPanelOpen ? "隐藏轨迹" : "操作轨迹"}</span>
                     {unreadEventCount > 0 && (
-                      <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[10px] font-semibold text-gray-950">
+                      <span className="ui-accent-bright ui-micro inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 font-semibold">
                         {unreadEventCount}
                       </span>
                     )}

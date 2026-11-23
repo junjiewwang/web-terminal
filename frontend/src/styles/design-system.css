@@ -44,7 +44,20 @@
   --ui-focus: #34d399; /* 与终端光标色一致，单一 accent */
   --ui-focus-width: 2px;
   --ui-tap-min: 44px; /* 移动端最小点击目标 */
-  /* 实心 accent 背景上的文字色（由组件显式声明 .ui-on-accent 使用） */
+
+  /* ── 实心 accent 配色（单一档，语义 token） ──
+     实测叠在 #050816 上的 WCAG 对比度（深墨字）：
+       default emerald-500 = 8.06:1 / hover emerald-400 = 10.29:1
+       active  emerald-600 =  5.46:1
+     原先 7 种实心绿底（500/90、500/80、600/80、600/90、600、700、500）
+     跨越了亮度反转点（约 emerald-600 @85%），导致白字/深字反复摇摆。
+     统一到这一档后全状态 ≥5.46:1。 */
+  --ui-accent-surface: var(--color-emerald-500);
+  --ui-accent-hover: var(--color-emerald-400);
+  --ui-accent-active: var(--color-emerald-600);
+  --ui-accent-surface-disabled: rgba(255, 255, 255, 0.06);
+  --ui-accent-ink-disabled: var(--ui-text-muted);
+  /* 实心 accent 背景上的文字色 */
   --ui-on-accent: #050816;
 }
 
@@ -114,19 +127,51 @@
   opacity: 1;
 }
 
-/* 实心 accent 按钮上的文字：仅由组件显式加 `.ui-on-accent` 声明，
-   绝不用 `[class*="bg-emerald-500"]` 之类的类名子串反查——那会把
-   /5~/25 的半透明背景（深色底上近乎黑）一并改成深色文字，造成黑底黑字。
-
-   背景 #34d399 / emerald-500 上深色文字约 8:1（白字仅 2.48:1）。 */
-:where(.ui-on-accent) {
+/* ══════════════════════════════════════════════════════════════
+ * 4b. 实心 accent 控件（单一语义类，组件显式声明）
+ *
+ *  由组件加 `.ui-accent-bright` 声明「我是实心主操作」，
+ *  绝不用 `[class*="bg-emerald-..."]` 类名子串反查 —— 那会把
+ *  /5~/25 的半透明幽灵按钮（深色底上近乎黑）一并改成深色文字，
+ *  造成上一轮的黑底黑字回归。
+ *
+ *  三态对比度（深墨字，实测）：8.06 / 10.29 / 5.46，均 ≥4.5:1。
+ *  hover 更亮，符合 Vercel「interactions increase contrast」。
+ * ══════════════════════════════════════════════════════════════ */
+:where(.ui-accent-bright) {
+  background-color: var(--ui-accent-surface);
   color: var(--ui-on-accent);
+  transition: background-color 150ms ease-out;
 }
 
-/* 同一按钮内 loading 转圈跟随深色文字 */
-:where(.ui-on-accent) :where([class*="border-white"]) {
+:where(.ui-accent-bright):where(:hover:not(:disabled):not([aria-disabled="true"])) {
+  background-color: var(--ui-accent-hover);
+}
+
+:where(.ui-accent-bright):where(:active:not(:disabled)) {
+  background-color: var(--ui-accent-active);
+}
+
+/* disabled：不用 opacity（双重衰减会让两种前景都低于 3:1），
+   改为显式中性灰底 + muted 文字，实测约 8:1 */
+:where(.ui-accent-bright):where(:disabled, [aria-disabled="true"]) {
+  background-color: var(--ui-accent-surface-disabled);
+  color: var(--ui-accent-ink-disabled);
+  /* 抵消组件里的 disabled:opacity-40：opacity 是独立属性，
+     不显式复位会与上面的配色叠加成双重衰减 */
+  opacity: 1;
+  cursor: not-allowed;
+}
+
+/* 按钮内 loading 转圈跟随深色文字；disabled 时跟随 muted 文字 */
+:where(.ui-accent-bright) :where([class*="border-white"]) {
   border-color: rgba(5, 8, 22, 0.35);
   border-top-color: var(--ui-on-accent);
+}
+:where(.ui-accent-bright):where(:disabled, [aria-disabled="true"])
+  :where([class*="border-white"]) {
+  border-color: currentColor;
+  border-top-color: transparent;
 }
 
 /* ══════════════════════════════════════════════════════════════

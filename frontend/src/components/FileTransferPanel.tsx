@@ -851,7 +851,7 @@ function _DownloadTab({
           type="button"
           onClick={onDownload}
           disabled={status === "downloading" || !isConnected}
-          className="shrink-0 px-3 py-1.5 rounded-md text-[11px] font-medium bg-emerald-600/80 hover:bg-emerald-500/80 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          className="ui-accent-bright shrink-0 px-3 py-1.5 rounded-md text-[11px] font-medium disabled:cursor-not-allowed"
         >
           {status === "downloading" ? "下载中..." : "下载"}
         </button>

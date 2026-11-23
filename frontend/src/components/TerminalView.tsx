@@ -391,7 +391,7 @@ export default function TerminalView({
       >
         {/* tmux copy-mode 复制 toast */}
         {toast && isActive && (
-          <div className="absolute top-2 right-2 z-20 px-3 py-1.5 bg-emerald-600/90 text-white text-xs rounded shadow-lg pointer-events-none animate-pulse">
+          <div className="ui-accent-bright absolute top-2 right-2 z-20 px-3 py-1.5 text-xs rounded shadow-lg pointer-events-none animate-pulse">
             {toast}
           </div>
         )}
@@ -418,7 +418,7 @@ export default function TerminalView({
               <p className="text-xs text-gray-600 mb-4">{error}</p>
               <button
                 onClick={() => connectToHost(host)}
-                className="px-4 py-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-white rounded transition-colors"
+                className="ui-accent-bright px-4 py-1.5 text-xs rounded"
               >
                 重新连接
               </button>

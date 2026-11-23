@@ -501,10 +501,10 @@ function _ParamForm({
         type="button"
         onClick={onExecute}
         disabled={!isConnected}
-        className={`w-full rounded-md py-1.5 text-xs font-medium transition-colors ${
+        className={`w-full rounded-md py-1.5 text-xs font-medium ${
           !isConnected
             ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-            : "bg-emerald-600/80 text-white hover:bg-emerald-600 active:bg-emerald-700"
+            : "ui-accent-bright"
         }`}
       >
         {isConnected ? "执行命令 ↵" : "终端未连接"}

@@ -99,7 +99,7 @@ export default function DisconnectOverlay({ exitInfo, onReconnect, onDismiss }: 
           {exitInfo.recoverable && (
             <button
               onClick={onReconnect}
-              className="px-5 py-2 text-sm bg-emerald-700 hover:bg-emerald-600 text-white rounded-md transition-colors font-medium shadow-lg shadow-emerald-900/30"
+              className="ui-accent-bright px-5 py-2 text-sm rounded-md font-medium shadow-lg shadow-emerald-900/30"
             >
               重新连接
             </button>
