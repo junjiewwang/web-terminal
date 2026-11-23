@@ -1,4 +1,8 @@
 @import "tailwindcss";
+/* 集中式设计系统：必须在 tailwindcss 之后引入。
+   Tailwind v4 工具类位于 @layer utilities，而本文件为 unlayered 规则，
+   CSS cascade 中 unlayered 优先级更高，因此可统一覆盖工具类而无需改 JSX。 */
+@import "./styles/design-system.css";
 
 /* ══════════════════════════════════════════════════════════════
  * xterm.js 终端样式覆盖

@@ -1,0 +1,164 @@
+/**
+ * design-system.css — 集中式设计系统与可访问性基线
+ *
+ * 设计意图：
+ *  本应用是工具型终端产品，信息密度高、组件多。字号、灰阶、圆角、焦点环
+ *  若散落在 200+ 处 className 中，既无法保证一致性，也会让后续新增组件
+ *  不断引入不合规写法。因此把设计决策收敛到本文件（单一数据源）。
+ *
+ * 实现依据：
+ *  Tailwind CSS v4 把工具类生成在 `@layer utilities` 中；CSS cascade 规范规定
+ *  **unlayered 规则优先级高于任何 layer 内规则**。本文件由 index.css 在
+ *  `@import "tailwindcss"` 之后以普通规则引入，因此可统一覆盖工具类，
+ *  无需修改任何组件 JSX。
+ *
+ * 适用范围：通用设计工程质量规则（来自 taste-skill 评审）。
+ *  营销页专属规则（每屏一节 / hero 入场 / dealt moment / 真实照片）刻意不实施。
+ */
+
+/* ══════════════════════════════════════════════════════════════
+ * 1. 设计 Token（单一数据源）
+ * ══════════════════════════════════════════════════════════════ */
+:root {
+  /* 字号下限：可读文本不得小于 13px（评审实测有 91 处 10/12px） */
+  --ui-text-min: 13px;
+
+  /* 圆角 family：控件 / 卡片 / 大容器；徽标另用 pill */
+  --ui-radius-control: 8px;
+  --ui-radius-card: 12px;
+  --ui-radius-panel: 16px;
+
+  /* 文本色阶（深色背景 #050816 上均满足 4.5:1，正文满足 7:1） */
+  --ui-text-body: oklch(0.93 0.01 260);
+  --ui-text-secondary: oklch(0.83 0.015 260);
+  --ui-text-muted: oklch(0.72 0.02 260);
+  --ui-text-subtle: oklch(0.68 0.02 260); /* 仅用于标签/元信息，仍 ≥4.5:1 */
+
+  /* 交互反馈 */
+  --ui-focus: #34d399; /* 与终端光标色一致，单一 accent */
+  --ui-focus-width: 2px;
+  --ui-tap-min: 44px; /* 移动端最小点击目标 */
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 2. P0 — 键盘焦点环
+ *  实测：输入框聚焦时 outline:none / boxShadow:none，键盘用户无法定位。
+ * ══════════════════════════════════════════════════════════════ */
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: var(--ui-focus-width) solid var(--ui-focus);
+  outline-offset: 2px;
+  border-radius: var(--ui-radius-control);
+}
+
+/* 终端 xterm 内部使用自己的焦点态，不要被全局 outline 干扰 */
+.xterm :focus-visible,
+.xterm-helper-textarea:focus-visible {
+  outline: none;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 3. P0 — 最小字号
+ *  统一覆盖 Tailwind 的任意字号类与 text-xs(12px)。
+ *  例外：紧凑的圆形计数徽标在 16~20px 容器内放不下 13px，用
+ *  `.ui-micro` 显式声明（例外必须有名字，不散落魔法数字）。
+ * ══════════════════════════════════════════════════════════════ */
+:where(
+    [class*="text-[9px]"],
+    [class*="text-[10px]"],
+    [class*="text-[11px]"],
+    [class*="text-[12px]"],
+    .text-xs
+  ):not(.ui-micro) {
+  font-size: var(--ui-text-min);
+}
+
+/* 显式例外：微型圆形计数徽标（如未读数气泡） */
+.ui-micro {
+  font-size: 11px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 4. P1 — 文本对比度
+ *  实测 oklch(0.373)/0.446/0.551 在深色底上低于 4.5:1。
+ *  保留三级层次但整体抬升，避免把设计压平成单一灰色。
+ * ══════════════════════════════════════════════════════════════ */
+:where(.text-gray-300) { color: var(--ui-text-body); }
+:where(.text-gray-400) { color: var(--ui-text-secondary); }
+:where(.text-gray-500) { color: var(--ui-text-muted); }
+:where(.text-gray-600) { color: var(--ui-text-subtle); }
+:where(.text-gray-700) { color: var(--ui-text-subtle); }
+
+/* placeholder 同样需要可读 */
+:where(input, textarea)::placeholder {
+  color: var(--ui-text-subtle);
+  opacity: 1;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 5. P1 — 移动端点击热区
+ *  桌面端保持工具型 UI 的紧凑密度，仅在粗指针/窄屏扩展热区，
+ *  用透明伪元素，不改变视觉尺寸，也不影响布局。
+ * ══════════════════════════════════════════════════════════════ */
+@media (pointer: coarse), (max-width: 640px) {
+  :where(button, [role="button"], a):not(.ui-tap-none) {
+    position: relative;
+  }
+
+  :where(button, [role="button"], a):not(.ui-tap-none)::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    min-width: max(100%, var(--ui-tap-min));
+    min-height: max(100%, var(--ui-tap-min));
+    pointer-events: none;
+  }
+
+  /* 全屏遮罩 / 大面板按钮不需要扩展，避免遮挡其它控件 */
+  .ui-tap-none::after { content: none; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 6. P2 — 圆角收敛
+ *  7 类 utility → 控件 8 / 卡片 12 / 大容器 16 / 徽标 pill 一套 family。
+ * ══════════════════════════════════════════════════════════════ */
+:where(.rounded, .rounded-md) { border-radius: var(--ui-radius-control); }
+:where(.rounded-lg) { border-radius: var(--ui-radius-card); }
+:where(.rounded-xl, .rounded-2xl, .rounded-3xl) { border-radius: var(--ui-radius-panel); }
+/* .rounded-full 保留给状态徽标 / 头像，属于同一 family 的 pill 变体 */
+
+/* ══════════════════════════════════════════════════════════════
+ * 7. P2 — Skip link（跳到主内容）
+ * ══════════════════════════════════════════════════════════════ */
+.ui-skip-link {
+  position: absolute;
+  left: 12px;
+  top: -60px;
+  z-index: 100;
+  padding: 10px 16px;
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-focus);
+  color: #050816;
+  font-size: var(--ui-text-min);
+  font-weight: 600;
+  transition: top 150ms ease-out;
+}
+
+.ui-skip-link:focus-visible {
+  top: 12px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 8. 尊重系统减弱动效偏好
+ * ══════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
