@@ -121,11 +121,13 @@
  *  用透明伪元素，不改变视觉尺寸，也不影响布局。
  * ══════════════════════════════════════════════════════════════ */
 @media (pointer: coarse), (max-width: 640px) {
-  :where(button, [role="button"], a):not(.ui-tap-none) {
+  /* 排除 skip-link：它是 absolute 定位、脱离布局流的跳转链接，
+     若被这里改成 relative 会成为 flex 首个子项，把页面内容整体推偏。 */
+  :where(button, [role="button"], a):not(.ui-tap-none):not(.skip-link) {
     position: relative;
   }
 
-  :where(button, [role="button"], a):not(.ui-tap-none)::after {
+  :where(button, [role="button"], a):not(.ui-tap-none):not(.skip-link)::after {
     content: "";
     position: absolute;
     left: 50%;
@@ -135,6 +137,9 @@
     min-height: max(100%, var(--ui-tap-min));
     pointer-events: none;
   }
+
+  /* 明确保证 skip-link 不被热区规则改变定位方式 */
+  :where(.skip-link, .ui-skip-link) { position: absolute; }
 
   /* 全屏遮罩 / 大面板按钮不需要扩展，避免遮挡其它控件 */
   .ui-tap-none::after { content: none; }
