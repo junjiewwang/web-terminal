@@ -65,6 +65,12 @@ export interface UseWebSocketOptions {
   onClipboard?: (text: string) => void;
   /** 收到 resize_hint 消息的回调（Broker 模式 min-size 策略通知有效尺寸） */
   onResizeHint?: (hint: ResizeHint) => void;
+  /**
+   * 获取握手时的初始终端尺寸（容器自然尺寸）。
+   * 随 WebSocket URL 的 cols/rows query 上报，让后端连接首帧即掌握真实尺寸，
+   * 避免默认 80×24 参与 min-size 计算把 PTY 钉在 80 列。
+   */
+  getInitialSize?: () => TermSize;
 }
 
 /** Hook 返回值（与 useWettySocket 兼容） */
@@ -97,7 +103,10 @@ function _decodeBase64Utf8(base64Text: string): string {
  * 原生 WebSocket 终端连接 Hook
  */
 export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
-  const { wsUrl, onData, onHistory, onConnect, onDisconnect, onSessionExit, onClipboard, onResizeHint } = options;
+  const {
+    wsUrl, onData, onHistory, onConnect, onDisconnect,
+    onSessionExit, onClipboard, onResizeHint, getInitialSize,
+  } = options;
   const [status, setStatus] = useState<SocketStatus>("disconnected");
   const wsRef = useRef<WebSocket | null>(null);
   const attemptsRef = useRef(0);
@@ -112,6 +121,7 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
   const onSessionExitRef = useRef(onSessionExit);
   const onClipboardRef = useRef(onClipboard);
   const onResizeHintRef = useRef(onResizeHint);
+  const getInitialSizeRef = useRef(getInitialSize);
   onDataRef.current = onData;
   onHistoryRef.current = onHistory;
   onConnectRef.current = onConnect;
@@ -119,6 +129,7 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
   onSessionExitRef.current = onSessionExit;
   onClipboardRef.current = onClipboard;
   onResizeHintRef.current = onResizeHint;
+  getInitialSizeRef.current = getInitialSize;
 
   // ── 连接生命周期 ──────────────────────────────
   useEffect(() => {
@@ -135,11 +146,19 @@ export function useWebSocket(options: UseWebSocketOptions): WebSocketHandle {
 
       setStatus("connecting");
 
-      // 构造完整 WebSocket URL（含认证 Token）
+      // 构造完整 WebSocket URL（认证 Token + 握手尺寸）
+      // 尺寸随握手上报，避免后端以默认 80×24 参与 min-size 计算。
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const params = new URLSearchParams();
       const token = getAccessToken();
-      const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
-      const fullUrl = `${protocol}//${window.location.host}${wsUrl}${tokenParam}`;
+      if (token) params.set("token", token);
+      const size = getInitialSizeRef.current?.();
+      if (size && Number.isFinite(size.cols) && Number.isFinite(size.rows)) {
+        params.set("cols", String(size.cols));
+        params.set("rows", String(size.rows));
+      }
+      const query = params.toString();
+      const fullUrl = `${protocol}//${window.location.host}${wsUrl}${query ? `?${query}` : ""}`;
 
       const ws = new WebSocket(fullUrl);
       wsRef.current = ws;

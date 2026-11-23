@@ -394,6 +394,63 @@ def test_compute_min_size_empty_returns_default():
     assert rows == 24
 
 
+def test_compute_min_size_ignores_unreported_clients():
+    """未上报尺寸的客户端（默认 80×24）不应把 PTY 钉在 80 列。"""
+    session = TerminalSession(
+        session_id="test-session",
+        instance_name="test",
+        backend=TerminalBackend.BROKER,
+    )
+    ws_mock = AsyncMock()
+    session._ws_clients["reported"] = ClientInfo(
+        ws=ws_mock, client_id="reported", cols=200, rows=50, size_reported=True
+    )
+    session._ws_clients["unreported"] = ClientInfo(
+        ws=ws_mock, client_id="unreported", cols=80, rows=24, size_reported=False
+    )
+
+    assert session._compute_min_size() == (200, 50)
+
+
+def test_compute_min_size_all_unreported_returns_default():
+    """所有客户端都未上报尺寸时回退到默认 80×24。"""
+    session = TerminalSession(
+        session_id="test-session",
+        instance_name="test",
+        backend=TerminalBackend.BROKER,
+    )
+    ws_mock = AsyncMock()
+    session._ws_clients["a"] = ClientInfo(
+        ws=ws_mock, client_id="a", size_reported=False
+    )
+
+    assert session._compute_min_size() == (80, 24)
+
+
+def test_add_ws_client_marks_size_reported_only_when_explicit():
+    """显式传入尺寸才标记为已上报；默认注册不参与 min-size。"""
+    session = TerminalSession(
+        session_id="test-session",
+        instance_name="test",
+        backend=TerminalBackend.BROKER,
+    )
+
+    explicit = session.add_ws_client(AsyncMock(), cols=180, rows=45)
+    implicit = session.add_ws_client(AsyncMock())
+
+    assert session._ws_clients[explicit].size_reported is True
+    assert (session._ws_clients[explicit].cols, session._ws_clients[explicit].rows) == (180, 45)
+    assert session._ws_clients[implicit].size_reported is False
+    assert session._compute_min_size() == (180, 45)
+
+
+def test_clamp_size_rejects_out_of_range():
+    """握手尺寸越界时应拒绝，避免异常窗口尺寸打乱 PTY 布局。"""
+    assert terminal_api._clamp_size(0, 10, 500) is None
+    assert terminal_api._clamp_size(999, 10, 500) is None
+    assert terminal_api._clamp_size(200, 10, 500) == 200
+
+
 def test_add_ws_client_returns_client_id():
     """add_ws_client 应返回分配的 client_id。"""
     session = TerminalSession(

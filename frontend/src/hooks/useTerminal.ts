@@ -65,8 +65,14 @@ export interface TerminalHandle {
   fit: () => void;
   /** 聚焦终端 */
   focus: () => void;
-  /** 获取当前尺寸 */
+  /** 获取容器自然尺寸（用于握手 / 上报，不受 effective 约束影响） */
   getSize: () => TermSize;
+  /**
+   * 应用后端的有效尺寸约束（`resize_hint`）。
+   * 幂等：尺寸相同时不做任何操作，避免 resize → onResize → sendResize 循环。
+   * 传 null 可清除约束。
+   */
+  applyEffectiveSize: (size: TermSize | null) => void;
   /** 获取当前选中文本（复制工具栏用） */
   getSelection: () => string;
 }
@@ -87,6 +93,12 @@ export function useTerminal(
   const fitAddonRef = useRef<FitAddon | null>(null);
   // 追踪容器 DOM 节点，用于 effect 触发
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
+  // 后端 min-size 有效尺寸约束（Broker 模式），null 表示无约束。
+  // 渲染尺寸按此对齐，但上报给后端的始终是容器自然尺寸，二者解耦：
+  // 否则约束尺寸会被回灌成客户端自然尺寸，小窗口断开后 PTY 尺寸无法回升。
+  const effectiveSizeRef = useRef<TermSize | null>(null);
+  // 抑制「约束对齐」触发的 onResize 上报
+  const suppressResizeReportRef = useRef(false);
   // 用 ref 存储回调避免 effect 频繁重建
   const onDataRef = useRef(options.onData);
   const onResizeRef = useRef(options.onResize);
@@ -101,6 +113,23 @@ export function useTerminal(
    */
   const containerRef = useCallback((node: HTMLDivElement | null) => {
     setContainer(node);
+  }, []);
+
+  /**
+   * 按后端有效尺寸对齐渲染尺寸（幂等）。
+   * 对齐过程触发的 onResize 会被抑制，避免把约束尺寸回灌给后端。
+   */
+  const alignToEffectiveSize = useCallback(() => {
+    const term = termRef.current;
+    const effective = effectiveSizeRef.current;
+    if (!term || !effective) return;
+    if (term.cols === effective.cols && term.rows === effective.rows) return;
+    suppressResizeReportRef.current = true;
+    try {
+      term.resize(effective.cols, effective.rows);
+    } finally {
+      suppressResizeReportRef.current = false;
+    }
   }, []);
 
   // ── 终端生命周期 ──────────────────────────────
@@ -149,6 +178,7 @@ export function useTerminal(
     requestAnimationFrame(() => {
       try {
         fitAddon.fit();
+        alignToEffectiveSize();
       } catch {
         // 首次 fit 可能因容器尺寸为 0 而失败，忽略
       }
@@ -160,7 +190,9 @@ export function useTerminal(
     });
 
     // 监听终端尺寸变化（由 fitAddon.fit() 触发）
+    // 约束对齐产生的 resize 不上报，避免污染后端 min-size 记录
     const resizeDisposable = term.onResize((size: { cols: number; rows: number }) => {
+      if (suppressResizeReportRef.current) return;
       onResizeRef.current?.({ cols: size.cols, rows: size.rows });
     });
 
@@ -184,6 +216,9 @@ export function useTerminal(
         rafId = null;
         try {
           fitAddon.fit();
+          // fit 会按容器自然尺寸重算并上报给后端；随后重新施加有效尺寸约束，
+          // 保证渲染列宽与 PTY 一致（对齐本身不上报）
+          alignToEffectiveSize();
         } catch {
           // 忽略（容器尺寸为 0 等边界场景）
         }
@@ -214,7 +249,7 @@ export function useTerminal(
       termRef.current = null;
       fitAddonRef.current = null;
     };
-  }, [container]);
+  }, [container, alignToEffectiveSize]);
 
   // ── 操作句柄（稳定引用） ──────────────────────
   const write = useCallback((data: string) => {
@@ -252,23 +287,69 @@ export function useTerminal(
   const fit = useCallback(() => {
     try {
       fitAddonRef.current?.fit();
+      alignToEffectiveSize();
     } catch {
       // 忽略
     }
-  }, []);
+  }, [alignToEffectiveSize]);
 
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);
 
+  /**
+   * 返回容器自然尺寸（而非被约束后的渲染尺寸）。
+   * 用于握手与 resize 上报，让后端始终掌握各客户端真实窗口能力。
+   */
   const getSize = useCallback((): TermSize => {
+    const proposed = fitAddonRef.current?.proposeDimensions?.();
+    if (proposed && proposed.cols > 0 && proposed.rows > 0) {
+      return { cols: proposed.cols, rows: proposed.rows };
+    }
     const term = termRef.current;
     return { cols: term?.cols ?? 80, rows: term?.rows ?? 24 };
   }, []);
+
+  /** 应用 / 清除后端有效尺寸约束（幂等） */
+  const applyEffectiveSize = useCallback(
+    (size: TermSize | null) => {
+      const prev = effectiveSizeRef.current;
+      const unchanged =
+        prev?.cols === size?.cols && prev?.rows === size?.rows &&
+        (prev === null) === (size === null);
+      effectiveSizeRef.current = size;
+      if (unchanged && size) {
+        // 约束未变，但仍需确保渲染尺寸未被 fit 悄悄改回自然尺寸
+        alignToEffectiveSize();
+        return;
+      }
+      if (size) {
+        alignToEffectiveSize();
+      } else {
+        // 清除约束：按容器自然尺寸重新 fit（会正常上报）
+        try {
+          fitAddonRef.current?.fit();
+        } catch {
+          // 忽略
+        }
+      }
+    },
+    [alignToEffectiveSize]
+  );
 
   const getSelection = useCallback((): string => {
     return termRef.current?.getSelection() ?? "";
   }, []);
 
-  return { containerRef, write, clear, reset, fit, focus, getSize, getSelection };
+  return {
+    containerRef,
+    write,
+    clear,
+    reset,
+    fit,
+    focus,
+    getSize,
+    applyEffectiveSize,
+    getSelection,
+  };
 }

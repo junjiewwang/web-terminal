@@ -18,6 +18,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { Host, TerminalInstance, TerminalBackend } from "../services/api";
 import { startTerminal } from "../services/api";
 import { useTerminal } from "../hooks/useTerminal";
+import type { TermSize } from "../hooks/useTerminal";
 import { useWebSocket, type SocketStatus } from "../hooks/useWebSocket";
 import type { SessionExitInfo } from "../hooks/useWebSocket";
 import SnippetPanel from "./SnippetPanel";
@@ -81,6 +82,8 @@ export default function TerminalView({
   });
   /** 断连退出信息（用于 DisconnectOverlay 展示） */
   const [exitInfo, setExitInfo] = useState<SessionExitInfo | null>(null);
+  /** 后端广播的有效终端尺寸（Broker min-size），用于状态栏展示 */
+  const [effectiveSize, setEffectiveSize] = useState<TermSize | null>(null);
 
   // ── scrollback 历史回放标志 ──
   // 当正在回放 scrollback 时，屏蔽 xterm.js 的 onData 输出到 WebSocket，
@@ -202,6 +205,14 @@ export default function TerminalView({
       });
     },
     onClipboard: showCopyToast,
+    // 握手阶段上报容器自然尺寸，避免默认 80×24 参与 min-size 计算
+    getInitialSize: () => terminal.getSize(),
+    // Broker 广播的有效尺寸：对齐渲染列宽并展示给用户
+    onResizeHint: (hint) => {
+      const size = { cols: hint.effective_cols, rows: hint.effective_rows };
+      terminal.applyEffectiveSize(size);
+      setEffectiveSize(size);
+    },
     onConnect: () => {
       setStatus("connected");
       setExitInfo(null); // 连接成功时清除旧的断连信息
@@ -222,6 +233,9 @@ export default function TerminalView({
       }
     },
     onDisconnect: (reason) => {
+      // 会话结束后清除约束，避免下次连接沿用旧尺寸
+      terminal.applyEffectiveSize(null);
+      setEffectiveSize(null);
       if (reason === "closed" || reason === "normal") {
         setStatus("idle");
         setWsUrl(null);
@@ -358,6 +372,7 @@ export default function TerminalView({
         onToggleSnippet={() => setSnippetPanelOpen((prev) => !prev)}
         fileTransferPanelOpen={fileTransferPanelOpen}
         onToggleFileTransfer={() => setFileTransferPanelOpen((prev) => !prev)}
+        effectiveSize={effectiveSize}
         hasSelection={hasSelection}
         handleToolbarCopy={handleToolbarCopy}
         handleToolbarClear={handleToolbarClear}
@@ -495,6 +510,7 @@ function _StatusBar({
   onToggleSnippet,
   fileTransferPanelOpen,
   onToggleFileTransfer,
+  effectiveSize,
   hasSelection,
   handleToolbarCopy,
   handleToolbarClear,
@@ -510,6 +526,7 @@ function _StatusBar({
   onToggleSnippet: () => void;
   fileTransferPanelOpen: boolean;
   onToggleFileTransfer: () => void;
+  effectiveSize: TermSize | null;
   hasSelection: boolean;
   handleToolbarCopy: () => void;
   handleToolbarClear: () => void;
@@ -531,6 +548,14 @@ function _StatusBar({
         {backendCfg && (
           <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${backendCfg.color}`}>
             {backendCfg.label}
+          </span>
+        )}
+        {effectiveSize && (
+          <span
+            className="inline-flex items-center rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-gray-500"
+            title="当前会话有效尺寸（由所有连接窗口的最小尺寸决定），终端渲染已按此对齐"
+          >
+            {effectiveSize.cols}×{effectiveSize.rows}
           </span>
         )}
       </span>

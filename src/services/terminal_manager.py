@@ -226,6 +226,11 @@ class ClientInfo:
     client_id: str
     cols: int = 80
     rows: int = 24
+    # 尺寸是否已由客户端上报。未上报的客户端使用默认 80×24，若参与
+    # min-size 计算会把 PTY 永久钉在 80 列，导致大窗口下 shell 行编辑
+    # 重绘（如 zsh-autosuggestions 长提示）与实际渲染列宽不一致。
+    # 默认为 True 以兼容直接构造 ClientInfo 的调用方（它们显式给了尺寸）。
+    size_reported: bool = True
     connected_at: datetime = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -672,6 +677,8 @@ class TerminalSession:
             if client:
                 client.cols = cols
                 client.rows = rows
+                # 收到显式 resize 即视为该客户端已上报真实尺寸
+                client.size_reported = True
 
             effective_cols, effective_rows = self._compute_min_size()
             self._set_pty_size(effective_cols, effective_rows)
@@ -714,12 +721,18 @@ class TerminalSession:
         """计算所有活跃客户端的 min(cols) × min(rows)。
 
         设下限 10×3 避免异常小窗口导致程序渲染出错。
-        无客户端时返回默认 80×24。
+        无客户端或所有客户端均未上报尺寸时返回默认 80×24。
+
+        只统计已上报尺寸（size_reported=True）的客户端：未上报的客户端
+        持有默认 80×24，若纳入 min 会把 PTY 永久钉在 80 列，造成前端
+        xterm.js 渲染列宽与 PTY / shell 认知列宽不一致，进而使长行
+        重绘（如 zsh-autosuggestions 长提示）出现字符散落、光标乱跳。
         """
-        if not self._ws_clients:
+        reported = [c for c in self._ws_clients.values() if c.size_reported]
+        if not reported:
             return (80, 24)
-        cols = min(c.cols for c in self._ws_clients.values())
-        rows = min(c.rows for c in self._ws_clients.values())
+        cols = min(c.cols for c in reported)
+        rows = min(c.rows for c in reported)
         return (max(cols, 10), max(rows, 3))
 
     def _broadcast_resize_hint(self, effective_cols: int, effective_rows: int) -> None:
@@ -924,7 +937,12 @@ class TerminalSession:
 
     # ── WebSocket 客户端管理 ──────────────────────
 
-    def add_ws_client(self, ws: WebSocket, cols: int = 80, rows: int = 24) -> str:
+    def add_ws_client(
+        self,
+        ws: WebSocket,
+        cols: int | None = None,
+        rows: int | None = None,
+    ) -> str:
         """添加 WebSocket 客户端，返回分配的 client_id。
 
         新客户端连接时：
@@ -932,9 +950,20 @@ class TerminalSession:
         2. 记录客户端尺寸（用于 Broker min-size 策略）
         3. 发送 scrollback 历史回放
         4. Broker 模式下重新计算 min-size 并通知所有客户端
+
+        cols/rows 显式传入表示客户端已在握手阶段上报真实尺寸；
+        均为 None 表示未上报，此时使用默认 80×24 但不参与 min-size 计算，
+        避免把 PTY 永久钉在 80 列。
         """
         client_id = str(uuid.uuid4())
-        client = ClientInfo(ws=ws, client_id=client_id, cols=cols, rows=rows)
+        size_reported = cols is not None and rows is not None
+        client = ClientInfo(
+            ws=ws,
+            client_id=client_id,
+            cols=cols if cols is not None else 80,
+            rows=rows if rows is not None else 24,
+            size_reported=size_reported,
+        )
         self._ws_clients[client_id] = client
 
         # 发送历史恢复（仅 Broker 模式需要，TMUX 模式由 tmux 自身处理屏幕恢复）

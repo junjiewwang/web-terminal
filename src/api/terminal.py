@@ -208,15 +208,29 @@ async def handle_copy_buffer(req: CopyBufferRequest) -> None:
     logger.info("tmux copy-buffer 已推送到前端: %s (%d chars)", session_name, len(text))
 
 
+# 客户端握手尺寸的合法范围（防止异常值打乱 PTY 布局）
+_MIN_COLS, _MAX_COLS = 10, 500
+_MIN_ROWS, _MAX_ROWS = 3, 200
+
+
+def _clamp_size(value: int, low: int, high: int) -> int | None:
+    """校验握手尺寸，越界返回 None（视为未上报）。"""
+    return value if low <= value <= high else None
+
+
 @router.websocket("/ws/terminal/{session_id}")
 async def terminal_websocket(
     websocket: WebSocket,
     session_id: str,
     token: str = Query(default=""),
+    cols: int = Query(default=0),
+    rows: int = Query(default=0),
 ) -> None:
     """WebSocket 终端连接
 
     认证方式：通过 query param `token` 传递 Bearer Token。
+    尺寸协商：客户端在握手时通过 `cols` / `rows` 上报真实窗口尺寸，
+    避免连接首帧仍以默认 80×24 参与 Broker min-size 计算。
     """
     mgr = _get_terminal_manager()
 
@@ -234,10 +248,21 @@ async def terminal_websocket(
 
     await websocket.accept()
 
-    client_id = session.add_ws_client(websocket)
+    # 握手阶段即带入真实尺寸：仅当 cols/rows 均合法时才视为「已上报」，
+    # 否则沿用 add_ws_client 的默认（未上报），不参与 min-size 计算。
+    valid_cols = _clamp_size(cols, _MIN_COLS, _MAX_COLS)
+    valid_rows = _clamp_size(rows, _MIN_ROWS, _MAX_ROWS)
+    if valid_cols is not None and valid_rows is not None:
+        client_id = session.add_ws_client(
+            websocket, cols=valid_cols, rows=valid_rows
+        )
+    else:
+        client_id = session.add_ws_client(websocket)
+
     logger.debug(
-        "WebSocket 已建立: session=%s, client=%s, backend=%s, instance=%s",
+        "WebSocket 已建立: session=%s, client=%s, backend=%s, instance=%s, size=%s",
         session_id[:8], client_id[:8], session.backend.value, session.instance_name,
+        f"{valid_cols}x{valid_rows}" if valid_cols and valid_rows else "unreported",
     )
 
     try:
