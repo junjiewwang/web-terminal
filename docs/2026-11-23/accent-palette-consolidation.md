@@ -1,9 +1,10 @@
 # 实心 Accent 配色收敛 — 记录文档
 
 - 日期：2026-11-23
-- 状态：实施中
+- 状态：**已完成并部署验证**
 - 前置：`tool-app-design-skill-research.md`（主题回归修复）中列为 P2 的遗留项
 - 范围：`frontend/src` 实心绿底按钮 / toast / 徽标
+- 提交：`ebd4140`
 
 ## 一、需求与背景
 
@@ -63,21 +64,77 @@
 ## 四、实施进展
 
 - [x] 配色实测与方案设计
-- [ ] 创建本记录文档（进行中）
-- [ ] CSS：token 与 `.ui-accent-bright` 三态 + disabled 中性态
-- [ ] 组件：6 个文件 7 处改用语义类
-- [ ] 构建 + 浏览器四态对比度实测 + 断言脚本
-- [ ] 提交推送 + dev 部署 + 线上验证
-- [ ] 更新记录文档收尾
+- [x] 创建本记录文档
+- [x] CSS：token 与 `.ui-accent-bright` 三态 + disabled 中性态
+- [x] 组件：7 个文件 8 处改用语义类
+- [x] 构建 + 浏览器四态对比度实测 + 断言脚本
+- [x] 提交推送 + dev 部署 + 线上验证
+- [x] 更新记录文档收尾
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `frontend/src/styles/design-system.css` | 新增 `--ui-accent-surface/hover/active`、`--ui-accent-surface-disabled`、`--ui-accent-ink-disabled`；实现 `.ui-accent-bright` 三态 + disabled；删除已失效的 `.ui-on-accent` 别名 |
+| `frontend/src/components/LoginPage.tsx` | 登录按钮 → `ui-accent-bright` |
+| `frontend/src/components/TerminalView.tsx` | toast、断连重连按钮 → `ui-accent-bright` |
+| `frontend/src/components/DisconnectOverlay.tsx` | 重连按钮 → `ui-accent-bright` |
+| `frontend/src/components/SnippetPanel.tsx` | 执行命令按钮启用态 → `ui-accent-bright` |
+| `frontend/src/components/FileTransferPanel.tsx` | 下载按钮 → `ui-accent-bright` |
+| `frontend/src/App.tsx` | 计数徽标 → `ui-accent-bright` + 保留 `ui-micro` |
+| `frontend/e2e/verify-accent-contrast.mjs` | **新增**：CDP 对比度断言脚本 |
+
+**未改动**：46 处半透明幽灵按钮（含 `CommandPalette` 选中项 17.87:1）、
+`emerald-800` token（探针解析异常，未引入）。
+
+### 验证结果
+
+**对比度断言脚本（真实浏览器解析 oklch 后计算）**
+
+| 状态 | 背景 | 前景 | 对比度 | 判定 |
+|---|---|---|---|---|
+| default | `emerald-500` | 深墨 `#050816` | **8.06:1** | PASS |
+| hover | `emerald-400` | 深墨 | **10.29:1** | PASS |
+| active | `emerald-600` | 深墨 | **5.46:1** | PASS |
+| disabled | 中性灰 `rgba(255,255,255,.06)` | `--ui-text-muted` | **7.25:1** | PASS |
+
+规则完整性检查全 PASS：base / hover / active / disabled 规则均存在、
+无 `opacity-40` 双重衰减。
+
+**线上部署**
+- wetty-terminal MCP 在 `dev-cloud:/root/go/src/github.com/web-terminal` 执行
+  `git pull --ff-only` → `ebd4140`；`docker compose build` + `up -d`
+  （后者由宿主机直连 SSH 完成，避免 MCP 服务端随容器重建中断会话）
+- 服务 HTTP 200，bundle `index-pbprThRK.css`
+- 线上断言脚本四态全部 PASS
+- 登录页真实 DOM 实测：`bg = oklch(0.696 0.17 162.48)`（emerald-500）、
+  `color = rgb(5,8,22)`、`opacity = 1`
+- checker 线上复跑：`FAIL 17→12`、`WARN 11→9`，
+  **`text-contrast: PASS`、新增 FAIL 0 / 新增 WARN 0**
+
+### 实施中发现并修正的两处
+
+1. **disabled 的 opacity 是独立属性**：组件里 `disabled:opacity-40` 不会因为
+   语义类改了 background/color 就消失，必须显式 `opacity: 1` 抵消，
+   否则仍是双重衰减（实测仅 1.46:1）。
+2. **断言脚本选中了空壳标签页**：多个同 URL tab 中部分未加载样式表，
+   token 读为空。改为逐个探测 `--ui-accent-surface` 后自动选出有效页。
+   另外静态 dist 重建后需 `Page.reload({ignoreCache:true})` 才会取到新 CSS。
 
 ## 五、未完成任务
 
-- 上述未勾选项
+- 本轮范围内无未完成项
+- 其余 P2 见下节遗留问题 6
 
 ## 六、遗留问题与风险
 
-1. **hover 态是 CSS 覆盖**：组件里原有 `hover:bg-emerald-*` 需移除或让语义类优先级更高，
-   否则 hover 会跳回旧色；需实测 hover 计算样式确认。
+1. **hover 态已端到端验证**：组件里原有 `hover:bg-emerald-*` / `transition-colors`
+   已从 8 处 className 中移除，语义类统一接管三态。用 CDP
+   `CSS.forcePseudoState` 强制 `:hover` / `:active` 后读真实计算样式：
+   - default `oklch(0.696 0.17 162.48)`（emerald-500）
+   - hover `oklch(0.765 0.177 163.223)`（emerald-400）
+   - active `oklch(0.596 0.145 163.225)`（emerald-600）
+   - 三态前景恒为 `rgb(5,8,22)`、`opacity` 恒为 1，无旧 className 抢优先级。
 2. **toast / 徽标是 div/span 而非 button**：语义类不能限定元素类型，用 `:where()` 保持低特异性。
 3. **disabled 态需同时覆盖 `:disabled` 与 aria-disabled**，避免遗漏。
 4. **emerald-800 token 解析异常**：探针里 `var(--color-emerald-800)` 返回白色，
