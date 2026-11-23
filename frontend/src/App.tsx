@@ -452,7 +452,7 @@ function MainApp({ onLogout, authRequired }: MainAppProps) {
   return (
     <div className="relative flex h-screen overflow-hidden bg-[#050816] text-gray-100">
       {/* 键盘用户跳过导航直达主内容（设计系统可访问性基线） */}
-      <a className="ui-skip-link" href="#main-content">跳到主内容</a>
+      <a className="skip-link ui-skip-link" href="#main-content">跳到主内容</a>
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
 
       {/* ── Activity Bar：最左窄栏（工作台/管理导航） ── */}

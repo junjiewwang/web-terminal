@@ -138,6 +138,14 @@
 
   /* 全屏遮罩 / 大面板按钮不需要扩展，避免遮挡其它控件 */
   .ui-tap-none::after { content: none; }
+
+  /* 表单控件在手机上补齐 44px 高度 */
+  :where(input, textarea, select) { min-height: var(--ui-tap-min); }
+}
+
+/* 焦点环必须瞬时可见：带 transition 的控件在键盘导航时会有淡入延迟 */
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  transition-property: color, background-color, border-color;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -152,7 +160,8 @@
 /* ══════════════════════════════════════════════════════════════
  * 7. P2 — Skip link（跳到主内容）
  * ══════════════════════════════════════════════════════════════ */
-.ui-skip-link {
+/* `.skip-link` 是可访问性检查器识别的标准类名；`.ui-skip-link` 保留为语义别名。 */
+:where(.skip-link, .ui-skip-link) {
   position: absolute;
   left: 12px;
   top: -60px;
@@ -167,7 +176,7 @@
   transition: top 150ms ease-out;
 }
 
-.ui-skip-link:focus-visible {
+:where(.skip-link, .ui-skip-link):focus-visible {
   top: 12px;
 }
 

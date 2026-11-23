@@ -44,7 +44,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
   return (
     <div className="relative flex h-screen items-center justify-center overflow-hidden bg-[#050816] text-gray-100">
       {/* 键盘用户跳过装饰直达登录表单（设计系统可访问性基线） */}
-      <a className="ui-skip-link" href="#login-form">跳到登录表单</a>
+      <a className="skip-link ui-skip-link" href="#login-form">跳到登录表单</a>
       {/* 背景装饰 */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.16),transparent_34%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_26%)]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_bottom_center,rgba(16,185,129,0.06),transparent_50%)]" />
